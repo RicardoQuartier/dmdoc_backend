@@ -107,6 +107,7 @@ async function upsertUser(
         email: user.email,
         passwordHash: user.passwordHash,
         createdAt: new Date(),
+        deleted: false,
       },
       $set: {
         name: user.name,
@@ -134,6 +135,11 @@ export async function seed(client: MongoDbClient): Promise<void> {
   const testTenantName = envOr('SEED_TENANT_NAME', 'Empresa Teste Ltda');
   const diskQuotaBytes = Number(envOr('SEED_TENANT_DISK_QUOTA_BYTES', String(10 * 1024 ** 3))); // 10 GiB
   const userQuota = Number(envOr('SEED_TENANT_USER_QUOTA', '20'));
+
+  // --- Tenant 2 e admin 2 ---
+  const tenant2AdminEmail = envOr('SEED_TENANT2_ADMIN_EMAIL', 'tenant-admin2@dmdoc.local');
+  const tenant2AdminPassword = envOr('SEED_TENANT2_ADMIN_PASSWORD', 'ChangeMe!TenantAdmin2');
+  const testTenant2Name = envOr('SEED_TENANT2_NAME', 'Empresa Teste 2 Ltda');
 
   // --- SUPER_ADMIN (sem empresa) ---
   const superAdminHash = await argon2.hash(superAdminPassword);
@@ -169,6 +175,29 @@ export async function seed(client: MongoDbClient): Promise<void> {
     role: 'TENANT_ADMIN',
   });
   log.info({ email: tenantAdminEmail, id: tenantAdmin.id, tenantId }, 'TENANT_ADMIN garantido');
+
+  // --- Tenant 2 de teste (para testes E2E de isolamento multi-tenant) ---
+  const tenant2Res = await db.collection('tenants').findOneAndUpdate(
+    { name: testTenant2Name },
+    {
+      $setOnInsert: { id: newId(), name: testTenant2Name, createdAt: new Date() },
+      $set: { diskQuotaBytes, userQuota, active: true },
+    },
+    { upsert: true, returnDocument: 'after' },
+  );
+  const tenant2 = tenant2Res as { id: string } | null;
+  const tenantId2 = tenant2?.id ?? '';
+  log.info({ name: testTenant2Name, id: tenantId2 }, 'tenant 2 garantido');
+
+  const tenant2AdminHash = await argon2.hash(tenant2AdminPassword);
+  const tenant2Admin = await upsertUser(db, {
+    tenantId: tenantId2,
+    email: tenant2AdminEmail,
+    passwordHash: tenant2AdminHash,
+    name: 'Tenant Admin 2',
+    role: 'TENANT_ADMIN',
+  });
+  log.info({ email: tenant2AdminEmail, id: tenant2Admin.id, tenantId: tenantId2 }, 'TENANT_ADMIN 2 garantido');
 
   // --- Tipos globais (tenantId: null, isGlobal: true) ---
   for (const seedType of globalTypeSeeds()) {

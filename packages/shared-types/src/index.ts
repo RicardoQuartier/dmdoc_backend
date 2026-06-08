@@ -21,3 +21,30 @@ export {
   DocumentTypeSchema,
   type DocumentType,
 } from './document-type.js';
+export {
+  DepartmentSchema,
+  type Department,
+  DepartmentPermissionSchema,
+  type DepartmentPermission,
+} from './department.js';
+export {
+  DocumentStatusSchema,
+  type DocumentStatus,
+  DocumentSchema,
+  type Document,
+} from './document.js';
+export {
+  ExtractionResultSchema,
+  type ExtractionResult,
+  IndexSuggestionSchema,
+  type IndexSuggestion,
+  CostBreakdownSchema,
+  type CostBreakdown,
+  DocumentContentSchema,
+  type DocumentContent,
+} from './document-content.js';
+export { ChunkSchema, type Chunk } from './chunk.js';
+export {
+  DocumentProcessingJobDataSchema,
+  type DocumentProcessingJobData,
+} from './job.js';

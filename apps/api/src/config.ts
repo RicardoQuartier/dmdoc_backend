@@ -29,6 +29,20 @@ const EnvSchema = z.object({
   JWT_REFRESH_SECRET: z.string().min(1, 'JWT_REFRESH_SECRET é obrigatória'),
   JWT_EXPIRES_IN: z.string().min(1).default('15m'),
   JWT_REFRESH_EXPIRES_IN: z.string().min(1).default('7d'),
+
+  // AWS S3 — storage de arquivos (spec §12). S3_ENDPOINT é opcional para dev
+  // com MinIO ou LocalStack. Ausente em produção (usa endpoint AWS padrão).
+  AWS_REGION: z.string().min(1).default('us-east-1'),
+  AWS_S3_BUCKET: z.string().min(1, 'AWS_S3_BUCKET é obrigatória'),
+  AWS_ACCESS_KEY_ID: z.string().min(1, 'AWS_ACCESS_KEY_ID é obrigatória'),
+  AWS_SECRET_ACCESS_KEY: z.string().min(1, 'AWS_SECRET_ACCESS_KEY é obrigatória'),
+  S3_ENDPOINT: z.string().url().optional(), // MinIO em dev; ausente em prod
+
+  // Redis — BullMQ (spec §12). Fila de processamento de documentos.
+  REDIS_URL: z.string().min(1, 'REDIS_URL é obrigatória'),
+
+  // Limites de upload (spec §12).
+  MAX_UPLOAD_MB: z.coerce.number().int().positive().default(50),
 });
 
 export type Config = Readonly<z.infer<typeof EnvSchema>>;

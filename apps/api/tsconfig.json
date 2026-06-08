@@ -1,9 +1,11 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "rootDir": "./src",
-    "outDir": "./dist"
+    "noEmit": true,
+    "paths": {
+      "@dmdoc/shared-types": ["../../packages/shared-types/src/index.ts"],
+      "@dmdoc/db-mongo": ["../../packages/db-mongo/src/index.ts"]
+    }
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts"]
+  "include": ["src/**/*.ts"]
 }

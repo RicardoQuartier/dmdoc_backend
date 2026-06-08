@@ -1,3 +1,4 @@
+import { Queue } from 'bullmq';
 import { buildApp } from './app.js';
 import { getConfig } from './config.js';
 
@@ -7,7 +8,23 @@ import { getConfig } from './config.js';
  */
 async function main(): Promise<void> {
   const config = getConfig();
-  const app = await buildApp({ config });
+
+  // Fila BullMQ de processamento de documentos (spec §8).
+  // O worker consome desta mesma fila via REDIS_URL.
+  const queue = new Queue('document-processing', {
+    connection: { url: config.REDIS_URL },
+    defaultJobOptions: {
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 2000 },
+    },
+  });
+
+  const app = await buildApp({ config, queue });
+
+  // Fecha a fila quando a app for encerrada (graceful shutdown)
+  app.addHook('onClose', async () => {
+    await queue.close();
+  });
 
   try {
     await app.listen({ port: config.APP_PORT, host: '0.0.0.0' });

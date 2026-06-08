@@ -13,6 +13,11 @@ import {
  * em `process.env` real. O `MONGO_URI`/`MONGO_DB` aqui são placeholders: os
  * testes injetam um `Db` real (memory-server) em `buildApp`, então a conexão
  * via config nunca é usada.
+ *
+ * AWS/S3: placeholders — os testes de upload injetam um mock de S3Service via
+ * `buildApp({ s3: mockS3 })`, portanto nunca chamam o SDK real.
+ * REDIS_URL: placeholder — os testes injetam `queue: null` em `buildApp`,
+ * portanto nunca conectam ao Redis.
  */
 export function testConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): Config {
   return loadConfig({
@@ -24,6 +29,13 @@ export function testConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): Config {
     JWT_REFRESH_SECRET: 'test-refresh-secret',
     JWT_EXPIRES_IN: '15m',
     JWT_REFRESH_EXPIRES_IN: '7d',
+    // AWS/S3 — placeholders; mock injetado via buildApp({ s3: ... })
+    AWS_REGION: 'us-east-1',
+    AWS_S3_BUCKET: 'test-bucket',
+    AWS_ACCESS_KEY_ID: 'test-key-id',
+    AWS_SECRET_ACCESS_KEY: 'test-secret-key',
+    // Redis — placeholder; queue: null injetado via buildApp
+    REDIS_URL: 'redis://placeholder:6379',
     ...overrides,
   });
 }

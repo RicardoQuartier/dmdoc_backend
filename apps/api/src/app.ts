@@ -1,11 +1,41 @@
 import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
+import multipart from '@fastify/multipart';
 import { ZodError } from 'zod';
+import type { Queue } from 'bullmq';
 import { MongoDbClient } from '@dmdoc/db-mongo';
 import type { Db } from 'mongodb';
 import { getConfig, type Config } from './config.js';
 import { AppError } from './errors/index.js';
 import { authPlugin } from './plugins/auth.js';
 import { authRoutes } from './routes/auth.js';
+import { adminTenantsRoutes } from './routes/admin/tenants.js';
+import { usersRoutes } from './routes/users.js';
+import { departmentsRoutes } from './routes/departments.js';
+import { documentTypesRoutes } from './routes/document-types.js';
+import { permissionsRoutes } from './routes/permissions.js';
+import { documentsRoutes } from './routes/documents.js';
+import { createS3Service, type S3Service, type S3Config } from './services/s3.js';
+
+declare module 'fastify' {
+  interface FastifyInstance {
+    db: Db;
+    /**
+     * Serviço S3. Null em testes que injetam um mock ou desabilitam o S3.
+     * As rotas que usam S3 verificam a presença antes de operar.
+     */
+    s3: S3Service;
+    /**
+     * Fila BullMQ de processamento de documentos.
+     * Null em testes — jobs não são enfileirados.
+     */
+    queue: Queue | null;
+    /**
+     * Tamanho máximo permitido para upload de arquivo (em bytes).
+     * Derivado de `config.MAX_UPLOAD_MB`.
+     */
+    uploadMaxBytes: number;
+  }
+}
 
 export interface BuildAppOptions {
   /** Permite injetar uma config alternativa (útil em testes). */
@@ -16,6 +46,17 @@ export interface BuildAppOptions {
    * registra o fechamento da conexão no `onClose` da app.
    */
   db?: Db;
+  /**
+   * Fila BullMQ de processamento de documentos.
+   * Em testes, passe `null` para desabilitar o enfileiramento.
+   * Em produção, `server.ts` cria a fila e a injeta aqui.
+   */
+  queue?: Queue | null;
+  /**
+   * Instância de S3Service a injetar.
+   * Em testes, passe um mock. Em produção é criado a partir da config.
+   */
+  s3?: S3Service;
 }
 
 /**
@@ -40,6 +81,27 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   const db = await resolveDb(app, options, config);
 
+  app.decorate('db', db);
+
+  // Upload max em bytes (config em MB)
+  const uploadMaxBytes = config.MAX_UPLOAD_MB * 1024 * 1024;
+  app.decorate('uploadMaxBytes', uploadMaxBytes);
+
+  // Fila BullMQ — null quando não injetada (testes)
+  app.decorate('queue', options.queue ?? null);
+
+  // Serviço S3
+  const s3 = options.s3 ?? createS3Service(buildS3Config(config));
+  app.decorate('s3', s3);
+
+  // Plugin @fastify/multipart — necessário para POST /documents
+  await app.register(multipart, {
+    limits: {
+      fileSize: uploadMaxBytes,
+      files: 1, // apenas um arquivo por request
+    },
+  });
+
   await app.register(authPlugin, { config, db });
 
   app.get('/healthz', async () => {
@@ -47,6 +109,12 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   });
 
   await app.register(authRoutes);
+  await app.register(adminTenantsRoutes);
+  await app.register(usersRoutes);
+  await app.register(departmentsRoutes);
+  await app.register(documentTypesRoutes);
+  await app.register(permissionsRoutes);
+  await app.register(documentsRoutes);
 
   await app.ready();
   return app;
@@ -71,6 +139,19 @@ async function resolveDb(
     await client.close();
   });
   return client.getDb();
+}
+
+/**
+ * Monta a S3Config a partir do Config da aplicação.
+ */
+function buildS3Config(config: Config): S3Config {
+  return {
+    region: config.AWS_REGION,
+    bucket: config.AWS_S3_BUCKET,
+    accessKeyId: config.AWS_ACCESS_KEY_ID,
+    secretAccessKey: config.AWS_SECRET_ACCESS_KEY,
+    ...(config.S3_ENDPOINT !== undefined ? { endpoint: config.S3_ENDPOINT } : {}),
+  };
 }
 
 /**
@@ -104,6 +185,17 @@ function registerErrorHandler(app: FastifyInstance): void {
       request.log.info({ err: error }, 'erro de validação (fastify)');
       return reply.status(422).send({
         error: { code: 'VALIDATION_ERROR', message: error.message },
+      });
+    }
+
+    // Erro de limite de tamanho de arquivo (@fastify/multipart)
+    if ((error as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') {
+      request.log.info({ err: error }, 'arquivo excede tamanho máximo');
+      return reply.status(422).send({
+        error: {
+          code: 'FILE_TOO_LARGE',
+          message: `Arquivo excede o tamanho máximo permitido`,
+        },
       });
     }
 

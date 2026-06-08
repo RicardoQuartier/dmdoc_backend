@@ -1,10 +1,8 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "noEmit": true,
-    "paths": {
-      "@dmdoc/shared-types": ["../shared-types/src/index.ts"]
-    }
+    "rootDir": "./src",
+    "outDir": "./dist"
   },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/*.test.ts"]

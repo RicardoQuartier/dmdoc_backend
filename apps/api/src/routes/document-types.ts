@@ -1,0 +1,378 @@
+import type { FastifyPluginAsync } from 'fastify';
+import { z } from 'zod';
+import { TenantRepository, newId } from '@dmdoc/db-mongo';
+import type { IndexField } from '@dmdoc/shared-types';
+import type { TenantDocument } from '@dmdoc/db-mongo';
+import { ConflictError, ForbiddenError, NotFoundError } from '../errors/index.js';
+import { requireRole } from '../auth/role-guard.js';
+import { resolveTenantId } from '../auth/resolve-tenant.js';
+
+interface DocumentTypeDoc extends TenantDocument {
+  name: string;
+  description: string | null;
+  isGlobal: boolean;
+  createdAt: Date;
+  indexFields: IndexField[];
+}
+
+const ListDocumentTypesQuerySchema = z.object({
+  tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas
+});
+
+const CreateDocumentTypeBodySchema = z.object({
+  name: z.string().min(1).max(200),
+  description: z.string().nullable().default(null),
+  tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas
+});
+
+const PatchDocumentTypeBodySchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  description: z.string().nullable().optional(),
+});
+
+const CreateIndexFieldBodySchema = z.object({
+  name: z.string().min(1).max(200),
+  fieldType: z.enum(['TEXT', 'DATE', 'NUMBER', 'CUSTOMER', 'PROVIDER']),
+  required: z.boolean().default(false),
+  aiExtractionHint: z.string().nullable().default(null),
+  order: z.number().int().nonnegative().default(0),
+  showOnSearch: z.boolean().default(true),
+});
+
+const PatchIndexFieldBodySchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  fieldType: z.enum(['TEXT', 'DATE', 'NUMBER', 'CUSTOMER', 'PROVIDER']).optional(),
+  required: z.boolean().optional(),
+  aiExtractionHint: z.string().nullable().optional(),
+  order: z.number().int().nonnegative().optional(),
+  showOnSearch: z.boolean().optional(),
+});
+
+const TenantIdQuerySchema = z.object({
+  tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas
+});
+
+/**
+ * Rotas de CRUD de tipos de documento e seus campos de índice.
+ *
+ * GET lista tipos do tenant + tipos globais (isGlobal: true).
+ * Mutations operam apenas sobre tipos do tenant (não globais).
+ *
+ * SUPER_ADMIN: informa tenantId via body (POST) ou ?tenantId (PATCH, DELETE,
+ * POST index-fields, PATCH index-fields, DELETE index-fields).
+ */
+export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
+  /**
+   * GET /document-types — lista tipos de documento.
+   *
+   * - SA com ?tenantId: tipos do tenant + tipos globais
+   * - SA sem ?tenantId: todos os tipos de todos os tenants (incluindo globais)
+   * - Outros: tipos do próprio tenant + globais
+   */
+  app.get('/document-types', { preHandler: app.authenticate }, async (request, reply) => {
+    const { tenantId: tenantIdParam } = ListDocumentTypesQuerySchema.parse(request.query);
+    const db = app.db;
+    const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
+
+    let items: Record<string, unknown>[];
+
+    if (isSuperAdmin) {
+      if (tenantIdParam !== undefined) {
+        // SA com tenantId: tipos do tenant específico + tipos globais
+        items = await db
+          .collection('document_types')
+          .find({
+            deleted: false,
+            $or: [{ tenantId: tenantIdParam }, { isGlobal: true, tenantId: null }],
+          })
+          .sort({ name: 1 })
+          .toArray() as unknown as Record<string, unknown>[];
+      } else {
+        // SA sem tenantId: todos os tipos de todos os tenants, incluindo globais
+        items = await db
+          .collection('document_types')
+          .find({ deleted: false })
+          .sort({ name: 1 })
+          .toArray() as unknown as Record<string, unknown>[];
+      }
+    } else {
+      const tenantId = request.tenantId!;
+      items = await db
+        .collection('document_types')
+        .find({
+          deleted: false,
+          $or: [{ tenantId }, { isGlobal: true, tenantId: null }],
+        })
+        .sort({ name: 1 })
+        .toArray() as unknown as Record<string, unknown>[];
+    }
+
+    return reply.status(200).send(items.map(stripMongoId));
+  });
+
+  /**
+   * POST /document-types — cria tipo de documento para o tenant.
+   * SUPER_ADMIN: informar `tenantId` no body (obrigatório).
+   * isGlobal sempre false; tenantId do request (ou body para SA).
+   */
+  app.post('/document-types', { preHandler: app.authenticate }, async (request, reply) => {
+    requireRole(request, 'TENANT_ADMIN');
+
+    const body = CreateDocumentTypeBodySchema.parse(request.body);
+    const effectiveTenantId = resolveTenantId(request, body.tenantId, true);
+    const tenantId = effectiveTenantId as string;
+
+    const { name, description } = body;
+    const db = app.db;
+
+    const repo = new TenantRepository<DocumentTypeDoc>(
+      db.collection('document_types'),
+      { tenantId }
+    );
+
+    const docType = await repo.insertOne({
+      name,
+      description,
+      isGlobal: false,
+      createdAt: new Date(),
+      indexFields: [],
+    });
+
+    request.log.info({ tenantId, documentTypeId: docType.id }, 'tipo de documento criado');
+    return reply.status(201).send(docType);
+  });
+
+  /**
+   * PATCH /document-types/:id — atualiza tipo de documento do tenant.
+   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
+   */
+  app.patch('/document-types/:id', { preHandler: app.authenticate }, async (request, reply) => {
+    requireRole(request, 'TENANT_ADMIN');
+
+    const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
+    const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
+    const tenantId = effectiveTenantId as string;
+
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const updates = PatchDocumentTypeBodySchema.parse(request.body);
+    const db = app.db;
+
+    const repo = new TenantRepository<DocumentTypeDoc>(
+      db.collection('document_types'),
+      { tenantId }
+    );
+
+    const updated = await repo.updateById(
+      id,
+      removeUndefined(updates) as Parameters<typeof repo.updateById>[1]
+    );
+    if (!updated) throw new NotFoundError();
+
+    request.log.info({ tenantId, documentTypeId: id }, 'tipo de documento atualizado');
+    return reply.status(200).send(updated);
+  });
+
+  /**
+   * DELETE /document-types/:id — soft-delete de tipo do tenant.
+   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
+   * Tipos globais não podem ser deletados por tenants.
+   */
+  app.delete('/document-types/:id', { preHandler: app.authenticate }, async (request, reply) => {
+    requireRole(request, 'TENANT_ADMIN');
+
+    const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
+    const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
+    const tenantId = effectiveTenantId as string;
+
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const db = app.db;
+
+    // Verificar se é tipo global antes de tentar deletar
+    const existing = await db
+      .collection('document_types')
+      .findOne({ id, deleted: false });
+
+    if (!existing) throw new NotFoundError();
+
+    const doc = existing as unknown as DocumentTypeDoc;
+    if (doc.isGlobal) {
+      throw new ForbiddenError('Tipos globais não podem ser excluídos por tenants');
+    }
+
+    // Confirmar que pertence ao tenant (TenantRepository garante 404 cross-tenant)
+    const repo = new TenantRepository<DocumentTypeDoc>(
+      db.collection('document_types'),
+      { tenantId }
+    );
+    const deleted = await repo.softDelete(id);
+    if (!deleted) throw new NotFoundError();
+
+    request.log.info({ tenantId, documentTypeId: id }, 'tipo de documento removido');
+    return reply.status(204).send();
+  });
+
+  /**
+   * POST /document-types/:id/index-fields — adiciona campo ao tipo.
+   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
+   */
+  app.post(
+    '/document-types/:id/index-fields',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      requireRole(request, 'TENANT_ADMIN');
+
+      const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
+      const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
+      const tenantId = effectiveTenantId as string;
+
+      const { id } = z.object({ id: z.string() }).parse(request.params);
+      const fieldInput = CreateIndexFieldBodySchema.parse(request.body);
+      const db = app.db;
+
+      const newField: IndexField = {
+        id: newId(),
+        name: fieldInput.name,
+        fieldType: fieldInput.fieldType,
+        required: fieldInput.required,
+        aiExtractionHint: fieldInput.aiExtractionHint,
+        order: fieldInput.order,
+        showOnSearch: fieldInput.showOnSearch,
+        deleted: false,
+      };
+
+      const updated = await db
+        .collection('document_types')
+        .findOneAndUpdate(
+          { id, tenantId, deleted: false },
+          // Cast necessário: o tipo do driver para $push é restrito a arrays,
+          // mas indexFields é um array de subdocumentos.
+          { $push: { indexFields: newField } } as Record<string, unknown>,
+          { returnDocument: 'after' }
+        );
+
+      if (!updated) throw new NotFoundError();
+
+      request.log.info(
+        { tenantId, documentTypeId: id, fieldId: newField.id },
+        'campo de índice adicionado'
+      );
+      return reply.status(200).send(stripMongoId(updated as Record<string, unknown>));
+    }
+  );
+
+  /**
+   * PATCH /document-types/:id/index-fields/:fieldId — atualiza campo.
+   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
+   */
+  app.patch(
+    '/document-types/:id/index-fields/:fieldId',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      requireRole(request, 'TENANT_ADMIN');
+
+      const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
+      const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
+      const tenantId = effectiveTenantId as string;
+
+      const { id, fieldId } = z
+        .object({ id: z.string(), fieldId: z.string() })
+        .parse(request.params);
+      const fieldUpdates = PatchIndexFieldBodySchema.parse(request.body);
+      const db = app.db;
+
+      // Monta o $set para o subdocumento usando arrayFilters
+      const setOps: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(fieldUpdates)) {
+        if (value !== undefined) {
+          setOps[`indexFields.$[elem].${key}`] = value;
+        }
+      }
+
+      if (Object.keys(setOps).length === 0) {
+        const existing = await db
+          .collection('document_types')
+          .findOne({ id, tenantId, deleted: false });
+        if (!existing) throw new NotFoundError();
+        return reply.status(200).send(stripMongoId(existing as Record<string, unknown>));
+      }
+
+      const updated = await db
+        .collection('document_types')
+        .findOneAndUpdate(
+          { id, tenantId, deleted: false, 'indexFields.id': fieldId },
+          { $set: setOps },
+          {
+            returnDocument: 'after',
+            arrayFilters: [{ 'elem.id': fieldId, 'elem.deleted': false }],
+          }
+        );
+
+      if (!updated) throw new NotFoundError();
+
+      request.log.info(
+        { tenantId, documentTypeId: id, fieldId },
+        'campo de índice atualizado'
+      );
+      return reply.status(200).send(stripMongoId(updated as Record<string, unknown>));
+    }
+  );
+
+  /**
+   * DELETE /document-types/:id/index-fields/:fieldId — soft-delete do campo.
+   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
+   */
+  app.delete(
+    '/document-types/:id/index-fields/:fieldId',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      requireRole(request, 'TENANT_ADMIN');
+
+      const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
+      const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
+      const tenantId = effectiveTenantId as string;
+
+      const { id, fieldId } = z
+        .object({ id: z.string(), fieldId: z.string() })
+        .parse(request.params);
+      const db = app.db;
+
+      const updated = await db
+        .collection('document_types')
+        .findOneAndUpdate(
+          { id, tenantId, deleted: false, 'indexFields.id': fieldId },
+          { $set: { 'indexFields.$[elem].deleted': true } },
+          {
+            returnDocument: 'after',
+            arrayFilters: [{ 'elem.id': fieldId }],
+          }
+        );
+
+      if (!updated) throw new NotFoundError();
+
+      request.log.info(
+        { tenantId, documentTypeId: id, fieldId },
+        'campo de índice removido (soft delete)'
+      );
+      return reply.status(200).send(stripMongoId(updated as Record<string, unknown>));
+    }
+  );
+};
+
+function stripMongoId(doc: Record<string, unknown>): Record<string, unknown> {
+  const { _id: _ignored, ...rest } = doc;
+  return rest;
+}
+
+/**
+ * Remove propriedades com valor `undefined` do objeto, para compatibilidade
+ * com `exactOptionalPropertyTypes`.
+ */
+function removeUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> {
+  const result: Partial<T> = {};
+  for (const key of Object.keys(obj) as (keyof T)[]) {
+    if (obj[key] !== undefined) {
+      result[key] = obj[key];
+    }
+  }
+  return result;
+}
