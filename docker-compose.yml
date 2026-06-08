@@ -1,0 +1,42 @@
+services:
+  mongodb:
+    # OBRIGATÓRIO: imagem Atlas Local — suporta $vectorSearch, $search e $rankFusion.
+    # NÃO usar a imagem padrão `mongo`, que não tem esses operadores.
+    image: mongodb/mongodb-atlas-local:latest
+    container_name: dmdoc-mongodb
+    ports:
+      - '27017:27017'
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.runCommand('ping').ok"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: dmdoc-redis
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    command: ['redis-server', '--appendonly', 'yes']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  unstructured:
+    image: downloads.unstructured.io/unstructured-io/unstructured-api:latest
+    container_name: dmdoc-unstructured
+    ports:
+      - '8000:8000'
+    environment:
+      UNSTRUCTURED_API_KEY: ''
+
+volumes:
+  mongodb_data:
+  redis_data:

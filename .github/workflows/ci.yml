@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancela execuções antigas do mesmo ref quando um novo push chega.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: lint + typecheck + test
+    runs-on: ubuntu-latest
+
+    # Serviços já provisionados para as próximas fases. Na Fase 0 os testes
+    # NÃO conectam, mas deixamos prontos:
+    #  - mongodb-atlas-local: imagem OBRIGATÓRIA (suporta $vectorSearch / $search /
+    #    $rankFusion). Nunca usar a imagem `mongo` padrão.
+    #  - redis: backend do BullMQ.
+    services:
+      mongodb:
+        image: mongodb/mongodb-atlas-local:latest
+        ports:
+          - 27017:27017
+        env:
+          MONGODB_INITDB_ROOT_USERNAME: root
+          MONGODB_INITDB_ROOT_PASSWORD: root
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+    env:
+      # Disponíveis para os testes das próximas fases. Ignorados na Fase 0.
+      MONGO_URI: mongodb://root:root@localhost:27017/?directConnection=true
+      REDIS_URL: redis://localhost:6379
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # pnpm precisa ser instalado ANTES do setup-node para que o cache do
+      # pnpm-lock.yaml seja resolvido corretamente.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ORDEM DE BUILD CRÍTICA:
+      # @dmdoc/shared-types expõe seus tipos via dist/ (campo "types" ->
+      # ./dist/index.d.ts). Quando apps/api e apps/worker passarem a importar
+      # @dmdoc/shared-types, o typecheck deles resolve os tipos pelo dist
+      # compilado. Por isso buildamos os packages ANTES de typecheck/test.
+      # `pnpm -r build` respeita o grafo do workspace e compila shared-types
+      # antes de api/worker.
+      - name: Build packages
+        run: pnpm -r build
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Lint
+        run: pnpm -r lint
+
+      - name: Test
+        run: pnpm -r test
