@@ -979,6 +979,69 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // =========================================================================
+  // DELETE /documents/:id — exclusão lógica + limpeza de chunks/S3
+  // =========================================================================
+  /**
+   * DELETE /documents/:id
+   *
+   * Soft-delete do documento (marca `deleted: true`). Remove fisicamente os
+   * chunks e o document_content do MongoDB e o arquivo do S3.
+   *
+   * Permissão: TENANT_ADMIN/SUPER_ADMIN sempre; UPLOADER precisa de canWrite no departamento.
+   * Resposta: 204 No Content.
+   */
+  app.delete('/documents/:id', { preHandler: app.authenticate }, async (request, reply) => {
+    const tenantId = request.tenantId as string;
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const db = app.db;
+
+    const { id } = request.params as { id: string };
+
+    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+    const doc = await repo.findById(id);
+
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    await assertCanWriteDepartment(db, userId, tenantId, doc.departmentId, role);
+
+    await repo.softDelete(id);
+
+    // Remove chunks e document_content — não há valor em mantê-los após exclusão
+    await Promise.all([
+      db.collection('chunks').deleteMany({ documentId: id, tenantId }),
+      db.collection('document_content').deleteOne({ documentId: id, tenantId }),
+    ]);
+
+    // Remove o arquivo do S3 (falha silenciosa — não derruba a operação)
+    await app.s3.deleteFile(doc.s3Key).catch((s3Err: unknown) => {
+      request.log.error({ err: s3Err, s3Key: doc.s3Key }, 'falha ao remover arquivo do S3');
+    });
+
+    const auditLogger = new AuditLogger(db);
+    try {
+      await auditLogger.record({
+        tenantId,
+        userId,
+        action: 'document.delete',
+        resource: `documents/${doc.id}`,
+        metadata: { filename: doc.filename, s3Key: doc.s3Key },
+      });
+    } catch (auditError) {
+      request.log.error(
+        { err: auditError, tenantId, userId, documentId: doc.id },
+        'falha ao registrar audit log de exclusão'
+      );
+    }
+
+    request.log.info({ tenantId, userId, documentId: doc.id }, 'documento excluído');
+
+    return reply.status(204).send();
+  });
+
+  // =========================================================================
   // POST /documents/:id/reprocess — reenfileira job para documento FAILED
   // =========================================================================
   /**

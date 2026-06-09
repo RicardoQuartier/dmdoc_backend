@@ -3,7 +3,7 @@
   "info": {
     "title": "DMDoc API",
     "description": "API de gestão documental multi-tenant com busca RAG. Fases 0–4 implementadas.",
-    "version": "0.4.0"
+    "version": "0.5.0"
   },
   "servers": [
     {
@@ -878,6 +878,31 @@
         "responses": {
           "200": { "description": "Documento atualizado", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Document" } } } },
           "422": { "description": "Valores de índice inválidos" }
+        }
+      },
+      "delete": {
+        "tags": ["Documentos"],
+        "summary": "Excluir documento",
+        "description": "Soft delete do documento. Remove fisicamente os chunks, document_content e o arquivo do S3. TENANT_ADMIN sempre; UPLOADER precisa de canWrite no departamento.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "204": { "description": "Excluído com sucesso" },
+          "403": { "description": "Sem permissão de escrita no departamento" },
+          "404": { "description": "Documento não encontrado" }
+        }
+      }
+    },
+    "/documents/{id}/reprocess": {
+      "post": {
+        "tags": ["Documentos"],
+        "summary": "Reprocessar documento com falha",
+        "description": "Reenfileira o job de processamento para um documento com status FAILED. Preserva o cache de extração (document_content) — se a extração já foi feita, o worker pula direto para embeddings. TENANT_ADMIN sempre; UPLOADER precisa de canWrite no departamento.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "202": { "description": "Documento reenfileirado — retorna o documento com status PENDING", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Document" } } } },
+          "403": { "description": "Sem permissão de escrita no departamento" },
+          "404": { "description": "Documento não encontrado" },
+          "409": { "description": "Documento não está em status FAILED" }
         }
       }
     },
