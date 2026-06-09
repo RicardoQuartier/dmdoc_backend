@@ -340,25 +340,38 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const db = app.db;
 
     // ------------------------------------------------------------------
-    // 1. Parse multipart
+    // 1. Parse multipart — lê todas as partes independente da ordem
+    //    request.file() só expõe fields que vêm ANTES do arquivo no stream,
+    //    então usamos request.parts() e bufferizamos o arquivo dentro do loop
+    //    para que campos posteriores ao arquivo também sejam lidos.
     // ------------------------------------------------------------------
-    const data = await request.file({ limits: { fileSize: app.uploadMaxBytes } });
-    if (!data) {
+    const textFields: Record<string, string> = {};
+    let fileData: MultipartFile | null = null;
+    let fileBuffer: Buffer | null = null;
+
+    for await (const part of request.parts({ limits: { fileSize: app.uploadMaxBytes } })) {
+      if (part.type === 'file') {
+        if (fileData === null) {
+          fileData = part;
+          fileBuffer = await streamToBuffer(part.file);
+        } else {
+          part.file.resume(); // descarta arquivos extras
+        }
+      } else {
+        textFields[part.fieldname] = part.value as string;
+      }
+    }
+
+    if (!fileData || !fileBuffer) {
       return reply.status(422).send({
         error: { code: 'VALIDATION_ERROR', message: 'Campo "file" é obrigatório' },
       });
     }
 
-    // Coletar campos de texto antes de consumir o stream do arquivo
-    // @fastify/multipart expõe os campos já parseados em data.fields
-    const fields = data.fields as Record<
-      string,
-      { value: string; fieldname: string } | MultipartFile
-    >;
-
-    const departmentIdRaw = (fields['departmentId'] as { value: string } | undefined)?.value;
-    const documentTypeIdRaw = (fields['documentTypeId'] as { value: string } | undefined)?.value;
-    const indexValuesRaw = (fields['indexValues'] as { value: string } | undefined)?.value;
+    const data = fileData;
+    const departmentIdRaw = textFields['departmentId'];
+    const documentTypeIdRaw = textFields['documentTypeId'];
+    const indexValuesRaw = textFields['indexValues'];
 
     // Valida campos obrigatórios
     const FieldsSchema = z.object({
@@ -413,9 +426,8 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     }
 
     // ------------------------------------------------------------------
-    // 3. Ler buffer do arquivo e calcular SHA-256
+    // 3. Calcular SHA-256 (buffer já lido no parse multipart)
     // ------------------------------------------------------------------
-    const fileBuffer = await streamToBuffer(data.file);
     const fileSize = fileBuffer.byteLength;
     const contentHash = sha256hex(fileBuffer);
     const originalFilename = data.filename;
