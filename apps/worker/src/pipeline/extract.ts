@@ -67,10 +67,10 @@ export async function extractDocument(
     };
   }
 
-  // Atualizar status para PROCESSING
+  // Atualizar status para PROCESSING e limpar failureReason de tentativas anteriores
   await db.collection('documents').updateOne(
     { id: documentId, tenantId },
-    { $set: { status: 'PROCESSING', updatedAt: new Date() } }
+    { $set: { status: 'PROCESSING', failureReason: null, updatedAt: new Date() } }
   );
 
   log.info({ s3Key, mimeType }, 'iniciando download do S3');

@@ -977,4 +977,92 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     return reply.status(200).send(updated);
   });
+
+  // =========================================================================
+  // POST /documents/:id/reprocess — reenfileira job para documento FAILED
+  // =========================================================================
+  /**
+   * POST /documents/:id/reprocess
+   *
+   * Reenfileira o job de processamento de um documento que está em status FAILED.
+   * Preserva o document_content cacheado (extração não é repetida se já existir).
+   *
+   * Permissão: TENANT_ADMIN/SUPER_ADMIN sempre; UPLOADER precisa de canWrite no departamento.
+   * Spec §8 fase 5, entregável 38.
+   */
+  app.post('/documents/:id/reprocess', { preHandler: app.authenticate }, async (request, reply) => {
+    const tenantId = request.tenantId as string;
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const db = app.db;
+
+    const { id } = request.params as { id: string };
+
+    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+    const doc = await repo.findById(id);
+
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    if (doc.status !== 'FAILED') {
+      return reply.status(409).send({
+        error: 'Conflict',
+        message: `Reprocessamento só é permitido para documentos com status FAILED. Status atual: ${doc.status}`,
+      });
+    }
+
+    await assertCanWriteDepartment(db, userId, tenantId, doc.departmentId, role);
+
+    const updated = await repo.updateById(id, {
+      status: 'PENDING',
+      failureReason: null,
+    } as Partial<Omit<DocumentDoc, 'id' | 'tenantId' | 'deleted'>>);
+
+    if (!updated) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    const jobData: DocumentProcessingJobData = DocumentProcessingJobDataSchema.parse({
+      tenantId,
+      documentId: doc.id,
+      s3Key: doc.s3Key,
+      mimeType: doc.mimeType,
+    });
+
+    if (app.queue !== null) {
+      await app.queue.add('process-document', jobData, {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2000 },
+      });
+    } else {
+      request.log.warn(
+        { tenantId, documentId: doc.id },
+        'queue não configurada — job de reprocessamento não enfileirado'
+      );
+    }
+
+    const auditLogger = new AuditLogger(db);
+    try {
+      await auditLogger.record({
+        tenantId,
+        userId,
+        action: 'document.reprocess',
+        resource: `documents/${doc.id}`,
+        metadata: { previousFailureReason: doc.failureReason },
+      });
+    } catch (auditError) {
+      request.log.error(
+        { err: auditError, tenantId, userId, documentId: doc.id },
+        'falha ao registrar audit log de reprocessamento'
+      );
+    }
+
+    request.log.info(
+      { tenantId, userId, documentId: doc.id },
+      'documento reenfileirado para reprocessamento'
+    );
+
+    return reply.status(202).send(updated);
+  });
 };
