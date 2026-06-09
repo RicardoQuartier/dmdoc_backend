@@ -1060,7 +1060,8 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
    * POST /documents/:id/reprocess
    *
    * Reenfileira o job de processamento de um documento que está em status FAILED.
-   * Preserva o document_content cacheado (extração não é repetida se já existir).
+   * Limpa document_content e chunks anteriores para forçar re-extração completa
+   * (caso contrário a guarda de idempotência no worker retorna o conteúdo antigo).
    *
    * Permissão: TENANT_ADMIN/SUPER_ADMIN sempre; UPLOADER precisa de canWrite no departamento.
    * Spec §8 fase 5, entregável 38.
@@ -1080,14 +1081,18 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    if (doc.status !== 'FAILED') {
+    if (doc.status === 'PROCESSING' || doc.status === 'PENDING') {
       return reply.status(409).send({
         error: 'Conflict',
-        message: `Reprocessamento só é permitido para documentos com status FAILED. Status atual: ${doc.status}`,
+        message: `Reprocessamento não pode ser iniciado enquanto o documento está ${doc.status}.`,
       });
     }
 
     await assertCanWriteDepartment(db, userId, tenantId, doc.departmentId, role);
+
+    // Limpa conteúdo anterior para forçar re-extração completa no worker
+    await db.collection('document_content').deleteOne({ documentId: id, tenantId });
+    await db.collection('chunks').deleteMany({ documentId: id, tenantId });
 
     const updated = await repo.updateById(id, {
       status: 'PENDING',
