@@ -33,11 +33,23 @@ const SUPPORTED_MIME_TYPES = new Set([
 ]);
 
 /**
+ * Mínimo de caracteres para considerar que a extração com strategy=auto
+ * produziu texto útil. Abaixo disso o documento provavelmente é uma imagem
+ * escaneada e o fallback hi_res (OCR forçado) será acionado.
+ */
+const MIN_TEXT_LENGTH_AUTO = 50;
+
+/**
  * Extrator que delega ao serviço Unstructured rodando via HTTP.
  *
- * Envia o arquivo como multipart/form-data e mapeia o array de elementos
- * para `ExtractionResult`. Lança `UnstructuredApiError` se o status HTTP
- * não for 2xx e `ExtractionError` para erros de rede ou MIME não suportado.
+ * Estratégia de extração em dois níveis:
+ * 1. Tenta `auto` (rápido, sem OCR forçado).
+ * 2. Se o texto extraído for menor que MIN_TEXT_LENGTH_AUTO (indica PDF
+ *    escaneado / sem camada de texto), re-tenta com `hi_res` que aciona
+ *    Tesseract via detectron2 para layout + OCR completo.
+ *
+ * Lança `UnstructuredApiError` se o status HTTP não for 2xx e
+ * `ExtractionError` para erros de rede ou MIME não suportado.
  */
 export class UnstructuredExtractor implements ExtractorProvider {
   private readonly config: UnstructuredExtractorConfig;
@@ -56,25 +68,44 @@ export class UnstructuredExtractor implements ExtractorProvider {
     }
 
     const startMs = Date.now();
-
-    // Lê o arquivo completo para um Buffer antes de montar o form-data.
-    // Isso evita o uso de streams dentro do FormData, que incompatibiliza
-    // com form.getBuffer() e com o fetch nativo do Node.
     const fileBuffer = await readFile(filePath);
 
+    const autoResult = await this.callApi(fileBuffer, filePath, mimeType, 'auto');
+
+    if (autoResult.fullText.length >= MIN_TEXT_LENGTH_AUTO) {
+      return { ...autoResult, durationMs: Date.now() - startMs };
+    }
+
+    // Texto insuficiente — provável PDF escaneado. Re-tenta com hi_res (OCR forçado).
+    const hiResResult = await this.callApi(fileBuffer, filePath, mimeType, 'hi_res');
+    return {
+      ...hiResResult,
+      // Marca todas as páginas como OCR quando hi_res foi necessário
+      ocrPages: Array.from({ length: hiResResult.pageCount }, (_, i) => i + 1),
+      durationMs: Date.now() - startMs,
+    };
+  }
+
+  private async callApi(
+    fileBuffer: Buffer,
+    filePath: string,
+    mimeType: string,
+    strategy: 'auto' | 'hi_res'
+  ): Promise<ExtractionResult> {
     const form = new FormData();
     form.append('files', fileBuffer, {
       filename: basename(filePath),
       contentType: mimeType,
     });
-    // Solicita coordenadas de página para determinar page_number corretamente
     form.append('include_page_breaks', 'true');
-    form.append('strategy', 'auto');
+    form.append('strategy', strategy);
+    // hi_res aciona OCR (Tesseract); especifica português para melhor acurácia
+    if (strategy === 'hi_res') {
+      form.append('ocr_languages', 'por');
+    }
 
     const formBuffer = form.getBuffer();
-    const headers: Record<string, string> = {
-      ...form.getHeaders(),
-    };
+    const headers: Record<string, string> = { ...form.getHeaders() };
     if (this.config.apiKey) {
       headers['unstructured-api-key'] = this.config.apiKey;
     }
@@ -113,36 +144,29 @@ export class UnstructuredExtractor implements ExtractorProvider {
       );
     }
 
-    // Garante array (a API pode retornar elementos aninhados por arquivo)
     const flat: UnstructuredElement[] = Array.isArray(elements[0])
       ? (elements as unknown as UnstructuredElement[][]).flat()
       : elements;
 
-    // Concatena textos, separando por parágrafo duplo
     const fullText = flat
       .filter((el) => typeof el.text === 'string' && el.text.trim().length > 0)
       .map((el) => el.text.trim())
       .join('\n\n');
 
-    // Determina pageCount pelo maior page_number encontrado
     let maxPage = 0;
     for (const el of flat) {
       const pn = el.metadata.page_number;
-      if (typeof pn === 'number' && pn > maxPage) {
-        maxPage = pn;
-      }
+      if (typeof pn === 'number' && pn > maxPage) maxPage = pn;
     }
     const pageCount = maxPage > 0 ? maxPage : 1;
-
-    const durationMs = Date.now() - startMs;
 
     return {
       fullText,
       pageCount,
-      ocrPages: [], // Unstructured não expõe quais páginas usaram OCR internamente
+      ocrPages: [],
       engine: 'unstructured',
-      engineVersion: '0.0.0', // versão do serviço — não exposta pela API free-tier
-      durationMs,
+      engineVersion: '0.0.0',
+      durationMs: 0, // preenchido pelo chamador com o tempo total
     };
   }
 }
