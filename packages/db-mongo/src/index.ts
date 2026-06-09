@@ -18,3 +18,14 @@ export {
   type PaginationOptions,
   type Page,
 } from './helpers.js';
+export {
+  lexicalSearch,
+  vectorSearch,
+  hybridSearch,
+  type ChunkSearchResult,
+  type SearchParams,
+  type LexicalSearchParams,
+  type VectorSearchParams,
+  type HybridSearchParams,
+  ChunkSearchResultSchema,
+} from './search.js';

@@ -48,3 +48,20 @@ export {
   DocumentProcessingJobDataSchema,
   type DocumentProcessingJobData,
 } from './job.js';
+export {
+  SearchRequestSchema,
+  type SearchRequest,
+  SearchResponseSchema,
+  type SearchResponse,
+  SearchChunkSchema,
+  type SearchChunk,
+  CitationSchema,
+  type Citation,
+  IndexFilterValueSchema,
+  type IndexFilterValue,
+  SSEEventSchema,
+  type SSEEvent,
+  type SSEChunkEvent,
+  type SSEDoneEvent,
+  type SSEErrorEvent,
+} from './search.js';

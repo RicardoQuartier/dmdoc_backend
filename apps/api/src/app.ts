@@ -14,6 +14,7 @@ import { departmentsRoutes } from './routes/departments.js';
 import { documentTypesRoutes } from './routes/document-types.js';
 import { permissionsRoutes } from './routes/permissions.js';
 import { documentsRoutes } from './routes/documents.js';
+import { searchRoutes, type SearchRoutesOptions } from './routes/search.js';
 import { createS3Service, type S3Service, type S3Config } from './services/s3.js';
 
 declare module 'fastify' {
@@ -115,6 +116,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(documentTypesRoutes);
   await app.register(permissionsRoutes);
   await app.register(documentsRoutes);
+  await app.register(searchRoutes, { config } satisfies SearchRoutesOptions);
 
   await app.ready();
   return app;

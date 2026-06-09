@@ -43,6 +43,17 @@ const EnvSchema = z.object({
 
   // Limites de upload (spec §12).
   MAX_UPLOAD_MB: z.coerce.number().int().positive().default(50),
+
+  // LLM — geração de resposta RAG (spec §12).
+  // LLM_PROVIDER=openai | openrouter
+  LLM_PROVIDER: z.enum(['openai', 'openrouter']).default('openrouter'),
+  LLM_BASE_URL: z.string().url().default('https://openrouter.ai/api/v1'),
+  LLM_API_KEY: z.string().default(''),
+  LLM_MODEL: z.string().min(1).default('google/gemma-3-27b-it:free'),
+
+  // Embeddings — sempre OpenAI, nunca OpenRouter (spec §12).
+  OPENAI_API_KEY: z.string().default(''),
+  EMBEDDING_MODEL: z.string().min(1).default('text-embedding-3-small'),
 });
 
 export type Config = Readonly<z.infer<typeof EnvSchema>>;

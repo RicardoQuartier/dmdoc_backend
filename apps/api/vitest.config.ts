@@ -12,6 +12,10 @@ export default defineConfig({
         import.meta.dirname,
         '../../packages/db-mongo/src/index.ts'
       ),
+      '@dmdoc/llm-provider': path.resolve(
+        import.meta.dirname,
+        '../../packages/llm-provider/src/index.ts'
+      ),
     },
   },
   test: {

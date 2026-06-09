@@ -4,7 +4,8 @@
     "noEmit": true,
     "paths": {
       "@dmdoc/shared-types": ["../../packages/shared-types/src/index.ts"],
-      "@dmdoc/db-mongo": ["../../packages/db-mongo/src/index.ts"]
+      "@dmdoc/db-mongo": ["../../packages/db-mongo/src/index.ts"],
+      "@dmdoc/llm-provider": ["../../packages/llm-provider/src/index.ts"]
     }
   },
   "include": ["src/**/*.ts"]
