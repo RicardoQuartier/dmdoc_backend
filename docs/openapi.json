@@ -220,7 +220,20 @@
                   "password": { "type": "string", "minLength": 8 }
                 }
               },
-              "example": { "email": "admin@dmdoc.io", "password": "senha123" }
+              "examples": {
+                "super_admin": {
+                  "summary": "SUPER_ADMIN (seed)",
+                  "value": { "email": "admin@dmdoc.local", "password": "ChangeMe!SuperAdmin1" }
+                },
+                "tenant_admin": {
+                  "summary": "TENANT_ADMIN — Empresa Teste Ltda (seed)",
+                  "value": { "email": "tenant-admin@dmdoc.local", "password": "ChangeMe!TenantAdmin1" }
+                },
+                "tenant_admin2": {
+                  "summary": "TENANT_ADMIN — Empresa Teste 2 Ltda (seed)",
+                  "value": { "email": "tenant-admin2@dmdoc.local", "password": "ChangeMe!TenantAdmin2" }
+                }
+              }
             }
           }
         },
