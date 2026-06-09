@@ -3,7 +3,7 @@ import type { FastifyPluginAsync, FastifyReply, FastifyBaseLogger } from 'fastif
 import type { Db } from 'mongodb';
 import { SearchRequestSchema } from '@dmdoc/shared-types';
 import type { SearchChunk, Citation } from '@dmdoc/shared-types';
-import { hybridSearch } from '@dmdoc/db-mongo';
+import { hybridSearch, lexicalSearch, vectorSearch } from '@dmdoc/db-mongo';
 import { createLLMProvider } from '@dmdoc/llm-provider';
 import type { LLMProvider } from '@dmdoc/llm-provider';
 import type { Config } from '../config.js';
@@ -201,7 +201,7 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     // 1. Validar body
     // ------------------------------------------------------------------
     const body = SearchRequestSchema.parse(request.body);
-    const { query, filters, topK, generateAnswer } = body;
+    const { query, searchMode, filters, topK, generateAnswer } = body;
 
     const log = request.log.child({ tenantId, userId, traceId: request.id });
 
@@ -247,34 +247,45 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     }
 
     // ------------------------------------------------------------------
-    // 4. Embedding da query (spec §9 etapa 2)
-    //    Sempre OpenAI (nunca OpenRouter)
+    // 4. Embedding da query — apenas quando searchMode exige vetorial
     // ------------------------------------------------------------------
-    const { embedding: queryEmbedding, costUsd: embeddingCostUsd } = await embedQuery(
-      query,
-      openaiClient,
-      config.EMBEDDING_MODEL,
-      log
-    );
+    let embeddingCostUsd = 0;
+    let queryEmbedding: number[] | null = null;
+
+    if (searchMode === 'vector' || searchMode === 'hybrid') {
+      const result = await embedQuery(query, openaiClient, config.EMBEDDING_MODEL, log);
+      queryEmbedding = result.embedding;
+      embeddingCostUsd = result.costUsd;
+    }
 
     // ------------------------------------------------------------------
-    // 5. Busca híbrida $rankFusion (spec §9 etapa 3)
+    // 5. Busca — modo selecionado via searchMode (spec §9 etapa 3)
     // ------------------------------------------------------------------
-    const hybridParams =
-      filterDocumentIds !== null
-        ? {
-            tenantId,
-            allowedDepartmentIds,
-            queryText: query,
-            queryEmbedding,
-            topK,
-            filterDocumentIds,
-          }
-        : { tenantId, allowedDepartmentIds, queryText: query, queryEmbedding, topK };
+    const baseParams = {
+      tenantId,
+      allowedDepartmentIds,
+      topK,
+      ...(filterDocumentIds !== null ? { filterDocumentIds } : {}),
+    };
 
-    const searchResults = await hybridSearch(db, hybridParams);
+    let searchResults;
 
-    log.info({ returned: searchResults.length, topK }, 'busca híbrida concluída');
+    if (searchMode === 'lexical') {
+      searchResults = await lexicalSearch(db, { ...baseParams, queryText: query });
+    } else if (searchMode === 'vector') {
+      searchResults = await vectorSearch(db, {
+        ...baseParams,
+        queryEmbedding: queryEmbedding as number[],
+      });
+    } else {
+      searchResults = await hybridSearch(db, {
+        ...baseParams,
+        queryText: query,
+        queryEmbedding: queryEmbedding as number[],
+      });
+    }
+
+    log.info({ returned: searchResults.length, topK, searchMode }, 'busca concluída');
 
     const chunks: SearchChunk[] = searchResults.map((r) => ({
       documentId: r.documentId,

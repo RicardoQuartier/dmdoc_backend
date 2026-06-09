@@ -37,6 +37,41 @@ services:
     environment:
       UNSTRUCTURED_API_KEY: ''
 
+  minio:
+    image: minio/minio:latest
+    container_name: dmdoc-minio
+    ports:
+      - '9000:9000'   # API S3-compatible
+      - '9001:9001'   # Console web (http://localhost:9001)
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ':9001'
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Cria o bucket automaticamente na primeira vez que o compose sobe
+  minio-init:
+    image: minio/mc:latest
+    container_name: dmdoc-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/dmdoc-documents &&
+        echo 'Bucket dmdoc-documents pronto.'
+      "
+    restart: 'no'
+
 volumes:
   mongodb_data:
   redis_data:
+  minio_data:

@@ -22,7 +22,9 @@ const WORKER_CONCURRENCY = 5;
 function createS3Client(): S3Client {
   return new S3Client({
     region: config.AWS_REGION,
-    ...(config.S3_ENDPOINT ? { endpoint: config.S3_ENDPOINT, forcePathStyle: true } : {}),
+    ...(config.S3_ENDPOINT
+    ? { endpoint: config.S3_ENDPOINT, forcePathStyle: config.S3_FORCE_PATH_STYLE }
+    : {}),
     ...(config.AWS_ACCESS_KEY_ID && config.AWS_SECRET_ACCESS_KEY
       ? {
           credentials: {

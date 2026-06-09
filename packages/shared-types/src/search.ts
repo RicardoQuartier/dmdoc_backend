@@ -19,8 +19,13 @@ export type IndexFilterValue = z.infer<typeof IndexFilterValueSchema>;
 /**
  * Body do POST /search (spec §7 — Busca RAG).
  *
+ * `searchMode`:
+ *   - `lexical`  → Atlas Search ($search) — sem embedding, sem API externa
+ *   - `vector`   → Atlas Vector Search ($vectorSearch) — requer embedding
+ *   - `hybrid`   → $rankFusion (lexical + vetorial) — requer embedding
+ *
  * `generateAnswer`: se true, passa os chunks para o LLM e retorna
- *   resposta gerada + citações. Se false, retorna apenas os chunks.
+ *   resposta gerada + citações. Requer LLM_API_KEY configurado.
  *
  * `topK`: número de chunks mais relevantes a retornar (padrão 10, máx 50).
  *
@@ -29,6 +34,7 @@ export type IndexFilterValue = z.infer<typeof IndexFilterValueSchema>;
  */
 export const SearchRequestSchema = z.object({
   query: z.string().min(1).max(2000),
+  searchMode: z.enum(['lexical', 'vector', 'hybrid']).default('hybrid'),
   filters: z
     .object({
       departmentIds: z.array(z.string().uuid()).optional(),

@@ -25,6 +25,11 @@ const EnvSchema = z.object({
   AWS_SECRET_ACCESS_KEY: z.string().min(1).optional(),
   /** Endpoint alternativo para MinIO em dev ou S3-compatible em prod. */
   S3_ENDPOINT: z.string().url().optional(),
+  /** true para MinIO (path-style obrigatório). false para AWS S3 e Cloudflare R2. */
+  S3_FORCE_PATH_STYLE: z
+    .string()
+    .transform((v) => v === 'true')
+    .default('false'),
 
   // Extração de texto
   /** Motor de extração: "native" para libs Node.js (prod), "unstructured" para serviço HTTP (dev). */

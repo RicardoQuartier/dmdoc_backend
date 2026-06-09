@@ -15,8 +15,10 @@ export interface S3Config {
   bucket: string;
   accessKeyId: string;
   secretAccessKey: string;
-  /** Endpoint alternativo para MinIO/LocalStack em dev. Ausente em produção. */
+  /** Endpoint alternativo para MinIO em dev ou Cloudflare R2 em prod. */
   endpoint?: string;
+  /** true para MinIO (path-style obrigatório). false para AWS S3 e Cloudflare R2. */
+  forcePathStyle?: boolean;
 }
 
 /**
@@ -41,7 +43,7 @@ export class S3Service {
       ...(config.endpoint !== undefined
         ? {
             endpoint: config.endpoint,
-            forcePathStyle: true, // necessário para MinIO
+            forcePathStyle: config.forcePathStyle ?? false,
           }
         : {}),
     });

@@ -36,7 +36,12 @@ const EnvSchema = z.object({
   AWS_S3_BUCKET: z.string().min(1, 'AWS_S3_BUCKET é obrigatória'),
   AWS_ACCESS_KEY_ID: z.string().min(1, 'AWS_ACCESS_KEY_ID é obrigatória'),
   AWS_SECRET_ACCESS_KEY: z.string().min(1, 'AWS_SECRET_ACCESS_KEY é obrigatória'),
-  S3_ENDPOINT: z.string().url().optional(), // MinIO em dev; ausente em prod
+  S3_ENDPOINT: z.string().url().optional(), // MinIO em dev; R2/LocalStack em staging
+  // true para MinIO (path-style obrigatório); false para AWS S3 e Cloudflare R2
+  S3_FORCE_PATH_STYLE: z
+    .string()
+    .transform((v) => v === 'true')
+    .default('false'),
 
   // Redis — BullMQ (spec §12). Fila de processamento de documentos.
   REDIS_URL: z.string().min(1, 'REDIS_URL é obrigatória'),

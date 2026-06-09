@@ -1,0 +1,1006 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "DMDoc API",
+    "description": "API de gestão documental multi-tenant com busca RAG. Fases 0–4 implementadas.",
+    "version": "0.4.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "Dev local"
+    }
+  ],
+  "tags": [
+    { "name": "Auth", "description": "Autenticação JWT" },
+    { "name": "Admin", "description": "Gestão de empresas (SUPER_ADMIN)" },
+    { "name": "Usuários", "description": "CRUD de usuários e permissões" },
+    { "name": "Departamentos", "description": "Árvore de departamentos" },
+    { "name": "Tipos de Documento", "description": "Tipos e campos de índice" },
+    { "name": "Documentos", "description": "Upload, listagem e download" },
+    { "name": "Busca", "description": "Busca RAG lexical / vetorial / híbrida" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      },
+      "TokenPair": {
+        "type": "object",
+        "properties": {
+          "accessToken": { "type": "string" },
+          "refreshToken": { "type": "string" }
+        },
+        "required": ["accessToken", "refreshToken"]
+      },
+      "AuthUser": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "tenantId": { "type": "string", "format": "uuid", "nullable": true },
+          "email": { "type": "string", "format": "email" },
+          "name": { "type": "string" },
+          "role": { "type": "string", "enum": ["SUPER_ADMIN", "TENANT_ADMIN", "UPLOADER", "USER"] },
+          "active": { "type": "boolean" }
+        }
+      },
+      "Tenant": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "diskQuotaBytes": { "type": "integer" },
+          "userQuota": { "type": "integer" },
+          "active": { "type": "boolean" },
+          "createdAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "User": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "tenantId": { "type": "string", "format": "uuid" },
+          "email": { "type": "string", "format": "email" },
+          "name": { "type": "string" },
+          "role": { "type": "string", "enum": ["TENANT_ADMIN", "UPLOADER", "USER"] },
+          "active": { "type": "boolean" },
+          "createdAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Department": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "tenantId": { "type": "string", "format": "uuid" },
+          "parentId": { "type": "string", "format": "uuid", "nullable": true },
+          "name": { "type": "string" },
+          "level": { "type": "integer", "minimum": 0, "maximum": 3 },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "createdAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "IndexField": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "fieldType": { "type": "string", "enum": ["TEXT", "DATE", "NUMBER", "CUSTOMER", "PROVIDER"] },
+          "required": { "type": "boolean" },
+          "aiExtractionHint": { "type": "string", "nullable": true },
+          "order": { "type": "integer" },
+          "showOnSearch": { "type": "boolean" },
+          "deleted": { "type": "boolean" }
+        }
+      },
+      "DocumentType": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "tenantId": { "type": "string", "format": "uuid", "nullable": true },
+          "name": { "type": "string" },
+          "description": { "type": "string", "nullable": true },
+          "isGlobal": { "type": "boolean" },
+          "indexFields": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/IndexField" }
+          },
+          "createdAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Document": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "tenantId": { "type": "string", "format": "uuid" },
+          "departmentId": { "type": "string", "format": "uuid" },
+          "documentTypeId": { "type": "string", "format": "uuid", "nullable": true },
+          "filename": { "type": "string" },
+          "originalFilename": { "type": "string" },
+          "contentHash": { "type": "string", "description": "SHA-256 do arquivo (64 hex chars)" },
+          "sizeBytes": { "type": "integer" },
+          "mimeType": { "type": "string" },
+          "s3Key": { "type": "string" },
+          "status": { "type": "string", "enum": ["PENDING", "PROCESSING", "READY", "FAILED"] },
+          "failureReason": { "type": "string", "nullable": true },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "mongoContentId": { "type": "string", "nullable": true },
+          "indexValues": { "type": "object", "additionalProperties": true },
+          "uploadedById": { "type": "string", "format": "uuid" },
+          "uploadedAt": { "type": "string", "format": "date-time" },
+          "processedAt": { "type": "string", "format": "date-time", "nullable": true },
+          "costUsdCents": { "type": "integer" },
+          "deleted": { "type": "boolean" }
+        }
+      },
+      "SearchChunk": {
+        "type": "object",
+        "properties": {
+          "documentId": { "type": "string" },
+          "documentTypeName": { "type": "string", "nullable": true },
+          "pageNumber": { "type": "integer", "nullable": true },
+          "chunkIndex": { "type": "integer" },
+          "text": { "type": "string" },
+          "score": { "type": "number" }
+        }
+      },
+      "Citation": {
+        "type": "object",
+        "properties": {
+          "documentId": { "type": "string" },
+          "pageNumber": { "type": "integer", "nullable": true },
+          "excerpt": { "type": "string" }
+        }
+      },
+      "Permission": {
+        "type": "object",
+        "properties": {
+          "departmentId": { "type": "string", "format": "uuid" },
+          "canRead": { "type": "boolean" },
+          "canWrite": { "type": "boolean" }
+        }
+      },
+      "Pagination": {
+        "type": "object",
+        "properties": {
+          "nextCursor": { "type": "string", "nullable": true }
+        }
+      }
+    }
+  },
+  "security": [{ "bearerAuth": [] }],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["Auth"],
+        "summary": "Health check",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "API no ar",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } },
+                "example": { "ok": true }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Login",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email", "password"],
+                "properties": {
+                  "email": { "type": "string", "format": "email" },
+                  "password": { "type": "string", "minLength": 8 }
+                }
+              },
+              "example": { "email": "admin@dmdoc.io", "password": "senha123" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Login bem-sucedido",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    { "$ref": "#/components/schemas/TokenPair" },
+                    { "type": "object", "properties": { "user": { "$ref": "#/components/schemas/AuthUser" } } }
+                  ]
+                }
+              }
+            }
+          },
+          "401": { "description": "Credenciais inválidas" }
+        }
+      }
+    },
+    "/auth/refresh": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Renovar tokens",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["refreshToken"],
+                "properties": { "refreshToken": { "type": "string" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Novo par de tokens", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TokenPair" } } } },
+          "401": { "description": "Refresh token inválido ou expirado" }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Logout (stateless)",
+        "responses": {
+          "200": { "description": "Sempre 200 — cliente descarta os tokens", "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } } } }
+        }
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "tags": ["Auth"],
+        "summary": "Usuário autenticado",
+        "responses": {
+          "200": { "description": "Dados do usuário logado", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthUser" } } } },
+          "401": { "description": "Token inválido ou expirado" }
+        }
+      }
+    },
+    "/admin/tenants": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Criar empresa",
+        "description": "Apenas SUPER_ADMIN.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string", "maxLength": 200 },
+                  "diskQuotaBytes": { "type": "integer", "default": 10737418240, "description": "Padrão: 10 GB" },
+                  "userQuota": { "type": "integer", "default": 20 }
+                }
+              },
+              "example": { "name": "Empresa Teste", "diskQuotaBytes": 10737418240, "userQuota": 20 }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Empresa criada", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Tenant" } } } },
+          "409": { "description": "Nome já em uso" }
+        }
+      },
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Listar empresas",
+        "description": "Apenas SUPER_ADMIN. Paginação por cursor.",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 20, "maximum": 100 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lista de empresas",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": { "type": "array", "items": { "$ref": "#/components/schemas/Tenant" } },
+                    "nextCursor": { "type": "string", "nullable": true }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/tenants/{id}": {
+      "patch": {
+        "tags": ["Admin"],
+        "summary": "Atualizar empresa",
+        "description": "Apenas SUPER_ADMIN.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "diskQuotaBytes": { "type": "integer" },
+                  "userQuota": { "type": "integer" },
+                  "active": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Empresa atualizada", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Tenant" } } } },
+          "404": { "description": "Empresa não encontrada" }
+        }
+      }
+    },
+    "/users": {
+      "post": {
+        "tags": ["Usuários"],
+        "summary": "Criar usuário",
+        "description": "TENANT_ADMIN cria no próprio tenant. SUPER_ADMIN deve informar `tenantId` no body.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email", "name", "role", "password"],
+                "properties": {
+                  "email": { "type": "string", "format": "email" },
+                  "name": { "type": "string" },
+                  "role": { "type": "string", "enum": ["TENANT_ADMIN", "UPLOADER", "USER"] },
+                  "password": { "type": "string", "minLength": 8 },
+                  "active": { "type": "boolean", "default": true },
+                  "tenantId": { "type": "string", "format": "uuid", "description": "Apenas SUPER_ADMIN" }
+                }
+              },
+              "example": { "email": "usuario@empresa.com", "name": "João Silva", "role": "UPLOADER", "password": "senha123" }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Usuário criado", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/User" } } } },
+          "409": { "description": "E-mail já em uso ou cota de usuários atingida" }
+        }
+      },
+      "get": {
+        "tags": ["Usuários"],
+        "summary": "Listar usuários",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 20 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string", "format": "uuid" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lista de usuários",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": { "type": "array", "items": { "$ref": "#/components/schemas/User" } },
+                    "nextCursor": { "type": "string", "nullable": true }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{id}": {
+      "patch": {
+        "tags": ["Usuários"],
+        "summary": "Atualizar usuário",
+        "description": "TENANT_ADMIN. SUPER_ADMIN deve informar `?tenantId`.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string", "format": "uuid" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "role": { "type": "string", "enum": ["TENANT_ADMIN", "UPLOADER", "USER"] },
+                  "active": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Usuário atualizado", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/User" } } } },
+          "404": { "description": "Usuário não encontrado" }
+        }
+      },
+      "delete": {
+        "tags": ["Usuários"],
+        "summary": "Remover usuário (soft delete)",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string", "format": "uuid" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "responses": {
+          "204": { "description": "Removido com sucesso" },
+          "404": { "description": "Usuário não encontrado" }
+        }
+      }
+    },
+    "/users/{id}/permissions": {
+      "get": {
+        "tags": ["Usuários"],
+        "summary": "Listar permissões do usuário",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string", "format": "uuid" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Permissões do usuário",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "permissions": { "type": "array", "items": { "$ref": "#/components/schemas/Permission" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": ["Usuários"],
+        "summary": "Substituir permissões do usuário",
+        "description": "Substitui TODAS as permissões do usuário. TENANT_ADMIN. SUPER_ADMIN deve informar `?tenantId`.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string", "format": "uuid" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["permissions"],
+                "properties": {
+                  "permissions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["departmentId", "canRead", "canWrite"],
+                      "properties": {
+                        "departmentId": { "type": "string", "format": "uuid" },
+                        "canRead": { "type": "boolean" },
+                        "canWrite": { "type": "boolean" }
+                      }
+                    }
+                  }
+                }
+              },
+              "example": {
+                "permissions": [
+                  { "departmentId": "uuid-dept-1", "canRead": true, "canWrite": false },
+                  { "departmentId": "uuid-dept-2", "canRead": true, "canWrite": true }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Permissões atualizadas",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "permissions": { "type": "array", "items": { "$ref": "#/components/schemas/Permission" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/departments": {
+      "get": {
+        "tags": ["Departamentos"],
+        "summary": "Listar departamentos",
+        "description": "Retorna array plano ordenado por nível. Máximo 1000 registros.",
+        "parameters": [
+          { "name": "tenantId", "in": "query", "schema": { "type": "string", "format": "uuid" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lista de departamentos",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Department" } }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["Departamentos"],
+        "summary": "Criar departamento",
+        "description": "TENANT_ADMIN. Máximo 4 níveis de profundidade.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string", "maxLength": 200 },
+                  "parentId": { "type": "string", "format": "uuid", "nullable": true, "default": null },
+                  "tags": { "type": "array", "items": { "type": "string" }, "default": [] },
+                  "tenantId": { "type": "string", "format": "uuid", "description": "Apenas SUPER_ADMIN" }
+                }
+              },
+              "example": { "name": "Financeiro", "parentId": null, "tags": [] }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Departamento criado", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Department" } } } },
+          "409": { "description": "Profundidade máxima de 4 níveis atingida" }
+        }
+      }
+    },
+    "/departments/{id}": {
+      "patch": {
+        "tags": ["Departamentos"],
+        "summary": "Atualizar departamento",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "tags": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Departamento atualizado", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Department" } } } },
+          "404": { "description": "Não encontrado" }
+        }
+      },
+      "delete": {
+        "tags": ["Departamentos"],
+        "summary": "Remover departamento (cascade soft delete)",
+        "description": "Remove o departamento, seus documentos e permissões vinculadas. Falha se houver sub-departamentos ativos.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "responses": {
+          "204": { "description": "Removido com sucesso" },
+          "409": { "description": "Departamento possui sub-departamentos ativos" }
+        }
+      }
+    },
+    "/document-types": {
+      "get": {
+        "tags": ["Tipos de Documento"],
+        "summary": "Listar tipos de documento",
+        "description": "Retorna tipos do tenant + tipos globais.",
+        "parameters": [
+          { "name": "tenantId", "in": "query", "schema": { "type": "string", "format": "uuid" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "responses": {
+          "200": { "description": "Lista de tipos", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/DocumentType" } } } } }
+        }
+      },
+      "post": {
+        "tags": ["Tipos de Documento"],
+        "summary": "Criar tipo de documento",
+        "description": "TENANT_ADMIN.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string", "maxLength": 200 },
+                  "description": { "type": "string", "nullable": true, "default": null },
+                  "tenantId": { "type": "string", "format": "uuid", "description": "Apenas SUPER_ADMIN" }
+                }
+              },
+              "example": { "name": "Contrato", "description": "Contratos comerciais" }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Tipo criado", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DocumentType" } } } }
+        }
+      }
+    },
+    "/document-types/{id}": {
+      "patch": {
+        "tags": ["Tipos de Documento"],
+        "summary": "Atualizar tipo de documento",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "description": { "type": "string", "nullable": true }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Tipo atualizado", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DocumentType" } } } },
+          "404": { "description": "Não encontrado" }
+        }
+      },
+      "delete": {
+        "tags": ["Tipos de Documento"],
+        "summary": "Remover tipo de documento",
+        "description": "Tipos globais não podem ser removidos por tenants.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "responses": {
+          "204": { "description": "Removido com sucesso" },
+          "403": { "description": "Tipos globais não podem ser excluídos por tenants" }
+        }
+      }
+    },
+    "/document-types/{id}/index-fields": {
+      "post": {
+        "tags": ["Tipos de Documento"],
+        "summary": "Adicionar campo de índice",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name", "fieldType"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "fieldType": { "type": "string", "enum": ["TEXT", "DATE", "NUMBER", "CUSTOMER", "PROVIDER"] },
+                  "required": { "type": "boolean", "default": false },
+                  "aiExtractionHint": { "type": "string", "nullable": true, "default": null },
+                  "order": { "type": "integer", "default": 0 },
+                  "showOnSearch": { "type": "boolean", "default": true }
+                }
+              },
+              "example": { "name": "Vencimento", "fieldType": "DATE", "required": true, "showOnSearch": true }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Tipo atualizado com novo campo", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DocumentType" } } } }
+        }
+      }
+    },
+    "/document-types/{id}/index-fields/{fieldId}": {
+      "patch": {
+        "tags": ["Tipos de Documento"],
+        "summary": "Atualizar campo de índice",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "fieldId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "fieldType": { "type": "string", "enum": ["TEXT", "DATE", "NUMBER", "CUSTOMER", "PROVIDER"] },
+                  "required": { "type": "boolean" },
+                  "aiExtractionHint": { "type": "string", "nullable": true },
+                  "order": { "type": "integer" },
+                  "showOnSearch": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Campo atualizado", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DocumentType" } } } }
+        }
+      },
+      "delete": {
+        "tags": ["Tipos de Documento"],
+        "summary": "Remover campo de índice (soft delete)",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "fieldId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string" }, "description": "Apenas SUPER_ADMIN" }
+        ],
+        "responses": {
+          "200": { "description": "Campo removido", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DocumentType" } } } }
+        }
+      }
+    },
+    "/documents": {
+      "post": {
+        "tags": ["Documentos"],
+        "summary": "Upload de documento",
+        "description": "multipart/form-data. Retorna 200 + X-Deduplicated: true se arquivo já existe (mesmo SHA-256).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["file", "departmentId"],
+                "properties": {
+                  "file": { "type": "string", "format": "binary", "description": "Arquivo (PDF, DOCX, XLSX, JPG, PNG, PPTX)" },
+                  "departmentId": { "type": "string", "format": "uuid" },
+                  "documentTypeId": { "type": "string", "format": "uuid", "description": "Opcional" },
+                  "indexValues": { "type": "string", "description": "JSON string com mapa campo→valor. Ex: {\"vencimento\": \"2026-01-31\"}" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Documento criado e enfileirado para processamento", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Document" } } } },
+          "200": {
+            "description": "Documento deduplicado — retorna o existente",
+            "headers": { "X-Deduplicated": { "schema": { "type": "string", "enum": ["true"] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Document" } } }
+          },
+          "409": { "description": "Cota de disco esgotada" },
+          "422": { "description": "Arquivo ausente ou indexValues inválido" }
+        }
+      },
+      "get": {
+        "tags": ["Documentos"],
+        "summary": "Listar documentos",
+        "description": "Paginação por cursor. Filtra pelos departamentos acessíveis do usuário.",
+        "parameters": [
+          { "name": "departmentId", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+          { "name": "documentTypeId", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+          { "name": "tags", "in": "query", "schema": { "type": "string" }, "description": "CSV de tags. Ex: 2026,janeiro" },
+          { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["PENDING", "PROCESSING", "READY", "FAILED"] } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 20, "maximum": 100 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lista de documentos",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": { "type": "array", "items": { "$ref": "#/components/schemas/Document" } },
+                    "nextCursor": { "type": "string", "nullable": true },
+                    "total": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/documents/{id}": {
+      "get": {
+        "tags": ["Documentos"],
+        "summary": "Detalhe do documento",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Documento", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Document" } } } },
+          "404": { "description": "Não encontrado ou sem permissão" }
+        }
+      },
+      "patch": {
+        "tags": ["Documentos"],
+        "summary": "Editar tipo, índices e tags",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "documentTypeId": { "type": "string", "format": "uuid", "nullable": true },
+                  "indexValues": { "type": "object", "additionalProperties": true },
+                  "tags": { "type": "array", "items": { "type": "string" } }
+                }
+              },
+              "example": { "documentTypeId": "uuid-tipo", "indexValues": { "vencimento": "2026-01-31", "valor": 5000 }, "tags": ["2026", "janeiro"] }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Documento atualizado", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Document" } } } },
+          "422": { "description": "Valores de índice inválidos" }
+        }
+      }
+    },
+    "/documents/{id}/download": {
+      "get": {
+        "tags": ["Documentos"],
+        "summary": "URL pré-assinada para download",
+        "description": "Gera URL válida por 5 minutos.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": {
+            "description": "URL de download",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "url": { "type": "string", "format": "uri" },
+                    "expiresAt": { "type": "string", "format": "date-time" }
+                  }
+                },
+                "example": { "url": "http://localhost:9000/dmdoc-documents/tenants/.../arquivo.pdf?X-Amz-...", "expiresAt": "2026-06-09T15:05:00.000Z" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/search": {
+      "post": {
+        "tags": ["Busca"],
+        "summary": "Busca de documentos / RAG",
+        "description": "Busca lexical, vetorial ou híbrida com geração opcional de resposta via LLM. Com `generateAnswer: true` retorna SSE (text/event-stream) em vez de JSON.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                  "query": { "type": "string", "minLength": 1, "maxLength": 2000 },
+                  "searchMode": {
+                    "type": "string",
+                    "enum": ["lexical", "vector", "hybrid"],
+                    "default": "hybrid",
+                    "description": "lexical: sem API externa. vector/hybrid: requer OPENAI_API_KEY."
+                  },
+                  "filters": {
+                    "type": "object",
+                    "properties": {
+                      "departmentIds": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+                      "documentTypeIds": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+                      "tags": { "type": "array", "items": { "type": "string" } },
+                      "indexFilters": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "object",
+                          "properties": {
+                            "gte": { "oneOf": [{ "type": "string" }, { "type": "number" }] },
+                            "lte": { "oneOf": [{ "type": "string" }, { "type": "number" }] },
+                            "eq": { "oneOf": [{ "type": "string" }, { "type": "number" }] }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "topK": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
+                  "generateAnswer": { "type": "boolean", "default": false, "description": "true → resposta SSE com streaming" }
+                }
+              },
+              "examples": {
+                "lexical_simples": {
+                  "summary": "Busca lexical sem API externa",
+                  "value": { "query": "contrato vencimento janeiro", "searchMode": "lexical", "generateAnswer": false }
+                },
+                "hibrida_com_filtros": {
+                  "summary": "Busca híbrida com filtros de índice",
+                  "value": {
+                    "query": "contratos que vencem em janeiro",
+                    "searchMode": "hybrid",
+                    "filters": {
+                      "departmentIds": ["uuid-dept"],
+                      "tags": ["2026"],
+                      "indexFilters": { "vencimento": { "gte": "2026-01-01", "lte": "2026-01-31" } }
+                    },
+                    "topK": 10,
+                    "generateAnswer": false
+                  }
+                },
+                "rag_com_resposta": {
+                  "summary": "RAG com geração de resposta (retorna SSE)",
+                  "value": { "query": "quais contratos vencem em janeiro?", "searchMode": "hybrid", "generateAnswer": true }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Resultado da busca (JSON) ou stream SSE (quando generateAnswer: true)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "answer": { "type": "string", "nullable": true },
+                    "citations": { "type": "array", "items": { "$ref": "#/components/schemas/Citation" } },
+                    "chunks": { "type": "array", "items": { "$ref": "#/components/schemas/SearchChunk" } },
+                    "costUsd": { "type": "number" }
+                  }
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "Eventos SSE:\nevent: chunk\\ndata: {\"type\":\"chunk\",\"text\":\"...\"}\n\nevent: done\\ndata: {\"type\":\"done\",\"citations\":[...],\"chunks\":[...],\"costUsd\":0.001}\n\nevent: error\\ndata: {\"type\":\"error\",\"message\":\"...\"}"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
