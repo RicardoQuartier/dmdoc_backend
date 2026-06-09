@@ -21,11 +21,6 @@ async function main(): Promise<void> {
 
   const app = await buildApp({ config, queue });
 
-  // Fecha a fila quando a app for encerrada (graceful shutdown)
-  app.addHook('onClose', async () => {
-    await queue.close();
-  });
-
   try {
     await app.listen({ port: config.APP_PORT, host: '0.0.0.0' });
   } catch (error) {

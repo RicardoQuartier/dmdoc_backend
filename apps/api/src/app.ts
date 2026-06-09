@@ -118,6 +118,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(documentsRoutes);
   await app.register(searchRoutes, { config } satisfies SearchRoutesOptions);
 
+  // Fecha a fila BullMQ no shutdown (deve ser antes de ready())
+  if (options.queue) {
+    const queue = options.queue;
+    app.addHook('onClose', async () => {
+      await queue.close();
+    });
+  }
+
   await app.ready();
   return app;
 }
