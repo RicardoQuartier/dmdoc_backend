@@ -59,6 +59,12 @@ const EnvSchema = z.object({
   // Embeddings — sempre OpenAI, nunca OpenRouter (spec §12).
   OPENAI_API_KEY: z.string().default(''),
   EMBEDDING_MODEL: z.string().min(1).default('text-embedding-3-small'),
+
+  // Rate limiting por tenant — Fase 5, entregável 39 (spec §8).
+  // Máximo de requisições por janela de tempo, por tenant.
+  // Defaults conservadores para produção; sobrescrever em dev/staging.
+  RATE_LIMIT_MAX: z.coerce.number().int().positive().default(200),
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
 });
 
 export type Config = Readonly<z.infer<typeof EnvSchema>>;

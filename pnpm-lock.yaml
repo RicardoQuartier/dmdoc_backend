@@ -56,6 +56,9 @@ importers:
       '@fastify/multipart':
         specifier: ^10.0.0
         version: 10.0.0
+      '@fastify/rate-limit':
+        specifier: ^11.0.0
+        version: 11.0.0
       argon2:
         specifier: ^0.41.1
         version: 0.41.1
@@ -750,6 +753,9 @@ packages:
   '@fastify/proxy-addr@5.1.0':
     resolution: {integrity: sha512-INS+6gh91cLUjB+PVHfu1UqcB76Sqtpyp7bnL+FYojhjygvOPA9ctiD/JDKsyD9Xgu4hUhCSJBPig/w7duNajw==}
 
+  '@fastify/rate-limit@11.0.0':
+    resolution: {integrity: sha512-kCs+G59SitZw9TL/ekFe+MrzXk20dEp6zPAM8WEZjFl5Ubvv5ksTbEXYr4jGlBwWAKn78q+NFsj5CN75zXLjaw==}
+
   '@humanfs/core@0.19.2':
     resolution: {integrity: sha512-UhXNm+CFMWcbChXywFwkmhqjs3PRCmcSa/hfBgLIb7oQ5HNb1wS0icWsGtSAUNgefHeI+eBrA8I1fxmbHsGdvA==}
     engines: {node: '>=18.18.0'}
@@ -912,6 +918,10 @@ packages:
 
   '@jridgewell/sourcemap-codec@1.5.5':
     resolution: {integrity: sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==}
+
+  '@lukeed/ms@2.0.2':
+    resolution: {integrity: sha512-9I2Zn6+NJLfaGoz9jN3lpwDgAYvfGeNYdbAIjJOqzs4Tpc+VU3Jqq4IofSUBKajiDS8k9fZIg18/z13mpk1bsA==}
+    engines: {node: '>=8'}
 
   '@mongodb-js/saslprep@1.4.11':
     resolution: {integrity: sha512-o9rAHc0IpIjuPSxRutWpE1F62x7n+4mVS4rCNHkzhIUMQcc18bb6xEq5wd2NdN0WjepIyXIppRshYI2kQDOZVA==}
@@ -3530,6 +3540,12 @@ snapshots:
       '@fastify/forwarded': 3.0.1
       ipaddr.js: 2.4.0
 
+  '@fastify/rate-limit@11.0.0':
+    dependencies:
+      '@lukeed/ms': 2.0.2
+      fastify-plugin: 5.1.0
+      toad-cache: 3.7.1
+
   '@humanfs/core@0.19.2':
     dependencies:
       '@humanfs/types': 0.15.0
@@ -3645,6 +3661,8 @@ snapshots:
   '@ioredis/commands@1.5.1': {}
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
+
+  '@lukeed/ms@2.0.2': {}
 
   '@mongodb-js/saslprep@1.4.11':
     dependencies:

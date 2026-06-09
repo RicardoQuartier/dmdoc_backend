@@ -6,6 +6,7 @@ import type { User } from '@dmdoc/shared-types';
 import { NotFoundError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantId } from '../auth/resolve-tenant.js';
+import { AuditLogger } from '../auth/audit.js';
 
 interface UserDoc extends TenantDocument {
   email: string;
@@ -167,6 +168,27 @@ export const permissionsRoutes: FastifyPluginAsync = async (app) => {
       canRead: (p as { canRead: boolean }).canRead,
       canWrite: (p as { canWrite: boolean }).canWrite,
     }));
+
+    // AuditLog de mudança de permissão (spec §10, invariante 7 — Fase 5)
+    const auditLogger = new AuditLogger(db);
+    try {
+      await auditLogger.record({
+        tenantId,
+        userId: request.user!.sub,
+        action: 'permission.update',
+        resource: `users/${id}/permissions`,
+        metadata: {
+          targetUserId: id,
+          permissionCount: permissions.length,
+          departmentIds: permissions.map((p) => p.departmentId),
+        },
+      });
+    } catch (auditError) {
+      request.log.error(
+        { err: auditError, tenantId, userId: id },
+        'falha ao registrar audit log de mudança de permissão'
+      );
+    }
 
     request.log.info({ tenantId, userId: id }, 'permissões atualizadas');
     return reply.status(200).send({ permissions: result });

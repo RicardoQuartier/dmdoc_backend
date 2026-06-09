@@ -9,8 +9,6 @@ import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import { NotFoundError, QuotaExceededError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
-import type { S3Service } from '../services/s3.js';
-import type { Queue } from 'bullmq';
 
 // ---------------------------------------------------------------------------
 // Tipos locais que mapeiam as coleções do MongoDB (spec §5.3)
@@ -71,33 +69,6 @@ interface IndexFieldDoc {
   showOnSearch: boolean;
   deleted: boolean;
 }
-
-// ---------------------------------------------------------------------------
-// Schema de resposta do upload
-// ---------------------------------------------------------------------------
-
-const UploadDocumentResponseSchema = z.object({
-  id: z.string().uuid(),
-  tenantId: z.string().uuid(),
-  departmentId: z.string().uuid(),
-  documentTypeId: z.string().uuid().nullable(),
-  filename: z.string(),
-  originalFilename: z.string(),
-  contentHash: z.string(),
-  sizeBytes: z.number(),
-  mimeType: z.string(),
-  s3Key: z.string(),
-  status: z.enum(['PENDING', 'PROCESSING', 'READY', 'FAILED']),
-  failureReason: z.string().nullable(),
-  tags: z.array(z.string()),
-  mongoContentId: z.string().nullable(),
-  indexValues: z.record(z.union([z.string(), z.number(), z.null()])),
-  uploadedById: z.string().uuid(),
-  uploadedAt: z.date(),
-  processedAt: z.date().nullable(),
-  costUsdCents: z.number(),
-  deleted: z.boolean(),
-});
 
 // ---------------------------------------------------------------------------
 // Schemas para novas rotas

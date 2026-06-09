@@ -7,6 +7,7 @@ import type { Db } from 'mongodb';
 import { getConfig, type Config } from './config.js';
 import { AppError } from './errors/index.js';
 import { authPlugin } from './plugins/auth.js';
+import { rateLimitPlugin } from './plugins/rate-limit.js';
 import { authRoutes } from './routes/auth.js';
 import { adminTenantsRoutes } from './routes/admin/tenants.js';
 import { usersRoutes } from './routes/users.js';
@@ -15,6 +16,8 @@ import { documentTypesRoutes } from './routes/document-types.js';
 import { permissionsRoutes } from './routes/permissions.js';
 import { documentsRoutes } from './routes/documents.js';
 import { searchRoutes, type SearchRoutesOptions } from './routes/search.js';
+import { auditLogsRoutes } from './routes/audit-logs.js';
+import { usageRoutes } from './routes/usage.js';
 import { createS3Service, type S3Service, type S3Config } from './services/s3.js';
 
 declare module 'fastify' {
@@ -105,6 +108,12 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   await app.register(authPlugin, { config, db });
 
+  // Rate limiting por tenant — Fase 5, entregável 39.
+  // Registrado após o authPlugin para que o keyGenerator tenha acesso ao tenantId
+  // quando disponível (o @fastify/rate-limit lê request.tenantId definido pelo authenticate).
+  // Rotas públicas (login, healthz) recaem no IP como chave.
+  await app.register(rateLimitPlugin, { config });
+
   app.get('/healthz', async () => {
     return { status: 'ok' } as const;
   });
@@ -117,6 +126,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(permissionsRoutes);
   await app.register(documentsRoutes);
   await app.register(searchRoutes, { config } satisfies SearchRoutesOptions);
+  await app.register(auditLogsRoutes);
+  await app.register(usageRoutes);
 
   // Fecha a fila BullMQ no shutdown (deve ser antes de ready())
   if (options.queue) {

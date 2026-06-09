@@ -24,7 +24,7 @@ const PASSWORD = 'senha-muito-secreta-123';
 let app: FastifyInstance;
 let testDb: TestDb;
 let tokenA: string;
-let tokenB: string;
+let _tokenB: string;
 
 beforeAll(async () => {
   testDb = await startTestDb();
@@ -82,7 +82,7 @@ beforeEach(async () => {
 
   // Obtém tokens para cada admin
   tokenA = await login('admin-a@empresa.com');
-  tokenB = await login('admin-b@empresa.com');
+  _tokenB = await login('admin-b@empresa.com');
 });
 
 async function login(email: string): Promise<string> {

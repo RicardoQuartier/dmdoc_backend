@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { TenantRepository, newId } from '@dmdoc/db-mongo';
 import type { IndexField } from '@dmdoc/shared-types';
 import type { TenantDocument } from '@dmdoc/db-mongo';
-import { ConflictError, ForbiddenError, NotFoundError } from '../errors/index.js';
+import { ForbiddenError, NotFoundError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantId } from '../auth/resolve-tenant.js';
 
