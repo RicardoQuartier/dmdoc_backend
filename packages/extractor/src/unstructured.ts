@@ -44,7 +44,7 @@ const SUPPORTED_MIME_TYPES = new Set([
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ]);
 
-const MIN_TEXT_LENGTH = 50;
+const MIN_TEXT_LENGTH = 20;
 
 /**
  * Retorna true se o texto tem conteúdo útil.
@@ -64,12 +64,11 @@ function isUsableText(text: string): boolean {
 /**
  * Extrator que delega ao serviço Unstructured rodando via HTTP.
  *
- * Pipeline de fallback para PDFs escaneados:
+ * Pipeline de fallback para PDFs escaneados e imagens:
  * 1. `auto` — rápido, sem OCR forçado.
  * 2. `ocr_only` — Tesseract em toda a página (sem layout detection).
- * 3. `tesseract.js` direto — converte PDF→imagem via pdftoppm e usa rotateAuto
- *    para corrigir documentos escaneados ao contrário (ex.: RG em página A4 invertida).
- *    Só ativado se `pdftoppm` estiver disponível no PATH.
+ * 3. `tesseract.js` direto — bbox detection + 4 rotações. Para PDF requer pdftoppm;
+ *    para JPEG/PNG usa o arquivo diretamente.
  */
 export class UnstructuredExtractor implements ExtractorProvider {
   private readonly config: UnstructuredExtractorConfig;
@@ -105,14 +104,14 @@ export class UnstructuredExtractor implements ExtractorProvider {
       };
     }
 
-    // Último recurso: tesseract.js direto com rotateAuto.
-    // Cobre o caso de scan armazenado invertido sem metadados de rotação
-    // (ex.: RG digitalizado ao contrário em página A4).
-    // Só executa se pdftoppm estiver disponível no PATH.
-    if (mimeType === 'application/pdf') {
+    // Último recurso: tesseract.js direto com bbox detection + 4 rotações.
+    // Cobre PDFs escaneados invertidos e imagens JPEG/PNG enviadas diretamente.
+    // Para PDF requer pdftoppm; para imagens usa o arquivo direto.
+    const isImage = mimeType === 'image/jpeg' || mimeType === 'image/png';
+    if (mimeType === 'application/pdf' || isImage) {
       let tsResult: ExtractionResult | null = null;
       try {
-        tsResult = await this.ocrWithTesseractJs(filePath);
+        tsResult = await this.ocrWithTesseractJs(filePath, mimeType);
       } catch (err) {
         process.stderr.write(`[dmdoc] ocrWithTesseractJs error: ${String(err)}\n`);
       }
@@ -130,45 +129,65 @@ export class UnstructuredExtractor implements ExtractorProvider {
   }
 
   /**
-   * Converte o PDF em imagens via pdftoppm e roda tesseract.js com rotateAuto.
-   * Retorna null se pdftoppm não estiver disponível no PATH.
+   * Roda tesseract.js com bbox detection + 4 rotações.
+   * Para PDF: converte para PNG via pdftoppm (requer poppler-utils no PATH).
+   * Para imagens (JPEG/PNG): usa o arquivo diretamente.
    */
-  private async ocrWithTesseractJs(filePath: string): Promise<ExtractionResult | null> {
-    // Verifica se pdftoppm está disponível — se não, skip silencioso
-    try {
-      await execAsync('which pdftoppm');
-    } catch {
-      process.stderr.write('[dmdoc] pdftoppm não encontrado, pulando fallback tesseract.js\n');
-      return null;
-    }
+  private async ocrWithTesseractJs(
+    filePath: string,
+    mimeType: string
+  ): Promise<ExtractionResult | null> {
+    const isImage = mimeType === 'image/jpeg' || mimeType === 'image/png';
 
     const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'dmdoc-tess-'));
     try {
-      const prefix = path.join(tmpDir, 'page');
-      process.stderr.write(`[dmdoc] pdftoppm: convertendo ${filePath}\n`);
-      await execAsync(`pdftoppm -r 300 -png "${filePath}" "${prefix}"`);
+      let files: string[];
 
-      const files = (await readdir(tmpDir))
-        .filter((f) => f.endsWith('.png'))
-        .sort()
-        .map((f) => path.join(tmpDir, f));
+      if (isImage) {
+        // Imagem enviada diretamente — usa como única "página"
+        files = [filePath];
+        process.stderr.write(`[dmdoc] tesseract.js: imagem direta ${filePath}\n`);
+      } else {
+        // PDF: converte para PNGs via pdftoppm
+        try {
+          await execAsync('which pdftoppm');
+        } catch {
+          process.stderr.write('[dmdoc] pdftoppm não encontrado, pulando fallback tesseract.js\n');
+          return null;
+        }
+        const prefix = path.join(tmpDir, 'page');
+        process.stderr.write(`[dmdoc] pdftoppm: convertendo ${filePath}\n`);
+        await execAsync(`pdftoppm -r 300 -png "${filePath}" "${prefix}"`);
+        files = (await readdir(tmpDir))
+          .filter((f) => f.endsWith('.png'))
+          .sort()
+          .map((f) => path.join(tmpDir, f));
+      }
 
       process.stderr.write(`[dmdoc] tesseract.js: ${files.length} página(s) para OCR\n`);
       if (files.length === 0) return null;
 
-      // Pré-processa cada página: encontra bounding box de conteúdo via pixels
-      // escuros (< 100) e gera 4 variantes de rotação para cobrir scans invertidos.
+      // Pré-processa cada página: gera 4 variantes de rotação.
+      // Para PDFs (convertidos via pdftoppm): usa bbox de pixels escuros para recortar
+      // o conteúdo antes de rodar o tesseract — evita o problema de "Estimating resolution"
+      // quando o documento ocupa só uma pequena área da página.
+      // Para imagens diretas (JPEG/PNG): usa a imagem completa — ela já é o documento.
       const preparedDir = path.join(tmpDir, 'prepared');
       await mkdir(preparedDir);
 
       const preparedFiles: string[] = [];
       for (const imgFile of files) {
-        const base = path.basename(imgFile, '.png');
+        const base = path.basename(imgFile, path.extname(imgFile));
 
-        // Descobrir bbox de conteúdo via imagem reduzida (5%)
         const origMeta = await sharp(imgFile).metadata();
         const origW = origMeta.width ?? 2544;
         const origH = origMeta.height as number ?? 3508;
+
+        let region: { left: number; top: number; width: number; height: number };
+
+        // Detecta bbox de conteúdo via pixels escuros (< 100) em thumbnail.
+        // Funciona para PDFs (conteúdo pequeno em página grande) e para imagens
+        // onde o texto concentrado numa região dá OCR melhor do que a imagem toda.
         const SW = 127, SH = Math.round((origH / origW) * SW);
         const { data: grayBuf, info: si } = await sharp(imgFile)
           .resize(SW, SH, { fit: 'fill' })
@@ -190,14 +209,13 @@ export class UnstructuredExtractor implements ExtractorProvider {
         }
 
         const scaleX = origW / SW, scaleY = origH / SH;
-        const PAD = 20; // pixels no espaço reduzido
+        const PAD = 20;
         const left = Math.max(0, Math.round((minX - PAD) * scaleX));
         const top = Math.max(0, Math.round((minY - PAD) * scaleY));
         const cropW = Math.min(origW - left, Math.round((maxX - minX + PAD * 2) * scaleX));
         const cropH = Math.min(origH - top, Math.round((maxY - minY + PAD * 2) * scaleY));
 
-        // Se não encontrou conteúdo, usa imagem inteira
-        const region =
+        region =
           maxX > minX && maxY > minY
             ? { left, top, width: cropW, height: cropH }
             : { left: 0, top: 0, width: origW, height: origH };
@@ -212,14 +230,21 @@ export class UnstructuredExtractor implements ExtractorProvider {
       const worker = await Tesseract.createWorker('por');
       const texts: string[] = [];
 
-      // Para cada página original, testa as 4 variantes e mantém a melhor
+      // Para cada página original, testa as 4 variantes e mantém a melhor.
+      // Critério: maior ratio de palavras longas (qualidade), desempate por comprimento.
       for (let p = 0; p < files.length; p++) {
         const variants = preparedFiles.slice(p * 4, p * 4 + 4);
         let best = '';
+        let bestRatio = 0;
         for (const imgFile of variants) {
           const r = await worker.recognize(imgFile);
           const t = r.data.text.trim();
-          if (isUsableText(t) && t.length > best.length) best = t;
+          const words = t.match(/\p{L}+/gu) ?? [];
+          const ratio = words.length > 0 ? words.filter((w) => w.length >= 4).length / words.length : 0;
+          if (isUsableText(t) && (ratio > bestRatio || (ratio === bestRatio && t.length > best.length))) {
+            best = t;
+            bestRatio = ratio;
+          }
         }
         if (best.length > 0) texts.push(best);
       }
