@@ -12,6 +12,7 @@ import {
   UnstructuredApiError,
   ExtractionError,
 } from './types.js';
+import { extractDocxImageText } from './docx-images.js';
 
 const execAsync = promisify(exec);
 
@@ -89,7 +90,25 @@ export class UnstructuredExtractor implements ExtractorProvider {
     const startMs = Date.now();
     const fileBuffer = await readFile(filePath);
 
+    const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
     const autoResult = await this.callApi(fileBuffer, filePath, mimeType, 'auto');
+
+    // Para DOCX, complementa o texto da API com OCR das imagens embutidas (word/media/).
+    // O Unstructured/auto não extrai imagens de DOCX — mammoth + tesseract.js cobrem o gap.
+    if (mimeType === DOCX_MIME) {
+      const imageText = await extractDocxImageText(filePath);
+      if (imageText.length > 0) {
+        const merged = [autoResult.fullText, imageText].filter(Boolean).join('\n\n');
+        return {
+          ...autoResult,
+          fullText: merged,
+          ocrPages: [1],
+          durationMs: Date.now() - startMs,
+        };
+      }
+      return { ...autoResult, durationMs: Date.now() - startMs };
+    }
+
     if (isUsableText(autoResult.fullText)) {
       return { ...autoResult, durationMs: Date.now() - startMs };
     }

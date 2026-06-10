@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { type ExtractionResult, type ExtractorProvider, ExtractionError } from './types.js';
+import { extractDocxImageText } from './docx-images.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -141,11 +142,20 @@ async function extractDocx(
 ): Promise<Pick<ExtractionResult, 'fullText' | 'pageCount' | 'ocrPages'>> {
   const buffer = await readFile(filePath);
   const mammoth = await importMammoth();
-  const result = await mammoth.extractRawText({ buffer });
+
+  const textResult = await mammoth.extractRawText({ buffer });
+  let fullText = textResult.value.trim();
+
+  const imageText = await extractDocxImageText(filePath);
+  const hasImages = imageText.length > 0;
+  if (hasImages) {
+    fullText = [fullText, imageText].filter(Boolean).join('\n\n');
+  }
+
   return {
-    fullText: result.value.trim(),
+    fullText,
     pageCount: 1, // mammoth não expõe contagem de páginas
-    ocrPages: [],
+    ocrPages: hasImages ? [1] : [],
   };
 }
 
