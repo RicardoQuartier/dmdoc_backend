@@ -15,7 +15,8 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "format": "prettier --write \"**/*.{ts,tsx,js,cjs,mjs,json,md,yaml,yml}\"",
-    "format:check": "prettier --check \"**/*.{ts,tsx,js,cjs,mjs,json,md,yaml,yml}\""
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,cjs,mjs,json,md,yaml,yml}\"",
+    "db:fresh": "pnpm --filter @dmdoc/db-mongo db:fresh"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
