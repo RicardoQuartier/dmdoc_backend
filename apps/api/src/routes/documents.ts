@@ -9,6 +9,7 @@ import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import { NotFoundError, QuotaExceededError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
+import { resolveTenantId } from '../auth/resolve-tenant.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais que mapeiam as coleções do MongoDB (spec §5.3)
@@ -76,6 +77,7 @@ interface IndexFieldDoc {
 
 /** Schema dos query params do GET /documents. */
 const ListDocumentsQuerySchema = z.object({
+  tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas — filtrar por tenant específico
   departmentId: z.string().uuid().optional(),
   documentTypeId: z.string().uuid().optional(),
   tags: z.string().optional(), // CSV de tags
@@ -127,6 +129,28 @@ function sanitizeFilename(name: string): string {
 }
 
 /**
+ * Busca um documento pelo seu id sem filtrar por tenantId.
+ *
+ * Usado exclusivamente para SUPER_ADMIN, que não tem um tenantId no JWT e
+ * precisa abrir qualquer documento diretamente (ex: a partir dos resultados
+ * de busca). O tenant é resolvido a partir do próprio documento encontrado —
+ * os checks de permissão subsequentes usam esse tenantId.
+ *
+ * Retorna null se o documento não existir ou estiver soft-deleted.
+ */
+async function findDocumentGlobally(
+  db: import('mongodb').Db,
+  id: string
+): Promise<DocumentDoc | null> {
+  const raw = await db
+    .collection<DocumentDoc>('documents')
+    .findOne({ id, deleted: false });
+  if (!raw) return null;
+  const { _id: _ignored, ...doc } = raw;
+  return doc as DocumentDoc;
+}
+
+/**
  * Resolve quais departmentIds o usuário pode LER.
  *
  * - TENANT_ADMIN / SUPER_ADMIN: `null` (sem restrição — retornar todos)
@@ -135,15 +159,16 @@ function sanitizeFilename(name: string): string {
 async function resolveReadableDepartmentIds(
   db: import('mongodb').Db,
   userId: string,
-  tenantId: string,
+  tenantId: string | null,
   role: string
 ): Promise<string[] | null> {
   if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN') {
     return null;
   }
+  // Para roles normais, tenantId nunca é null (vem do JWT)
   const perms = await db
     .collection<DepartmentPermissionDoc>('department_permissions')
-    .find({ userId, tenantId, canRead: true })
+    .find({ userId, tenantId: tenantId!, canRead: true })
     .toArray();
   return perms.map((p) => p.departmentId);
 }
@@ -159,22 +184,26 @@ async function resolveReadableDepartmentIds(
 async function assertCanReadDepartment(
   db: import('mongodb').Db,
   userId: string,
-  tenantId: string,
+  tenantId: string | null,
   departmentId: string,
   role: string
 ): Promise<void> {
   if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN') {
-    const dept = await db
-      .collection('departments')
-      .findOne({ id: departmentId, tenantId, deleted: false });
+    // SUPER_ADMIN sem tenantId filtrado: aceita qualquer departamento existente
+    const deptFilter: Record<string, unknown> = { id: departmentId, deleted: false };
+    if (tenantId !== null) {
+      deptFilter['tenantId'] = tenantId;
+    }
+    const dept = await db.collection('departments').findOne(deptFilter);
     if (!dept) {
       throw new NotFoundError('Departamento não encontrado');
     }
     return;
   }
+  // Para roles normais, tenantId nunca é null (vem do JWT)
   const perm = await db
     .collection<DepartmentPermissionDoc>('department_permissions')
-    .findOne({ userId, departmentId, tenantId, canRead: true });
+    .findOne({ userId, departmentId, tenantId: tenantId!, canRead: true });
   if (!perm) {
     throw new NotFoundError('Departamento não encontrado ou sem permissão de leitura');
   }
@@ -605,7 +634,6 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
    * Resposta: { items, nextCursor, total }
    */
   app.get('/documents', { preHandler: app.authenticate }, async (request, reply) => {
-    const tenantId = request.tenantId as string;
     const userId = request.user!.sub;
     const role = request.user!.role;
     const db = app.db;
@@ -613,21 +641,35 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     // Parse e validação de query params
     const query = ListDocumentsQuerySchema.parse(request.query);
 
+    // Resolve o tenantId efetivo:
+    // - roles normais: sempre o do JWT
+    // - SUPER_ADMIN com ?tenantId=xxx: filtra pelo tenant informado
+    // - SUPER_ADMIN sem ?tenantId: null (sem restrição de tenant — vê todos)
+    const effectiveTenantId = resolveTenantId(request, query.tenantId, false);
+
     // ------------------------------------------------------------------
     // 1. Resolver departamentos acessíveis
     // ------------------------------------------------------------------
-    const readableDepartmentIds = await resolveReadableDepartmentIds(db, userId, tenantId, role);
+    const readableDepartmentIds = await resolveReadableDepartmentIds(
+      db,
+      userId,
+      effectiveTenantId,
+      role
+    );
 
     // Se filtro por departamento específico foi solicitado, verificar permissão
     if (query.departmentId !== undefined) {
-      await assertCanReadDepartment(db, userId, tenantId, query.departmentId, role);
+      await assertCanReadDepartment(db, userId, effectiveTenantId, query.departmentId, role);
     }
 
     // ------------------------------------------------------------------
     // 2. Montar filtro base
     // ------------------------------------------------------------------
     type DocFilter = Record<string, unknown>;
-    const baseFilter: DocFilter = { tenantId, deleted: false };
+    const baseFilter: DocFilter = { deleted: false };
+    if (effectiveTenantId !== null) {
+      baseFilter['tenantId'] = effectiveTenantId;
+    }
 
     // Restrição de departamentos por role
     if (readableDepartmentIds !== null) {
@@ -690,7 +732,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const items = page.map(({ _id: _ignored, ...rest }) => rest);
 
     request.log.info(
-      { tenantId, userId, total, returned: items.length },
+      { tenantId: effectiveTenantId, userId, total, returned: items.length },
       'listagem de documentos'
     );
 
@@ -707,25 +749,34 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
    * de leitura no departamento do documento.
    */
   app.get('/documents/:id', { preHandler: app.authenticate }, async (request, reply) => {
-    const tenantId = request.tenantId as string;
     const userId = request.user!.sub;
     const role = request.user!.role;
     const db = app.db;
 
     const { id } = request.params as { id: string };
 
-    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
-    const doc = await repo.findById(id);
+    let doc: DocumentDoc | null;
+
+    if (role === 'SUPER_ADMIN') {
+      // SUPER_ADMIN não tem tenantId no JWT — busca o documento sem restrição
+      // de tenant e resolve o tenantId a partir do próprio documento.
+      doc = await findDocumentGlobally(db, id);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      doc = await repo.findById(id);
+    }
 
     if (!doc) {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    // Verifica permissão de leitura no departamento do documento
-    await assertCanReadDepartment(db, userId, tenantId, doc.departmentId, role);
+    // Verifica permissão de leitura no departamento do documento.
+    // Para SUPER_ADMIN o tenantId vem do próprio documento (sempre permitido).
+    await assertCanReadDepartment(db, userId, doc.tenantId, doc.departmentId, role);
 
     request.log.info(
-      { tenantId, userId, documentId: doc.id },
+      { tenantId: doc.tenantId, userId, documentId: doc.id },
       'detalhe de documento recuperado'
     );
 
@@ -744,7 +795,6 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
    * Resposta: { url: string, expiresAt: string (ISO 8601) }
    */
   app.get('/documents/:id/download', { preHandler: app.authenticate }, async (request, reply) => {
-    const tenantId = request.tenantId as string;
     const userId = request.user!.sub;
     const role = request.user!.role;
     const db = app.db;
@@ -752,10 +802,19 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const { id } = request.params as { id: string };
 
     // ------------------------------------------------------------------
-    // 1. Buscar documento (respeita tenantId + deleted: false via wrapper)
+    // 1. Buscar documento
+    //    SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
+    //    Demais roles: busca escopada ao tenant do JWT.
     // ------------------------------------------------------------------
-    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
-    const doc = await repo.findById(id);
+    let doc: DocumentDoc | null;
+
+    if (role === 'SUPER_ADMIN') {
+      doc = await findDocumentGlobally(db, id);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      doc = await repo.findById(id);
+    }
 
     if (!doc) {
       throw new NotFoundError('Documento não encontrado');
@@ -764,7 +823,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     // ------------------------------------------------------------------
     // 2. Verificar permissão de leitura no departamento
     // ------------------------------------------------------------------
-    await assertCanReadDepartment(db, userId, tenantId, doc.departmentId, role);
+    await assertCanReadDepartment(db, userId, doc.tenantId, doc.departmentId, role);
 
     // ------------------------------------------------------------------
     // 3. Gerar URL assinada (5 minutos = 300 segundos)
@@ -779,7 +838,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const auditLogger = new AuditLogger(db);
     try {
       await auditLogger.record({
-        tenantId,
+        tenantId: doc.tenantId,
         userId,
         action: 'document.download',
         resource: `documents/${doc.id}`,
@@ -787,13 +846,13 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       });
     } catch (auditError) {
       request.log.error(
-        { err: auditError, tenantId, userId, documentId: doc.id },
+        { err: auditError, tenantId: doc.tenantId, userId, documentId: doc.id },
         'falha ao registrar audit log de download'
       );
     }
 
     request.log.info(
-      { tenantId, userId, documentId: doc.id },
+      { tenantId: doc.tenantId, userId, documentId: doc.id },
       'URL de download gerada'
     );
 
@@ -816,7 +875,6 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
    * Registra AuditLog com a lista de campos alterados.
    */
   app.patch('/documents/:id', { preHandler: app.authenticate }, async (request, reply) => {
-    const tenantId = request.tenantId as string;
     const userId = request.user!.sub;
     const role = request.user!.role;
     const db = app.db;
@@ -828,13 +886,26 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     // ------------------------------------------------------------------
     // 1. Buscar documento
+    //    SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
+    //    Demais roles: busca escopada ao tenant do JWT.
     // ------------------------------------------------------------------
-    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
-    const doc = await repo.findById(id);
+    let doc: DocumentDoc | null;
+
+    if (role === 'SUPER_ADMIN') {
+      doc = await findDocumentGlobally(db, id);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      doc = await repo.findById(id);
+    }
 
     if (!doc) {
       throw new NotFoundError('Documento não encontrado');
     }
+
+    // A partir daqui o tenantId é sempre o do documento.
+    const tenantId = doc.tenantId;
+    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
 
     // ------------------------------------------------------------------
     // 2. Verificar permissão de ESCRITA no departamento
@@ -974,19 +1045,30 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
    * Resposta: 204 No Content.
    */
   app.delete('/documents/:id', { preHandler: app.authenticate }, async (request, reply) => {
-    const tenantId = request.tenantId as string;
     const userId = request.user!.sub;
     const role = request.user!.role;
     const db = app.db;
 
     const { id } = request.params as { id: string };
 
-    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
-    const doc = await repo.findById(id);
+    // SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
+    // Demais roles: busca escopada ao tenant do JWT.
+    let doc: DocumentDoc | null;
+
+    if (role === 'SUPER_ADMIN') {
+      doc = await findDocumentGlobally(db, id);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      doc = await repo.findById(id);
+    }
 
     if (!doc) {
       throw new NotFoundError('Documento não encontrado');
     }
+
+    const tenantId = doc.tenantId;
+    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
 
     await assertCanWriteDepartment(db, userId, tenantId, doc.departmentId, role);
 
@@ -1038,15 +1120,23 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
    * Spec §8 fase 5, entregável 38.
    */
   app.post('/documents/:id/reprocess', { preHandler: app.authenticate }, async (request, reply) => {
-    const tenantId = request.tenantId as string;
     const userId = request.user!.sub;
     const role = request.user!.role;
     const db = app.db;
 
     const { id } = request.params as { id: string };
 
-    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
-    const doc = await repo.findById(id);
+    // SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
+    // Demais roles: busca escopada ao tenant do JWT.
+    let doc: DocumentDoc | null;
+
+    if (role === 'SUPER_ADMIN') {
+      doc = await findDocumentGlobally(db, id);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      doc = await repo.findById(id);
+    }
 
     if (!doc) {
       throw new NotFoundError('Documento não encontrado');
@@ -1058,6 +1148,9 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
         message: `Reprocessamento não pode ser iniciado enquanto o documento está ${doc.status}.`,
       });
     }
+
+    const tenantId = doc.tenantId;
+    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
 
     await assertCanWriteDepartment(db, userId, tenantId, doc.departmentId, role);
 

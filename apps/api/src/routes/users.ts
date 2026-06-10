@@ -146,6 +146,32 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
   });
 
   /**
+   * GET /users/:id — retorna um único usuário pelo ID.
+   * TENANT_ADMIN: escopado ao próprio tenant.
+   * SUPER_ADMIN: busca global (IDs são UUIDs globalmente únicos).
+   */
+  app.get('/users/:id', { preHandler: app.authenticate }, async (request, reply) => {
+    requireRole(request, 'TENANT_ADMIN');
+
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const db = app.db;
+    const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
+
+    if (isSuperAdmin) {
+      const user = await db.collection('users').findOne({ id, deleted: false }) as unknown as UserDoc | null;
+      if (!user) throw new NotFoundError();
+      return reply.status(200).send(safeUser(user));
+    }
+
+    const tenantId = request.tenantId!;
+    const usersRepo = new TenantRepository<UserDoc>(db.collection('users'), { tenantId });
+    const user = await usersRepo.findById(id);
+    if (!user) throw new NotFoundError();
+
+    return reply.status(200).send(safeUser(user));
+  });
+
+  /**
    * PATCH /users/:id — atualiza usuário do tenant.
    * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
    */

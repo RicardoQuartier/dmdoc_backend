@@ -131,6 +131,52 @@ describe('Isolamento multi-tenant — PATCH /users/:id', () => {
   });
 });
 
+describe('Isolamento multi-tenant — GET /departments', () => {
+  it('tenant A não enxerga departamentos do tenant B', async () => {
+    const deptIdA = newId();
+    const deptIdB = newId();
+
+    await testDb.db.collection('departments').insertMany([
+      {
+        id: deptIdA,
+        tenantId: TENANT_A,
+        parentId: null,
+        name: 'Dept do Tenant A',
+        level: 0,
+        tags: [],
+        deleted: false,
+        createdAt: new Date(),
+      },
+      {
+        id: deptIdB,
+        tenantId: TENANT_B,
+        parentId: null,
+        name: 'Dept do Tenant B',
+        level: 0,
+        tags: [],
+        deleted: false,
+        createdAt: new Date(),
+      },
+    ]);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments',
+      headers: { authorization: `Bearer ${tokenA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const items = res.json() as Array<{ id: string; tenantId: string }>;
+
+    const ids = items.map((d) => d.id);
+    expect(ids).toContain(deptIdA);
+    expect(ids).not.toContain(deptIdB);
+
+    // Todos os registros devolvidos devem ser do tenant A
+    expect(items.every((d) => d.tenantId === TENANT_A)).toBe(true);
+  });
+});
+
 describe('Isolamento multi-tenant — DELETE /departments/:id', () => {
   it('tenant A tentando deletar departamento do tenant B → 404', async () => {
     // Cria departamento no tenant B

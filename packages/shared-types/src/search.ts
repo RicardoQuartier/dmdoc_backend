@@ -57,6 +57,8 @@ export type SearchRequest = z.infer<typeof SearchRequestSchema>;
  */
 export const SearchChunkSchema = z.object({
   documentId: z.string(),
+  documentName: z.string().nullable(),
+  tenantId: z.string().nullable(),
   documentTypeName: z.string().nullable(),
   pageNumber: z.number().nullable(),
   chunkIndex: z.number(),

@@ -1,4 +1,5 @@
 import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
+import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import { ZodError } from 'zod';
 import type { Queue } from 'bullmq';
@@ -82,6 +83,12 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   });
 
   registerErrorHandler(app);
+
+  await app.register(cors, {
+    origin: config.NODE_ENV === 'production' ? false : true,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  });
 
   const db = await resolveDb(app, options, config);
 

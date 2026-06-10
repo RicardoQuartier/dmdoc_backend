@@ -67,13 +67,21 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
         .limit(1000)
         .toArray()) as unknown as DepartmentDoc[];
     } else {
-      const tenantId = request.tenantId!;
-      const repo = new TenantRepository<DepartmentDoc>(db.collection('departments'), { tenantId });
-      const page = await repo.findMany({}, { limit: 1000 });
-      items = page.items.sort((a, b) => {
-        if (a.level !== b.level) return a.level - b.level;
-        return a.name.localeCompare(b.name);
-      });
+      const tenantId = request.tenantId;
+      // tenantId deve ser sempre uma string UUID para roles não-SUPER_ADMIN.
+      // A checagem explícita protege contra execuções fora do fluxo normal de
+      // autenticação e evita que uma query sem tenantId vaze dados de todos os
+      // tenants (BSON serializa `undefined` descartando a chave do filtro).
+      if (typeof tenantId !== 'string') {
+        throw new Error('tenantId ausente no contexto da request');
+      }
+
+      items = (await db
+        .collection('departments')
+        .find({ tenantId, deleted: false })
+        .sort({ level: 1, name: 1 })
+        .limit(1000)
+        .toArray()) as unknown as DepartmentDoc[];
     }
 
     return reply.status(200).send(items);

@@ -23,6 +23,7 @@ const CreateDocumentTypeBodySchema = z.object({
   name: z.string().min(1).max(200),
   description: z.string().nullable().default(null),
   tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas
+  isGlobal: z.boolean().default(false),   // SUPER_ADMIN apenas
 });
 
 const PatchDocumentTypeBodySchema = z.object({
@@ -119,11 +120,30 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     requireRole(request, 'TENANT_ADMIN');
 
     const body = CreateDocumentTypeBodySchema.parse(request.body);
-    const effectiveTenantId = resolveTenantId(request, body.tenantId, true);
-    const tenantId = effectiveTenantId as string;
-
+    const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
     const { name, description } = body;
     const db = app.db;
+
+    if (isSuperAdmin && body.isGlobal) {
+      // Tipo global — sem escopo de tenant
+      const id = newId();
+      const docType = {
+        id,
+        tenantId: null,
+        name,
+        description: description ?? null,
+        isGlobal: true,
+        createdAt: new Date(),
+        indexFields: [],
+        deleted: false,
+      };
+      await db.collection('document_types').insertOne(docType);
+      request.log.info({ documentTypeId: id }, 'tipo de documento global criado');
+      return reply.status(201).send(docType);
+    }
+
+    const effectiveTenantId = resolveTenantId(request, body.tenantId, true);
+    const tenantId = effectiveTenantId as string;
 
     const repo = new TenantRepository<DocumentTypeDoc>(
       db.collection('document_types'),
@@ -143,29 +163,41 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
   });
 
   /**
-   * PATCH /document-types/:id — atualiza tipo de documento do tenant.
-   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
+   * PATCH /document-types/:id — atualiza tipo de documento.
+   * SUPER_ADMIN em tipo global: sem tenantId necessário.
+   * SUPER_ADMIN em tipo de tenant: informar `?tenantId=xxx`.
    */
   app.patch('/document-types/:id', { preHandler: app.authenticate }, async (request, reply) => {
     requireRole(request, 'TENANT_ADMIN');
+
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const updates = PatchDocumentTypeBodySchema.parse(request.body);
+    const db = app.db;
+    const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
+
+    const existing = await db.collection('document_types').findOne({ id, deleted: false });
+    if (!existing) throw new NotFoundError();
+    const doc = existing as unknown as DocumentTypeDoc;
+
+    if (doc.isGlobal) {
+      if (!isSuperAdmin) throw new ForbiddenError('Tipos globais só podem ser editados por SUPER_ADMIN');
+      const clean = removeUndefined(updates);
+      const result = await db.collection('document_types').findOneAndUpdate(
+        { id, deleted: false },
+        { $set: clean },
+        { returnDocument: 'after' }
+      );
+      if (!result) throw new NotFoundError();
+      request.log.info({ documentTypeId: id }, 'tipo de documento global atualizado');
+      return reply.status(200).send(stripMongoId(result as Record<string, unknown>));
+    }
 
     const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
     const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
     const tenantId = effectiveTenantId as string;
 
-    const { id } = z.object({ id: z.string() }).parse(request.params);
-    const updates = PatchDocumentTypeBodySchema.parse(request.body);
-    const db = app.db;
-
-    const repo = new TenantRepository<DocumentTypeDoc>(
-      db.collection('document_types'),
-      { tenantId }
-    );
-
-    const updated = await repo.updateById(
-      id,
-      removeUndefined(updates) as Parameters<typeof repo.updateById>[1]
-    );
+    const repo = new TenantRepository<DocumentTypeDoc>(db.collection('document_types'), { tenantId });
+    const updated = await repo.updateById(id, removeUndefined(updates) as Parameters<typeof repo.updateById>[1]);
     if (!updated) throw new NotFoundError();
 
     request.log.info({ tenantId, documentTypeId: id }, 'tipo de documento atualizado');
@@ -174,36 +206,32 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * DELETE /document-types/:id — soft-delete de tipo do tenant.
-   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
-   * Tipos globais não podem ser deletados por tenants.
+   * SUPER_ADMIN pode deletar tipos globais sem tenantId.
+   * Tenants não podem deletar tipos globais.
    */
   app.delete('/document-types/:id', { preHandler: app.authenticate }, async (request, reply) => {
     requireRole(request, 'TENANT_ADMIN');
+
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const db = app.db;
+    const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
+
+    const existing = await db.collection('document_types').findOne({ id, deleted: false });
+    if (!existing) throw new NotFoundError();
+    const doc = existing as unknown as DocumentTypeDoc;
+
+    if (doc.isGlobal) {
+      if (!isSuperAdmin) throw new ForbiddenError('Tipos globais não podem ser excluídos por tenants');
+      await db.collection('document_types').updateOne({ id }, { $set: { deleted: true } });
+      request.log.info({ documentTypeId: id }, 'tipo de documento global removido');
+      return reply.status(204).send();
+    }
 
     const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
     const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
     const tenantId = effectiveTenantId as string;
 
-    const { id } = z.object({ id: z.string() }).parse(request.params);
-    const db = app.db;
-
-    // Verificar se é tipo global antes de tentar deletar
-    const existing = await db
-      .collection('document_types')
-      .findOne({ id, deleted: false });
-
-    if (!existing) throw new NotFoundError();
-
-    const doc = existing as unknown as DocumentTypeDoc;
-    if (doc.isGlobal) {
-      throw new ForbiddenError('Tipos globais não podem ser excluídos por tenants');
-    }
-
-    // Confirmar que pertence ao tenant (TenantRepository garante 404 cross-tenant)
-    const repo = new TenantRepository<DocumentTypeDoc>(
-      db.collection('document_types'),
-      { tenantId }
-    );
+    const repo = new TenantRepository<DocumentTypeDoc>(db.collection('document_types'), { tenantId });
     const deleted = await repo.softDelete(id);
     if (!deleted) throw new NotFoundError();
 
@@ -221,13 +249,23 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     async (request, reply) => {
       requireRole(request, 'TENANT_ADMIN');
 
-      const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
-      const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
-      const tenantId = effectiveTenantId as string;
-
       const { id } = z.object({ id: z.string() }).parse(request.params);
       const fieldInput = CreateIndexFieldBodySchema.parse(request.body);
       const db = app.db;
+      const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
+
+      const existing = await db.collection('document_types').findOne({ id, deleted: false });
+      if (!existing) throw new NotFoundError();
+      const docType = existing as unknown as DocumentTypeDoc;
+      if (docType.isGlobal && !isSuperAdmin) throw new ForbiddenError('Tipos globais só podem ser editados por SUPER_ADMIN');
+
+      const typeFilter = docType.isGlobal
+        ? { id, deleted: false }
+        : (() => {
+            const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
+            const tenantId = resolveTenantId(request, tenantIdParam, true) as string;
+            return { id, tenantId, deleted: false };
+          })();
 
       const newField: IndexField = {
         id: newId(),
@@ -243,9 +281,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       const updated = await db
         .collection('document_types')
         .findOneAndUpdate(
-          { id, tenantId, deleted: false },
-          // Cast necessário: o tipo do driver para $push é restrito a arrays,
-          // mas indexFields é um array de subdocumentos.
+          typeFilter,
           { $push: { indexFields: newField } } as Record<string, unknown>,
           { returnDocument: 'after' }
         );
@@ -253,7 +289,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       if (!updated) throw new NotFoundError();
 
       request.log.info(
-        { tenantId, documentTypeId: id, fieldId: newField.id },
+        { documentTypeId: id, fieldId: newField.id },
         'campo de índice adicionado'
       );
       return reply.status(200).send(stripMongoId(updated as Record<string, unknown>));
@@ -262,7 +298,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * PATCH /document-types/:id/index-fields/:fieldId — atualiza campo.
-   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
+   * SUPER_ADMIN em tipo global: sem tenantId necessário.
    */
   app.patch(
     '/document-types/:id/index-fields/:fieldId',
@@ -270,15 +306,25 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     async (request, reply) => {
       requireRole(request, 'TENANT_ADMIN');
 
-      const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
-      const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
-      const tenantId = effectiveTenantId as string;
-
       const { id, fieldId } = z
         .object({ id: z.string(), fieldId: z.string() })
         .parse(request.params);
       const fieldUpdates = PatchIndexFieldBodySchema.parse(request.body);
       const db = app.db;
+      const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
+
+      const existing = await db.collection('document_types').findOne({ id, deleted: false });
+      if (!existing) throw new NotFoundError();
+      const docType = existing as unknown as DocumentTypeDoc;
+      if (docType.isGlobal && !isSuperAdmin) throw new ForbiddenError('Tipos globais só podem ser editados por SUPER_ADMIN');
+
+      const typeFilter = docType.isGlobal
+        ? { id, deleted: false }
+        : (() => {
+            const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
+            const tenantId = resolveTenantId(request, tenantIdParam, true) as string;
+            return { id, tenantId, deleted: false };
+          })();
 
       // Monta o $set para o subdocumento usando arrayFilters
       const setOps: Record<string, unknown> = {};
@@ -289,17 +335,15 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       }
 
       if (Object.keys(setOps).length === 0) {
-        const existing = await db
-          .collection('document_types')
-          .findOne({ id, tenantId, deleted: false });
-        if (!existing) throw new NotFoundError();
-        return reply.status(200).send(stripMongoId(existing as Record<string, unknown>));
+        const noopExisting = await db.collection('document_types').findOne(typeFilter);
+        if (!noopExisting) throw new NotFoundError();
+        return reply.status(200).send(stripMongoId(noopExisting as Record<string, unknown>));
       }
 
       const updated = await db
         .collection('document_types')
         .findOneAndUpdate(
-          { id, tenantId, deleted: false, 'indexFields.id': fieldId },
+          { ...typeFilter, 'indexFields.id': fieldId },
           { $set: setOps },
           {
             returnDocument: 'after',
@@ -310,7 +354,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       if (!updated) throw new NotFoundError();
 
       request.log.info(
-        { tenantId, documentTypeId: id, fieldId },
+        { documentTypeId: id, fieldId },
         'campo de índice atualizado'
       );
       return reply.status(200).send(stripMongoId(updated as Record<string, unknown>));
@@ -319,7 +363,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * DELETE /document-types/:id/index-fields/:fieldId — soft-delete do campo.
-   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
+   * SUPER_ADMIN em tipo global: sem tenantId necessário.
    */
   app.delete(
     '/document-types/:id/index-fields/:fieldId',
@@ -327,19 +371,29 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     async (request, reply) => {
       requireRole(request, 'TENANT_ADMIN');
 
-      const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
-      const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
-      const tenantId = effectiveTenantId as string;
-
       const { id, fieldId } = z
         .object({ id: z.string(), fieldId: z.string() })
         .parse(request.params);
       const db = app.db;
+      const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
+
+      const existing = await db.collection('document_types').findOne({ id, deleted: false });
+      if (!existing) throw new NotFoundError();
+      const docType = existing as unknown as DocumentTypeDoc;
+      if (docType.isGlobal && !isSuperAdmin) throw new ForbiddenError('Tipos globais só podem ser editados por SUPER_ADMIN');
+
+      const typeFilter = docType.isGlobal
+        ? { id, deleted: false }
+        : (() => {
+            const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
+            const tenantId = resolveTenantId(request, tenantIdParam, true) as string;
+            return { id, tenantId, deleted: false };
+          })();
 
       const updated = await db
         .collection('document_types')
         .findOneAndUpdate(
-          { id, tenantId, deleted: false, 'indexFields.id': fieldId },
+          { ...typeFilter, 'indexFields.id': fieldId },
           { $set: { 'indexFields.$[elem].deleted': true } },
           {
             returnDocument: 'after',
@@ -350,7 +404,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       if (!updated) throw new NotFoundError();
 
       request.log.info(
-        { tenantId, documentTypeId: id, fieldId },
+        { documentTypeId: id, fieldId },
         'campo de índice removido (soft delete)'
       );
       return reply.status(200).send(stripMongoId(updated as Record<string, unknown>));

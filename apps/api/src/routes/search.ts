@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import { z } from 'zod';
 import type { FastifyPluginAsync, FastifyReply, FastifyBaseLogger } from 'fastify';
 import type { Db } from 'mongodb';
 import { SearchRequestSchema } from '@dmdoc/shared-types';
@@ -10,6 +11,7 @@ import type { Config } from '../config.js';
 import { embedQuery } from '../services/embedding.js';
 import { parseCitations } from '../services/citation-parser.js';
 import { RAG_ANSWER_PROMPT } from '../prompts/rag-answer.js';
+import { resolveTenantId } from '../auth/resolve-tenant.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais
@@ -192,15 +194,17 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
   // POST /search
   // =========================================================================
   app.post('/search', { preHandler: app.authenticate }, async (request, reply) => {
-    const tenantId = request.tenantId as string;
     const userId = request.user!.sub;
     const role = request.user!.role;
     const db = app.db;
 
     // ------------------------------------------------------------------
-    // 1. Validar body
+    // 1. Validar body e resolver tenantId
     // ------------------------------------------------------------------
     const body = SearchRequestSchema.parse(request.body);
+
+    const { tenantId: tenantIdParam } = z.object({ tenantId: z.string().uuid().optional() }).parse(request.query);
+    const tenantId = resolveTenantId(request, tenantIdParam, true) as string;
     const { query, searchMode, filters, topK, generateAnswer } = body;
 
     const log = request.log.child({ tenantId, userId, traceId: request.id });
@@ -278,17 +282,40 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
         queryEmbedding: queryEmbedding as number[],
       });
     } else {
-      searchResults = await hybridSearch(db, {
-        ...baseParams,
-        queryText: query,
-        queryEmbedding: queryEmbedding as number[],
-      });
+      try {
+        searchResults = await hybridSearch(db, {
+          ...baseParams,
+          queryText: query,
+          queryEmbedding: queryEmbedding as number[],
+        });
+      } catch (err: unknown) {
+        // $rankFusion / rankFusionScore não disponível neste MongoDB — degrada para lexical
+        const msg = err instanceof Error ? err.message : '';
+        if (msg.includes('rankFusionScore') || msg.includes('$rankFusion') || msg.includes('Unsupported $meta')) {
+          log.warn({ err: msg }, '$rankFusion indisponível, usando lexical como fallback');
+          searchResults = await lexicalSearch(db, { ...baseParams, queryText: query });
+        } else {
+          throw err;
+        }
+      }
     }
 
     log.info({ returned: searchResults.length, topK, searchMode }, 'busca concluída');
 
+    // Enriquece chunks com o nome original do documento (originalFilename)
+    const uniqueDocIds = [...new Set(searchResults.map((r) => r.documentId))];
+    const docDocs = uniqueDocIds.length > 0
+      ? await db.collection('documents')
+          .find({ id: { $in: uniqueDocIds } })
+          .project<{ id: string; originalFilename: string }>({ _id: 0, id: 1, originalFilename: 1 })
+          .toArray()
+      : [];
+    const docNameMap = new Map(docDocs.map((d) => [d.id, d.originalFilename]));
+
     const chunks: SearchChunk[] = searchResults.map((r) => ({
       documentId: r.documentId,
+      documentName: docNameMap.get(r.documentId) ?? null,
+      tenantId: r.tenantId,
       documentTypeName: r.documentTypeName,
       pageNumber: r.pageNumber,
       chunkIndex: r.chunkIndex,
