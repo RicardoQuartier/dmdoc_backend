@@ -19,7 +19,7 @@ services:
     image: redis:7-alpine
     container_name: dmdoc-redis
     ports:
-      - '6379:6379'
+      - '5052:6379'
     volumes:
       - redis_data:/data
     command: ['redis-server', '--appendonly', 'yes']
@@ -33,7 +33,7 @@ services:
     image: downloads.unstructured.io/unstructured-io/unstructured-api:latest
     container_name: dmdoc-unstructured
     ports:
-      - '8000:8000'
+      - '5053:8000'
     environment:
       UNSTRUCTURED_API_KEY: ''
 
@@ -41,8 +41,8 @@ services:
     image: minio/minio:latest
     container_name: dmdoc-minio
     ports:
-      - '9000:9000'   # API S3-compatible
-      - '9001:9001'   # Console web (http://localhost:9001)
+      - '5054:9000'   # API S3-compatible
+      - '5055:9001'   # Console web (http://localhost:5055)
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
