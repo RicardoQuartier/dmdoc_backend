@@ -128,17 +128,17 @@ export async function seed(client: MongoDbClient): Promise<void> {
   const db = client.getDb();
 
   // --- Credenciais (env com defaults de dev) ---
-  const superAdminEmail = envOr('SEED_SUPERADMIN_EMAIL', 'admin@dmdoc.local');
-  const superAdminPassword = envOr('SEED_SUPERADMIN_PASSWORD', 'ChangeMe!SuperAdmin1');
-  const tenantAdminEmail = envOr('SEED_TENANT_ADMIN_EMAIL', 'tenant-admin@dmdoc.local');
-  const tenantAdminPassword = envOr('SEED_TENANT_ADMIN_PASSWORD', 'ChangeMe!TenantAdmin1');
+  const superAdminEmail = envOr('SEED_SUPERADMIN_EMAIL', 'superadmin@local.com');
+  const superAdminPassword = envOr('SEED_SUPERADMIN_PASSWORD', '123qwe');
+  const tenantAdminEmail = envOr('SEED_TENANT_ADMIN_EMAIL', 'admin1@local.com');
+  const tenantAdminPassword = envOr('SEED_TENANT_ADMIN_PASSWORD', '123qwe');
   const testTenantName = envOr('SEED_TENANT_NAME', 'Empresa Teste Ltda');
   const diskQuotaBytes = Number(envOr('SEED_TENANT_DISK_QUOTA_BYTES', String(10 * 1024 ** 3))); // 10 GiB
   const userQuota = Number(envOr('SEED_TENANT_USER_QUOTA', '20'));
 
   // --- Tenant 2 e admin 2 ---
-  const tenant2AdminEmail = envOr('SEED_TENANT2_ADMIN_EMAIL', 'tenant-admin2@dmdoc.local');
-  const tenant2AdminPassword = envOr('SEED_TENANT2_ADMIN_PASSWORD', 'ChangeMe!TenantAdmin2');
+  const tenant2AdminEmail = envOr('SEED_TENANT2_ADMIN_EMAIL', 'admin2@local.com');
+  const tenant2AdminPassword = envOr('SEED_TENANT2_ADMIN_PASSWORD', '123qwe');
   const testTenant2Name = envOr('SEED_TENANT2_NAME', 'Empresa Teste 2 Ltda');
 
   // --- SUPER_ADMIN (sem empresa) ---
