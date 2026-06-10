@@ -1,4 +1,7 @@
+name: dmdoc-backend
+
 services:
+  # ---------------- Infraestrutura ----------------
   mongodb:
     # OBRIGATÓRIO: imagem Atlas Local — suporta $vectorSearch, $search e $rankFusion.
     # NÃO usar a imagem padrão `mongo`, que não tem esses operadores.
@@ -71,7 +74,95 @@ services:
       "
     restart: 'no'
 
+  # ---------- Instalação de deps (one-shot) ----------
+  backend-install:
+    image: node:22-slim
+    working_dir: /app
+    environment:
+      CI: 'true'
+    volumes:
+      - .:/app
+      - backend_root_nm:/app/node_modules
+      - backend_api_nm:/app/apps/api/node_modules
+      - backend_worker_nm:/app/apps/worker/node_modules
+      - backend_shared_nm:/app/packages/shared-types/node_modules
+    command: sh -c "corepack enable && pnpm install && pnpm --filter @dmdoc/shared-types build"
+
+  # ---------------- API (hot-reload via tsx watch) ----------------
+  api:
+    image: node:22-slim
+    working_dir: /app
+    command: sh -c "corepack enable && pnpm --filter @dmdoc/api dev"
+    env_file:
+      - ./.env
+    environment:
+      MONGO_URI: mongodb://mongodb:27017?directConnection=true
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_S3_BUCKET: dmdoc-documents
+      AWS_REGION: us-east-1
+      S3_FORCE_PATH_STYLE: 'true'
+      CHOKIDAR_USEPOLLING: 'true'
+    ports:
+      - '5051:5051'
+    volumes:
+      - .:/app
+      - backend_root_nm:/app/node_modules
+      - backend_api_nm:/app/apps/api/node_modules
+      - backend_worker_nm:/app/apps/worker/node_modules
+      - backend_shared_nm:/app/packages/shared-types/node_modules
+    depends_on:
+      backend-install:
+        condition: service_completed_successfully
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  # ---------------- Worker (hot-reload via tsx watch) ----------------
+  worker:
+    image: node:22-slim
+    working_dir: /app
+    # poppler-utils: fornece pdftoppm para conversão PDF→imagem (fallback OCR tesseract.js)
+    command: sh -c "apt-get update -qq && apt-get install -y -qq poppler-utils && corepack enable && pnpm --filter @dmdoc/worker dev"
+    env_file:
+      - ./.env
+    environment:
+      MONGO_URI: mongodb://mongodb:27017?directConnection=true
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_S3_BUCKET: dmdoc-documents
+      AWS_REGION: us-east-1
+      S3_FORCE_PATH_STYLE: 'true'
+      UNSTRUCTURED_URL: http://unstructured:8000/general/v0/general
+      CHOKIDAR_USEPOLLING: 'true'
+    volumes:
+      - .:/app
+      - backend_root_nm:/app/node_modules
+      - backend_api_nm:/app/apps/api/node_modules
+      - backend_worker_nm:/app/apps/worker/node_modules
+      - backend_shared_nm:/app/packages/shared-types/node_modules
+    depends_on:
+      backend-install:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      unstructured:
+        condition: service_started
+
 volumes:
   mongodb_data:
   redis_data:
   minio_data:
+  backend_root_nm:
+  backend_api_nm:
+  backend_worker_nm:
+  backend_shared_nm:
