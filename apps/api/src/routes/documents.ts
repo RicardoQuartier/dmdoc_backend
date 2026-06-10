@@ -1209,4 +1209,85 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     return reply.status(202).send(updated);
   });
+
+  // =========================================================================
+  // GET /documents/:id/status-stream — SSE de status de processamento
+  // =========================================================================
+  /**
+   * GET /documents/:id/status-stream
+   *
+   * Abre um stream SSE que emite o status atual do documento a cada 2 segundos.
+   * Fecha automaticamente quando o status atinge um estado terminal (READY ou FAILED).
+   * O cliente deve fechar a conexão caso abandone a página antes disso.
+   */
+  app.get('/documents/:id/status-stream', { preHandler: app.authenticate }, async (request, reply) => {
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const db = app.db;
+
+    const { id } = request.params as { id: string };
+
+    let doc: DocumentDoc | null;
+
+    if (role === 'SUPER_ADMIN') {
+      doc = await findDocumentGlobally(db, id);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      doc = await repo.findById(id);
+    }
+
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    await assertCanReadDepartment(db, userId, doc.tenantId, doc.departmentId, role);
+
+    const tenantId = doc.tenantId;
+
+    reply.hijack();
+
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+
+    const TERMINAL = new Set(['READY', 'FAILED']);
+
+    const formatSSE = (data: unknown): string =>
+      `event: status\ndata: ${JSON.stringify(data)}\n\n`;
+
+    const sendStatus = async (): Promise<boolean> => {
+      const current = await db.collection<DocumentDoc>('documents').findOne(
+        { id, tenantId },
+        { projection: { status: 1, failureReason: 1 } }
+      );
+      if (!current) return true;
+      reply.raw.write(formatSSE({ status: current.status, failureReason: current.failureReason ?? null }));
+      return TERMINAL.has(current.status);
+    };
+
+    // Envia status imediatamente e encerra se já for terminal
+    const alreadyDone = await sendStatus();
+    if (alreadyDone) {
+      reply.raw.end();
+      return;
+    }
+
+    const interval = setInterval(() => {
+      void sendStatus().then((done) => {
+        if (done) {
+          clearInterval(interval);
+          reply.raw.end();
+        }
+      });
+    }, 2000);
+
+    // Limpa o intervalo se o cliente fechar a conexão antes do término
+    reply.raw.on('close', () => {
+      clearInterval(interval);
+    });
+  });
 };
