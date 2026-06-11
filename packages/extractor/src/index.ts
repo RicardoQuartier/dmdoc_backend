@@ -8,6 +8,7 @@ export {
 export {
   UnstructuredExtractor,
   type UnstructuredExtractorConfig,
+  type OcrServiceConfig,
 } from './unstructured.js';
 
 export { NativeExtractor } from './native.js';

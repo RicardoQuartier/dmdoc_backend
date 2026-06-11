@@ -1,11 +1,10 @@
 import { exec } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { promisify } from 'node:util';
 import FormData from 'form-data';
 import sharp from 'sharp';
-import Tesseract from 'tesseract.js';
 import {
   type ExtractionResult,
   type ExtractorProvider,
@@ -27,6 +26,25 @@ interface UnstructuredElement {
 }
 
 /**
+ * Configuração do microserviço de OCR (EasyOCR) usado como motor de alta qualidade
+ * para scans/imagens onde o Unstructured falha (documentos de identidade, certificados).
+ *
+ * Diferente de LLMs multimodais (gpt-4o), um motor de OCR dedicado NÃO recusa
+ * documentos de identidade por política de PII e não alucina texto.
+ */
+export interface OcrServiceConfig {
+  /** URL completa do endpoint, ex.: http://ocr:8000/ocr */
+  url: string;
+}
+
+/** Resposta do microserviço de OCR. */
+interface OcrServiceResponse {
+  text: string;
+  lineCount: number;
+  avgConfidence: number;
+}
+
+/**
  * Configuração injetada pelo chamador.
  * O `apiKey` é opcional pois o Unstructured self-hosted pode não exigir auth.
  */
@@ -34,6 +52,11 @@ export interface UnstructuredExtractorConfig {
   /** URL completa do endpoint, ex.: http://localhost:8000/general/v0/general */
   apiUrl: string;
   apiKey?: string;
+  /**
+   * Microserviço de OCR para scans/imagens. Quando ausente, o extractor não tem
+   * motor de alta qualidade — retorna o melhor resultado do Unstructured mesmo pobre.
+   */
+  ocrService?: OcrServiceConfig;
 }
 
 const SUPPORTED_MIME_TYPES = new Set([
@@ -46,6 +69,9 @@ const SUPPORTED_MIME_TYPES = new Set([
 ]);
 
 const MIN_TEXT_LENGTH = 20;
+
+/** Resolução máxima enviada ao OCR (maior lado, em px). */
+const OCR_MAX_DIMENSION = 2048;
 
 /**
  * Retorna true se o texto tem conteúdo útil.
@@ -62,14 +88,96 @@ function isUsableText(text: string): boolean {
   return longWords / words.length >= 0.3;
 }
 
+/** Limiar de grayscale abaixo do qual um pixel conta como conteúdo (não-branco). */
+const CONTENT_THRESHOLD = 220;
+/** Largura do thumbnail usado na detecção de bbox. */
+const CONTENT_THUMB_WIDTH = 200;
+/** Mínimo de pixels não-brancos no thumbnail para confiar na detecção. */
+const CONTENT_MIN_PIXELS = 50;
+
+/**
+ * Detecta a bounding box do conteúdo (região não-branca) de uma imagem.
+ * Retorna null quando não há conteúdo suficiente ou quando o conteúdo já ocupa
+ * praticamente toda a página (recorte seria inútil).
+ */
+async function detectContentRegion(
+  imgFile: string
+): Promise<{ left: number; top: number; width: number; height: number } | null> {
+  const meta = await sharp(imgFile).metadata();
+  const W = meta.width ?? 0;
+  const H = meta.height ?? 0;
+  if (W === 0 || H === 0) return null;
+
+  const SW = CONTENT_THUMB_WIDTH;
+  const SH = Math.max(1, Math.round((H / W) * SW));
+  const { data, info } = await sharp(imgFile)
+    .resize(SW, SH, { fit: 'fill' })
+    .grayscale()
+    .median(5) // remove pontos/sujeira isolados no branco
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  let minX = info.width, maxX = -1, minY = info.height, maxY = -1, count = 0;
+  for (let y = 0; y < info.height; y++) {
+    for (let x = 0; x < info.width; x++) {
+      if (data[y * info.width + x]! < CONTENT_THRESHOLD) {
+        count++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (count < CONTENT_MIN_PIXELS || maxX <= minX || maxY <= minY) return null;
+
+  const sx = W / info.width;
+  const sy = H / info.height;
+  const PAD = 4; // px do thumbnail
+  const left = Math.max(0, Math.round((minX - PAD) * sx));
+  const top = Math.max(0, Math.round((minY - PAD) * sy));
+  const width = Math.min(W - left, Math.round((maxX - minX + PAD * 2) * sx));
+  const height = Math.min(H - top, Math.round((maxY - minY + PAD * 2) * sy));
+
+  if (width <= 0 || height <= 0) return null;
+  // Conteúdo já preenche >95% da página — recorte não compensa.
+  if (width * height >= W * H * 0.95) return null;
+
+  return { left, top, width, height };
+}
+
+/**
+ * Prepara uma imagem para o OCR: remove a borda branca (folha A4 em volta do
+ * documento) e reescala para no máximo {@link OCR_MAX_DIMENSION}px no maior lado.
+ *
+ * Remover o branco é essencial para scans onde o documento ocupa parte da página
+ * (card de RG num A4): sem isso, após o downscale o conteúdo fica minúsculo. A
+ * detecção é por bbox de pixels não-brancos com filtro de mediana (elimina sujeira
+ * isolada que travaria um trim simples). Se a detecção falhar ou o conteúdo já
+ * preencher a página, envia a imagem inteira.
+ */
+async function prepareImageForOcr(imgFile: string): Promise<Buffer> {
+  const region = await detectContentRegion(imgFile);
+  const base = region ? sharp(imgFile).extract(region) : sharp(imgFile);
+  return base
+    .resize(OCR_MAX_DIMENSION, OCR_MAX_DIMENSION, {
+      fit: 'inside',
+      withoutEnlargement: true,
+    })
+    .jpeg({ quality: 90 })
+    .toBuffer();
+}
+
 /**
  * Extrator que delega ao serviço Unstructured rodando via HTTP.
  *
- * Pipeline de fallback para PDFs escaneados e imagens:
- * 1. `auto` — rápido, sem OCR forçado.
- * 2. `ocr_only` — Tesseract em toda a página (sem layout detection).
- * 3. `tesseract.js` direto — bbox detection + 4 rotações. Para PDF requer pdftoppm;
- *    para JPEG/PNG usa o arquivo diretamente.
+ * Pipeline para PDFs escaneados e imagens:
+ * 1. `auto` — rápido, sem OCR forçado (cobre PDFs nativos digitais).
+ * 2. `ocr_only` — Tesseract do Unstructured em toda a página (PDFs escaneados limpos).
+ * 3. Microserviço de OCR (EasyOCR) — motor de alta qualidade para scans difíceis:
+ *    documentos de identidade com fundo de segurança, foto embutida e rotação. Não
+ *    recusa IDs (como LLMs fazem) e testa múltiplas rotações.
  */
 export class UnstructuredExtractor implements ExtractorProvider {
   private readonly config: UnstructuredExtractorConfig;
@@ -113,7 +221,7 @@ export class UnstructuredExtractor implements ExtractorProvider {
       return { ...autoResult, durationMs: Date.now() - startMs };
     }
 
-    // PDF escaneado: tenta ocr_only (Tesseract em página inteira, sem detectron2)
+    // PDF escaneado limpo: tenta ocr_only (Tesseract em página inteira, sem detectron2)
     const ocrResult = await this.callApi(fileBuffer, filePath, mimeType, 'ocr_only');
     if (isUsableText(ocrResult.fullText)) {
       return {
@@ -123,160 +231,102 @@ export class UnstructuredExtractor implements ExtractorProvider {
       };
     }
 
-    // Último recurso: tesseract.js direto com bbox detection + 4 rotações.
-    // Cobre PDFs escaneados invertidos e imagens JPEG/PNG enviadas diretamente.
-    // Para PDF requer pdftoppm; para imagens usa o arquivo direto.
+    // Motor de alta qualidade: microserviço de OCR para scans/imagens difíceis.
+    // Cobre documentos de identidade (RG, CNH), certificados, fotos de documentos —
+    // casos onde o OCR clássico falha por fundo de segurança, layout misto ou rotação.
     const isImage = mimeType === 'image/jpeg' || mimeType === 'image/png';
-    if (mimeType === 'application/pdf' || isImage) {
-      let tsResult: ExtractionResult | null = null;
+    if (this.config.ocrService && (mimeType === 'application/pdf' || isImage)) {
       try {
-        tsResult = await this.ocrWithTesseractJs(filePath, mimeType);
+        const svcResult = await this.ocrWithService(filePath, mimeType);
+        if (svcResult !== null && isUsableText(svcResult.fullText)) {
+          return { ...svcResult, durationMs: Date.now() - startMs };
+        }
       } catch (err) {
-        process.stderr.write(`[dmdoc] ocrWithTesseractJs error: ${String(err)}\n`);
-      }
-      if (tsResult !== null && isUsableText(tsResult.fullText)) {
-        return { ...tsResult, durationMs: Date.now() - startMs };
+        process.stderr.write(`[dmdoc] OCR service error: ${String(err)}\n`);
       }
     }
 
     // Retorna o melhor resultado disponível (pode ser texto curto/inútil)
+    const best = ocrResult.fullText.length >= autoResult.fullText.length ? ocrResult : autoResult;
     return {
-      ...ocrResult,
-      ocrPages: Array.from({ length: ocrResult.pageCount }, (_, i) => i + 1),
+      ...best,
+      ocrPages: Array.from({ length: best.pageCount }, (_, i) => i + 1),
       durationMs: Date.now() - startMs,
     };
   }
 
   /**
-   * Roda tesseract.js com bbox detection + 4 rotações.
-   * Para PDF: converte para PNG via pdftoppm (requer poppler-utils no PATH).
-   * Para imagens (JPEG/PNG): usa o arquivo diretamente.
+   * OCR via microserviço HTTP (EasyOCR).
+   *
+   * Para PDF: converte cada página em PNG via pdftoppm (requer poppler-utils) e envia
+   * uma requisição por página. Para imagens (JPEG/PNG): envia o arquivo diretamente.
+   * Cada imagem passa por {@link prepareImageForOcr} (remove branco + reescala).
+   *
+   * Retorna null se o serviço não estiver configurado ou se nenhuma página produzir texto.
    */
-  private async ocrWithTesseractJs(
+  private async ocrWithService(
     filePath: string,
     mimeType: string
   ): Promise<ExtractionResult | null> {
-    const isImage = mimeType === 'image/jpeg' || mimeType === 'image/png';
+    const svc = this.config.ocrService;
+    if (!svc) return null;
 
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'dmdoc-tess-'));
+    const isImage = mimeType === 'image/jpeg' || mimeType === 'image/png';
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'dmdoc-ocr-'));
     try {
-      let files: string[];
+      let imageFiles: string[];
 
       if (isImage) {
-        // Imagem enviada diretamente — usa como única "página"
-        files = [filePath];
-        process.stderr.write(`[dmdoc] tesseract.js: imagem direta ${filePath}\n`);
+        imageFiles = [filePath];
       } else {
-        // PDF: converte para PNGs via pdftoppm
         try {
           await execAsync('which pdftoppm');
         } catch {
-          process.stderr.write('[dmdoc] pdftoppm não encontrado, pulando fallback tesseract.js\n');
+          process.stderr.write('[dmdoc] pdftoppm não encontrado, pulando OCR service\n');
           return null;
         }
         const prefix = path.join(tmpDir, 'page');
-        process.stderr.write(`[dmdoc] pdftoppm: convertendo ${filePath}\n`);
-        await execAsync(`pdftoppm -r 300 -png "${filePath}" "${prefix}"`);
-        files = (await readdir(tmpDir))
+        await execAsync(`pdftoppm -r 150 -png "${filePath}" "${prefix}"`);
+        imageFiles = (await readdir(tmpDir))
           .filter((f) => f.endsWith('.png'))
           .sort()
           .map((f) => path.join(tmpDir, f));
       }
 
-      process.stderr.write(`[dmdoc] tesseract.js: ${files.length} página(s) para OCR\n`);
-      if (files.length === 0) return null;
+      if (imageFiles.length === 0) return null;
+      process.stderr.write(`[dmdoc] OCR service: ${imageFiles.length} página(s)\n`);
 
-      // Pré-processa cada página: gera 4 variantes de rotação.
-      // Para PDFs (convertidos via pdftoppm): usa bbox de pixels escuros para recortar
-      // o conteúdo antes de rodar o tesseract — evita o problema de "Estimating resolution"
-      // quando o documento ocupa só uma pequena área da página.
-      // Para imagens diretas (JPEG/PNG): usa a imagem completa — ela já é o documento.
-      const preparedDir = path.join(tmpDir, 'prepared');
-      await mkdir(preparedDir);
-
-      const preparedFiles: string[] = [];
-      for (const imgFile of files) {
-        const base = path.basename(imgFile, path.extname(imgFile));
-
-        const origMeta = await sharp(imgFile).metadata();
-        const origW = origMeta.width ?? 2544;
-        const origH = origMeta.height as number ?? 3508;
-
-        let region: { left: number; top: number; width: number; height: number };
-
-        // Detecta bbox de conteúdo via pixels escuros (< 100) em thumbnail.
-        // Funciona para PDFs (conteúdo pequeno em página grande) e para imagens
-        // onde o texto concentrado numa região dá OCR melhor do que a imagem toda.
-        const SW = 127, SH = Math.round((origH / origW) * SW);
-        const { data: grayBuf, info: si } = await sharp(imgFile)
-          .resize(SW, SH, { fit: 'fill' })
-          .grayscale()
-          .raw()
-          .toBuffer({ resolveWithObject: true });
-        const gray = new Uint8Array(grayBuf.buffer, grayBuf.byteOffset, grayBuf.byteLength);
-
-        let minX = si.width, maxX = 0, minY = si.height, maxY = 0;
-        for (let y = 0; y < si.height; y++) {
-          for (let x = 0; x < si.width; x++) {
-            if (gray[y * si.width + x]! < 100) {
-              if (x < minX) minX = x;
-              if (x > maxX) maxX = x;
-              if (y < minY) minY = y;
-              if (y > maxY) maxY = y;
-            }
-          }
-        }
-
-        const scaleX = origW / SW, scaleY = origH / SH;
-        const PAD = 20;
-        const left = Math.max(0, Math.round((minX - PAD) * scaleX));
-        const top = Math.max(0, Math.round((minY - PAD) * scaleY));
-        const cropW = Math.min(origW - left, Math.round((maxX - minX + PAD * 2) * scaleX));
-        const cropH = Math.min(origH - top, Math.round((maxY - minY + PAD * 2) * scaleY));
-
-        region =
-          maxX > minX && maxY > minY
-            ? { left, top, width: cropW, height: cropH }
-            : { left: 0, top: 0, width: origW, height: origH };
-
-        for (const angle of [0, 90, 180, 270] as const) {
-          const outPath = path.join(preparedDir, `${base}_r${angle}.png`);
-          await sharp(imgFile).extract(region).rotate(angle).png().toFile(outPath);
-          preparedFiles.push(outPath);
-        }
-      }
-
-      const worker = await Tesseract.createWorker('por');
       const texts: string[] = [];
+      for (const imgFile of imageFiles) {
+        const prepared = await prepareImageForOcr(imgFile);
+        const form = new FormData();
+        form.append('file', prepared, { filename: 'page.jpg', contentType: 'image/jpeg' });
 
-      // Para cada página original, testa as 4 variantes e mantém a melhor.
-      // Critério: maior ratio de palavras longas (qualidade), desempate por comprimento.
-      for (let p = 0; p < files.length; p++) {
-        const variants = preparedFiles.slice(p * 4, p * 4 + 4);
-        let best = '';
-        let bestRatio = 0;
-        for (const imgFile of variants) {
-          const r = await worker.recognize(imgFile);
-          const t = r.data.text.trim();
-          const words = t.match(/\p{L}+/gu) ?? [];
-          const ratio = words.length > 0 ? words.filter((w) => w.length >= 4).length / words.length : 0;
-          if (isUsableText(t) && (ratio > bestRatio || (ratio === bestRatio && t.length > best.length))) {
-            best = t;
-            bestRatio = ratio;
-          }
+        const response = await fetch(svc.url, {
+          method: 'POST',
+          headers: form.getHeaders(),
+          body: form.getBuffer(),
+        });
+        if (!response.ok) {
+          process.stderr.write(`[dmdoc] OCR service HTTP ${response.status}\n`);
+          continue;
         }
-        if (best.length > 0) texts.push(best);
+        const json = (await response.json()) as OcrServiceResponse;
+        const text = (json.text ?? '').trim();
+        process.stderr.write(
+          `[dmdoc] OCR service: lines=${json.lineCount ?? 0} conf=${(json.avgConfidence ?? 0).toFixed(2)} len=${text.length}\n`
+        );
+        if (text.length > 0) texts.push(text);
       }
 
-      await worker.terminate();
+      if (texts.length === 0) return null;
 
-      const fullText = texts.join('\n\n');
       return {
-        fullText,
-        pageCount: files.length,
-        ocrPages: Array.from({ length: files.length }, (_, i) => i + 1),
+        fullText: texts.join('\n\n'),
+        pageCount: imageFiles.length,
+        ocrPages: Array.from({ length: imageFiles.length }, (_, i) => i + 1),
         engine: 'unstructured',
-        engineVersion: '0.0.0',
+        engineVersion: 'easyocr',
         durationMs: 0,
       };
     } finally {
@@ -288,7 +338,7 @@ export class UnstructuredExtractor implements ExtractorProvider {
     fileBuffer: Buffer,
     filePath: string,
     mimeType: string,
-    strategy: 'auto' | 'hi_res' | 'ocr_only'
+    strategy: 'auto' | 'ocr_only'
   ): Promise<ExtractionResult> {
     const form = new FormData();
     form.append('files', fileBuffer, {
@@ -297,7 +347,7 @@ export class UnstructuredExtractor implements ExtractorProvider {
     });
     form.append('include_page_breaks', 'true');
     form.append('strategy', strategy);
-    if (strategy === 'hi_res' || strategy === 'ocr_only') {
+    if (strategy === 'ocr_only') {
       form.append('ocr_languages', 'por');
     }
 

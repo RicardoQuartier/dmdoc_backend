@@ -42,6 +42,13 @@ const EnvSchema = z.object({
   OPENAI_API_KEY: z.string().min(1).optional(),
   EMBEDDING_MODEL: z.string().min(1).default('text-embedding-3-small'),
 
+  /**
+   * URL do microserviço de OCR (EasyOCR) — motor de alta qualidade para scans
+   * difíceis (RG, CNH, certificados) onde o Unstructured falha. Ausente desabilita
+   * o fallback. LLMs multimodais não servem aqui: recusam transcrever IDs por PII.
+   */
+  OCR_URL: z.string().url().optional(),
+
   // Limites de chunking (spec §12)
   CHUNK_TARGET_TOKENS: z.coerce.number().int().positive().default(500),
   CHUNK_OVERLAP_TOKENS: z.coerce.number().int().nonnegative().default(50),
