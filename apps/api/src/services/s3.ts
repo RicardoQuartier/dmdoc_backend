@@ -17,6 +17,13 @@ export interface S3Config {
   secretAccessKey: string;
   /** Endpoint alternativo para MinIO em dev ou Cloudflare R2 em prod. */
   endpoint?: string;
+  /**
+   * Endpoint público para assinar URLs de download. Em dev o `endpoint` é o host
+   * interno do Docker (http://minio:9000), que o navegador não alcança — as URLs
+   * assinadas precisam do host publicado (http://localhost:5054). Quando ausente,
+   * o presign usa o mesmo `endpoint`.
+   */
+  publicEndpoint?: string;
   /** true para MinIO (path-style obrigatório). false para AWS S3 e Cloudflare R2. */
   forcePathStyle?: boolean;
 }
@@ -30,6 +37,12 @@ export interface S3Config {
  */
 export class S3Service {
   private readonly client: S3Client;
+  /**
+   * Cliente usado APENAS para assinar URLs de download — configurado com o
+   * endpoint público (browser-reachable). Igual ao `client` quando não há
+   * `publicEndpoint` (ex.: produção com AWS/R2).
+   */
+  private readonly presignClient: S3Client;
   private readonly bucket: string;
 
   constructor(config: S3Config) {
@@ -47,6 +60,19 @@ export class S3Service {
           }
         : {}),
     });
+
+    this.presignClient =
+      config.publicEndpoint !== undefined
+        ? new S3Client({
+            region: config.region,
+            credentials: {
+              accessKeyId: config.accessKeyId,
+              secretAccessKey: config.secretAccessKey,
+            },
+            endpoint: config.publicEndpoint,
+            forcePathStyle: config.forcePathStyle ?? false,
+          })
+        : this.client;
   }
 
   /**
@@ -81,7 +107,7 @@ export class S3Service {
       Bucket: this.bucket,
       Key: key,
     });
-    return getSignedUrl(this.client, command, { expiresIn: expiresInSeconds });
+    return getSignedUrl(this.presignClient, command, { expiresIn: expiresInSeconds });
   }
 
   /**

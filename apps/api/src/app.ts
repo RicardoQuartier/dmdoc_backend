@@ -179,6 +179,9 @@ function buildS3Config(config: Config): S3Config {
     accessKeyId: config.AWS_ACCESS_KEY_ID,
     secretAccessKey: config.AWS_SECRET_ACCESS_KEY,
     ...(config.S3_ENDPOINT !== undefined ? { endpoint: config.S3_ENDPOINT } : {}),
+    ...(config.S3_PUBLIC_ENDPOINT !== undefined
+      ? { publicEndpoint: config.S3_PUBLIC_ENDPOINT }
+      : {}),
     forcePathStyle: config.S3_FORCE_PATH_STYLE,
   };
 }

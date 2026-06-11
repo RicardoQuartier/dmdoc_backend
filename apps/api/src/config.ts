@@ -37,6 +37,11 @@ const EnvSchema = z.object({
   AWS_ACCESS_KEY_ID: z.string().min(1, 'AWS_ACCESS_KEY_ID é obrigatória'),
   AWS_SECRET_ACCESS_KEY: z.string().min(1, 'AWS_SECRET_ACCESS_KEY é obrigatória'),
   S3_ENDPOINT: z.string().url().optional(), // MinIO em dev; R2/LocalStack em staging
+  // Endpoint público usado SÓ para assinar URLs de download. Em dev o S3_ENDPOINT
+  // é o host interno do Docker (http://minio:9000), inacessível pelo navegador —
+  // o presigner precisa do host publicado (http://localhost:5054). Em produção,
+  // ausente: o endpoint público é o próprio do S3/R2.
+  S3_PUBLIC_ENDPOINT: z.string().url().optional(),
   // true para MinIO (path-style obrigatório); false para AWS S3 e Cloudflare R2
   S3_FORCE_PATH_STYLE: z
     .string()
