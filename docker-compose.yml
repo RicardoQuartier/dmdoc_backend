@@ -32,13 +32,17 @@ services:
       timeout: 5s
       retries: 5
 
-  unstructured:
-    image: downloads.unstructured.io/unstructured-io/unstructured-api:latest
-    container_name: dmdoc-unstructured
+  # Microserviço de extração de texto (Python) — unifica TODOS os formatos:
+  # PyMuPDF (PDF), python-docx (DOCX), openpyxl (XLSX), python-pptx (PPTX) e
+  # EasyOCR para scans/imagens (RG, CNH, certificados). Substitui o Unstructured
+  # e o NativeExtractor. Não recusa documentos de identidade (ao contrário de LLMs)
+  # e corrige rotação. Chamado por HTTP pelo worker.
+  extractor:
+    build:
+      context: ./services/extractor
+    container_name: dmdoc-extractor
     ports:
-      - '5053:8000'
-    environment:
-      UNSTRUCTURED_API_KEY: ''
+      - '5056:8000'
 
   minio:
     image: minio/minio:latest
@@ -127,8 +131,7 @@ services:
   worker:
     image: node:22-slim
     working_dir: /app
-    # poppler-utils: fornece pdftoppm para conversão PDF→imagem (fallback OCR tesseract.js)
-    command: sh -c "apt-get update -qq && apt-get install -y -qq poppler-utils && corepack enable && pnpm --filter @dmdoc/worker dev"
+    command: sh -c "corepack enable && pnpm --filter @dmdoc/worker dev"
     env_file:
       - ./.env
     environment:
@@ -140,7 +143,8 @@ services:
       AWS_S3_BUCKET: dmdoc-documents
       AWS_REGION: us-east-1
       S3_FORCE_PATH_STYLE: 'true'
-      UNSTRUCTURED_URL: http://unstructured:8000/general/v0/general
+      EXTRACTOR: python
+      EXTRACTOR_URL: http://extractor:8000/extract
       CHOKIDAR_USEPOLLING: 'true'
     volumes:
       - .:/app
@@ -155,7 +159,7 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
-      unstructured:
+      extractor:
         condition: service_started
 
 volumes:
