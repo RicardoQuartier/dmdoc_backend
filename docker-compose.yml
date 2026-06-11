@@ -44,8 +44,8 @@ services:
     image: minio/minio:latest
     container_name: dmdoc-minio
     ports:
-      - '5054:9000'   # API S3-compatible
-      - '5055:9001'   # Console web (http://localhost:5055)
+      - '9000:9000'   # API S3-compatible
+      - '9001:9001'   # Console web (http://localhost:5055)
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
