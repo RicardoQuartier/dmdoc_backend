@@ -31,23 +31,15 @@ const EnvSchema = z.object({
     .transform((v) => v === 'true')
     .default('false'),
 
-  // Extração de texto
-  /** Motor de extração: "native" para libs Node.js (prod), "unstructured" para serviço HTTP (dev). */
-  EXTRACTOR: z.enum(['native', 'unstructured']).default('native'),
-  /** Obrigatório quando EXTRACTOR=unstructured. */
-  UNSTRUCTURED_URL: z.string().url().optional(),
-  UNSTRUCTURED_API_KEY: z.string().optional(),
+  // Extração de texto — microserviço unificado em Python
+  // (PyMuPDF/docx/xlsx/pptx + EasyOCR), mesmo motor em dev e prod.
+  EXTRACTOR: z.enum(['python']).default('python'),
+  /** URL do microserviço de extração Python. */
+  EXTRACTOR_URL: z.string().url().optional(),
 
   // Embeddings (sempre OpenAI, nunca OpenRouter)
   OPENAI_API_KEY: z.string().min(1).optional(),
   EMBEDDING_MODEL: z.string().min(1).default('text-embedding-3-small'),
-
-  /**
-   * URL do microserviço de OCR (EasyOCR) — motor de alta qualidade para scans
-   * difíceis (RG, CNH, certificados) onde o Unstructured falha. Ausente desabilita
-   * o fallback. LLMs multimodais não servem aqui: recusam transcrever IDs por PII.
-   */
-  OCR_URL: z.string().url().optional(),
 
   // Limites de chunking (spec §12)
   CHUNK_TARGET_TOKENS: z.coerce.number().int().positive().default(500),

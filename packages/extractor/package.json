@@ -19,17 +19,10 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "form-data": "^4.0.1",
-    "mammoth": "^1.7.0",
-    "node-fetch": "^3.3.2",
-    "pdf-parse": "^1.1.1",
-    "sharp": "^0.34.5",
-    "tesseract.js": "^5.0.0",
-    "xlsx": "^0.18.5"
+    "form-data": "^4.0.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
-    "@types/pdf-parse": "^1.1.4",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"

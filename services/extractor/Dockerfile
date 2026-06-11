@@ -1,9 +1,9 @@
-# Microserviço de OCR (EasyOCR) para o DMDoc.
-# Imagem CPU — sem GPU. Os modelos são baixados no build (camada cacheada) para a
-# primeira requisição não pagar o download.
+# Microserviço de extração de texto (Python) do DMDoc.
+# Imagem CPU. Os modelos de OCR (EasyOCR) são baixados no build (camada cacheada)
+# para a primeira requisição não pagar o download.
 FROM python:3.10-slim
 
-# Dependências nativas do OpenCV (libGL, glib).
+# Dependências nativas do OpenCV/PyMuPDF (libGL, glib).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-# Pré-baixa os modelos (detecção + reconhecimento) para os idiomas configurados.
+# Pré-baixa os modelos de OCR (detecção + reconhecimento) para os idiomas configurados.
 ARG OCR_LANGS=pt
 ENV OCR_LANGS=${OCR_LANGS}
 RUN python -c "import easyocr; easyocr.Reader('${OCR_LANGS}'.split(','), gpu=False)"

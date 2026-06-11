@@ -1,45 +1,40 @@
-import { UnstructuredExtractor, type UnstructuredExtractorConfig } from './unstructured.js';
-import { NativeExtractor } from './native.js';
+import { PythonExtractor, type PythonExtractorConfig } from './python.js';
 import { type ExtractorProvider } from './types.js';
 
-export type ExtractorType = 'unstructured' | 'native';
+export type ExtractorType = 'python';
 
 export interface ExtractorConfig {
   type: ExtractorType;
-  /** Obrigatório quando type === 'unstructured'. */
-  unstructured?: UnstructuredExtractorConfig;
+  /** Obrigatório quando type === 'python'. */
+  python?: PythonExtractorConfig;
 }
 
 /**
  * Fábrica de extractores.
  *
- * Lê `config.type` para decidir qual implementação instanciar.
- * A configuração é sempre injetada pelo chamador (worker/config.ts via Zod).
- * Este pacote nunca lê `process.env` diretamente.
+ * Toda a extração é delegada ao microserviço Python (PyMuPDF/docx/xlsx/pptx +
+ * EasyOCR), que cobre todos os formatos em dev e prod. A configuração é sempre
+ * injetada pelo chamador (worker/config.ts via Zod); este pacote nunca lê
+ * `process.env` diretamente.
  *
  * @example
  * ```ts
  * const extractor = createExtractor({
- *   type: 'unstructured',
- *   unstructured: { apiUrl: env.UNSTRUCTURED_URL, apiKey: env.UNSTRUCTURED_API_KEY },
+ *   type: 'python',
+ *   python: { url: env.EXTRACTOR_URL },
  * });
  * const result = await extractor.extract('/tmp/doc.pdf', 'application/pdf');
  * ```
  */
 export function createExtractor(config: ExtractorConfig): ExtractorProvider {
   switch (config.type) {
-    case 'unstructured': {
-      const unstructuredConfig = config.unstructured;
-      if (!unstructuredConfig) {
-        throw new Error(
-          'createExtractor: unstructured config is required when type is "unstructured"'
-        );
+    case 'python': {
+      const pythonConfig = config.python;
+      if (!pythonConfig) {
+        throw new Error('createExtractor: python config is required when type is "python"');
       }
-      return new UnstructuredExtractor(unstructuredConfig);
+      return new PythonExtractor(pythonConfig);
     }
-
-    case 'native':
-      return new NativeExtractor();
 
     default: {
       // Garante exhaustiveness em TypeScript

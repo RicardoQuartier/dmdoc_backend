@@ -5,13 +5,7 @@ export {
   UnstructuredApiError,
 } from './types.js';
 
-export {
-  UnstructuredExtractor,
-  type UnstructuredExtractorConfig,
-  type OcrServiceConfig,
-} from './unstructured.js';
-
-export { NativeExtractor } from './native.js';
+export { PythonExtractor, type PythonExtractorConfig } from './python.js';
 
 export {
   createExtractor,

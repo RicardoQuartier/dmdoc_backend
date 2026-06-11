@@ -117,24 +117,10 @@ async function main(): Promise<void> {
   });
   logger.info({ model: config.EMBEDDING_MODEL }, 'OpenAI client criado');
 
-  // Extractor — microserviço de OCR (EasyOCR) como motor de alta qualidade.
-  const ocrServiceConfig = config.OCR_URL ? { url: config.OCR_URL } : undefined;
-  const extractor = createExtractor(
-    config.EXTRACTOR === 'unstructured'
-      ? {
-          type: 'unstructured',
-          unstructured: {
-            apiUrl: config.UNSTRUCTURED_URL ?? 'http://localhost:8000/general/v0/general',
-            ...(config.UNSTRUCTURED_API_KEY ? { apiKey: config.UNSTRUCTURED_API_KEY } : {}),
-            ...(ocrServiceConfig ? { ocrService: ocrServiceConfig } : {}),
-          },
-        }
-      : { type: 'native' }
-  );
-  logger.info(
-    { extractor: config.EXTRACTOR, ocrService: config.OCR_URL ?? 'disabled' },
-    'extractor criado'
-  );
+  // Extractor — microserviço unificado em Python (PyMuPDF/docx/xlsx/pptx + EasyOCR).
+  const extractorUrl = config.EXTRACTOR_URL ?? 'http://localhost:8000/extract';
+  const extractor = createExtractor({ type: 'python', python: { url: extractorUrl } });
+  logger.info({ extractor: config.EXTRACTOR, extractorUrl }, 'extractor criado');
 
   const deps: PipelineDeps = {
     s3,

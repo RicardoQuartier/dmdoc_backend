@@ -1,25 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { createExtractor } from '../factory.js';
-import { UnstructuredExtractor } from '../unstructured.js';
-import { NativeExtractor } from '../native.js';
+import { PythonExtractor } from '../python.js';
 
 describe('createExtractor', () => {
-  it('retorna NativeExtractor quando type === "native"', () => {
-    const extractor = createExtractor({ type: 'native' });
-    expect(extractor).toBeInstanceOf(NativeExtractor);
-  });
-
-  it('retorna UnstructuredExtractor quando type === "unstructured"', () => {
+  it('retorna PythonExtractor quando type === "python"', () => {
     const extractor = createExtractor({
-      type: 'unstructured',
-      unstructured: { apiUrl: 'http://localhost:8000/general/v0/general' },
+      type: 'python',
+      python: { url: 'http://localhost:8000/extract' },
     });
-    expect(extractor).toBeInstanceOf(UnstructuredExtractor);
+    expect(extractor).toBeInstanceOf(PythonExtractor);
   });
 
-  it('lança quando type === "unstructured" mas config está ausente', () => {
-    expect(() => createExtractor({ type: 'unstructured' })).toThrow(
-      'unstructured config is required'
-    );
+  it('lança quando type === "python" mas config está ausente', () => {
+    expect(() => createExtractor({ type: 'python' })).toThrow('python config is required');
   });
 });
