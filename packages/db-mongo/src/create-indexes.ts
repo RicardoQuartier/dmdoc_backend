@@ -33,9 +33,6 @@ export async function createIndexes(client: MongoDbClient): Promise<number> {
   }
 
   log.info({ totalIndexes: created }, 'todos os índices regulares garantidos');
-  log.warn(
-    'Vector Search e Atlas Search NÃO são criados aqui — Fase 3 (entregável 25) via Atlas API.',
-  );
   return created;
 }
 

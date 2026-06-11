@@ -16,6 +16,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src --max-warnings=0",
     "test": "vitest run",
+    "setup-indexes": "tsx src/scripts/setup-all-indexes.ts",
     "create-atlas-indexes": "tsx src/scripts/create-atlas-indexes.ts",
     "create-indexes": "tsx src/create-indexes.ts",
     "seed": "tsx src/seed.ts",
