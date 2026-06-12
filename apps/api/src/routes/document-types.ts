@@ -5,7 +5,10 @@ import type { IndexField } from '@dmdoc/shared-types';
 import type { TenantDocument } from '@dmdoc/db-mongo';
 import { ForbiddenError, NotFoundError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
+// TODO: migrar para resolveTenantContext — cada handler precisa tratar mode:'allowed'
+//       (MULTI_TENANT_ADMIN em leitura) e ajustar a lógica de tipos globais separadamente.
 import { resolveTenantId } from '../auth/resolve-tenant.js';
+import { ADMIN_ROLES } from '@dmdoc/shared-types';
 
 interface DocumentTypeDoc extends TenantDocument {
   name: string;
@@ -117,7 +120,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
    * isGlobal sempre false; tenantId do request (ou body para SA).
    */
   app.post('/document-types', { preHandler: app.authenticate }, async (request, reply) => {
-    requireRole(request, 'TENANT_ADMIN');
+    requireRole(request, ...ADMIN_ROLES);
 
     const body = CreateDocumentTypeBodySchema.parse(request.body);
     const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
@@ -168,7 +171,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
    * SUPER_ADMIN em tipo de tenant: informar `?tenantId=xxx`.
    */
   app.patch('/document-types/:id', { preHandler: app.authenticate }, async (request, reply) => {
-    requireRole(request, 'TENANT_ADMIN');
+    requireRole(request, ...ADMIN_ROLES);
 
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const updates = PatchDocumentTypeBodySchema.parse(request.body);
@@ -210,7 +213,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
    * Tenants não podem deletar tipos globais.
    */
   app.delete('/document-types/:id', { preHandler: app.authenticate }, async (request, reply) => {
-    requireRole(request, 'TENANT_ADMIN');
+    requireRole(request, ...ADMIN_ROLES);
 
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const db = app.db;
@@ -247,7 +250,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     '/document-types/:id/index-fields',
     { preHandler: app.authenticate },
     async (request, reply) => {
-      requireRole(request, 'TENANT_ADMIN');
+      requireRole(request, ...ADMIN_ROLES);
 
       const { id } = z.object({ id: z.string() }).parse(request.params);
       const fieldInput = CreateIndexFieldBodySchema.parse(request.body);
@@ -304,7 +307,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     '/document-types/:id/index-fields/:fieldId',
     { preHandler: app.authenticate },
     async (request, reply) => {
-      requireRole(request, 'TENANT_ADMIN');
+      requireRole(request, ...ADMIN_ROLES);
 
       const { id, fieldId } = z
         .object({ id: z.string(), fieldId: z.string() })
@@ -369,7 +372,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     '/document-types/:id/index-fields/:fieldId',
     { preHandler: app.authenticate },
     async (request, reply) => {
-      requireRole(request, 'TENANT_ADMIN');
+      requireRole(request, ...ADMIN_ROLES);
 
       const { id, fieldId } = z
         .object({ id: z.string(), fieldId: z.string() })

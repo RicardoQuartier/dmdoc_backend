@@ -4,6 +4,7 @@ import {
   RefreshRequestSchema,
   type LoginResponse,
   type AuthUser,
+  type AllowedTenantSummary,
 } from '@dmdoc/shared-types';
 import { UnauthorizedError } from '../errors/index.js';
 import { verifyPassword } from '../auth/password.js';
@@ -63,9 +64,17 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
 
     await recordLogin(app, request, user);
 
+    // Para MULTI_TENANT_ADMIN: buscar nome dos tenants para evitar roundtrip
+    // adicional no frontend (apresentação de seletor de contexto).
+    let allowedTenants: AllowedTenantSummary[] | undefined;
+    if (user.role === 'MULTI_TENANT_ADMIN' && (user.allowedTenantIds?.length ?? 0) > 0) {
+      allowedTenants = await fetchAllowedTenants(app, user.allowedTenantIds ?? []);
+    }
+
     const body: LoginResponse = {
       ...pair,
       user: toAuthUser(user),
+      ...(allowedTenants !== undefined ? { allowedTenants } : {}),
     };
     return reply.status(200).send(body);
   });
@@ -108,6 +117,8 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
   /**
    * GET /auth/me — exige access token válido. Retorna o usuário ATUAL (re-lido
    * do banco), sem passwordHash.
+   *
+   * Para MULTI_TENANT_ADMIN inclui `allowedTenants` com id+nome de cada empresa.
    */
   app.get('/auth/me', { preHandler: app.authenticate }, async (request, reply) => {
     // `authenticate` garante `request.user`.
@@ -122,7 +133,15 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       throw new UnauthorizedError();
     }
 
-    const body: AuthUser = toAuthUser(user);
+    let allowedTenants: AllowedTenantSummary[] | undefined;
+    if (user.role === 'MULTI_TENANT_ADMIN' && (user.allowedTenantIds?.length ?? 0) > 0) {
+      allowedTenants = await fetchAllowedTenants(app, user.allowedTenantIds ?? []);
+    }
+
+    const body = {
+      ...toAuthUser(user),
+      ...(allowedTenants !== undefined ? { allowedTenants } : {}),
+    };
     return reply.status(200).send(body);
   });
 };
@@ -139,7 +158,26 @@ function toAccessClaims(user: UserDocument): AccessClaims {
     sub: user.id,
     tenantId: user.tenantId,
     role: user.role,
+    allowedTenantIds: user.allowedTenantIds ?? [],
   };
+}
+
+/**
+ * Busca nome + id dos tenants da lista do MULTI_TENANT_ADMIN para compor o
+ * `allowedTenants` da resposta de login/me. Tenants inexistentes ou inativos
+ * são simplesmente omitidos — não é erro (o admin pode ter desativado um tenant
+ * sem atualizar a lista do MTA).
+ */
+async function fetchAllowedTenants(
+  app: FastifyInstance,
+  tenantIds: string[],
+): Promise<AllowedTenantSummary[]> {
+  const docs = await app.db
+    .collection<{ id: string; name: string }>('tenants')
+    .find({ id: { $in: tenantIds }, active: true })
+    .project({ id: 1, name: 1, _id: 0 })
+    .toArray();
+  return docs.map((d) => ({ id: d.id, name: d.name }));
 }
 
 /**

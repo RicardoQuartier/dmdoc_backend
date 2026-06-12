@@ -9,7 +9,7 @@ import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import { NotFoundError, QuotaExceededError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
-import { resolveTenantId } from '../auth/resolve-tenant.js';
+import { resolveTenantId, resolveTenantContext } from '../auth/resolve-tenant.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais que mapeiam as coleções do MongoDB (spec §5.3)
@@ -151,9 +151,33 @@ async function findDocumentGlobally(
 }
 
 /**
+ * Busca um documento pelo seu id restrito a uma lista de tenants permitidos.
+ *
+ * Usado exclusivamente para MULTI_TENANT_ADMIN em leitura sem tenantId explícito.
+ * O filtro `tenantId: { $in: allowedTenantIds }` garante que o MTA só acessa
+ * documentos de empresas da sua lista — nunca de empresas externas.
+ *
+ * Retorna null se o documento não existir, estiver soft-deleted ou o tenantId
+ * do documento não estiver na lista (tratado como inexistente — spec §10, inv. 4).
+ */
+async function findDocumentInTenants(
+  db: import('mongodb').Db,
+  id: string,
+  allowedTenantIds: string[]
+): Promise<DocumentDoc | null> {
+  const raw = await db
+    .collection<DocumentDoc>('documents')
+    .findOne({ id, tenantId: { $in: allowedTenantIds }, deleted: false });
+  if (!raw) return null;
+  const { _id: _ignored, ...doc } = raw;
+  return doc as DocumentDoc;
+}
+
+/**
  * Resolve quais departmentIds o usuário pode LER.
  *
- * - TENANT_ADMIN / SUPER_ADMIN: `null` (sem restrição — retornar todos)
+ * - TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN: `null` (sem restrição — retornar todos)
+ *   Para MTA o isolamento já é garantido pelo filtro $in de tenantIds.
  * - UPLOADER / USER: apenas os departamentos onde `canRead: true`
  */
 async function resolveReadableDepartmentIds(
@@ -162,7 +186,7 @@ async function resolveReadableDepartmentIds(
   tenantId: string | null,
   role: string
 ): Promise<string[] | null> {
-  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN') {
+  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN') {
     return null;
   }
   // Para roles normais, tenantId nunca é null (vem do JWT)
@@ -176,8 +200,16 @@ async function resolveReadableDepartmentIds(
 /**
  * Valida se o usuário tem permissão de LEITURA em um departamento específico.
  *
- * - TENANT_ADMIN / SUPER_ADMIN: sempre permitido (desde que o dept exista no tenant)
+ * - TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN: sempre permitido (desde
+ *   que o dept exista no tenant). Para MTA o isolamento já foi feito ao buscar
+ *   o documento com `findDocumentInTenants` — o tenantId aqui é o do documento.
  * - UPLOADER / USER: verifica `department_permissions` com `canRead: true`
+ *
+ * IMPORTANTE: o departamento NÃO é filtrado por `deleted: false`. A exclusão de
+ * departamento preserva os documentos vinculados (eles seguem `deleted: false`),
+ * apenas o próprio departamento vira `deleted: true`. Portanto, admins precisam
+ * conseguir ler documentos órfãos cujo departamento foi soft-deletado — basta
+ * que o departamento exista (e pertença ao tenant, quando aplicável).
  *
  * Lança `NotFoundError` se sem permissão (spec §10, invariante 4 — nunca 403).
  */
@@ -188,9 +220,10 @@ async function assertCanReadDepartment(
   departmentId: string,
   role: string
 ): Promise<void> {
-  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN') {
-    // SUPER_ADMIN sem tenantId filtrado: aceita qualquer departamento existente
-    const deptFilter: Record<string, unknown> = { id: departmentId, deleted: false };
+  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN') {
+    // SUPER_ADMIN/MTA sem tenantId filtrado: aceita qualquer departamento existente.
+    // Sem `deleted: false`: departamento soft-deletado ainda dá acesso aos docs preservados.
+    const deptFilter: Record<string, unknown> = { id: departmentId };
     if (tenantId !== null) {
       deptFilter['tenantId'] = tenantId;
     }
@@ -211,6 +244,12 @@ async function assertCanReadDepartment(
 
 /**
  * Valida se o usuário tem permissão de ESCRITA em um departamento específico.
+ *
+ * IMPORTANTE: o departamento NÃO é filtrado por `deleted: false`. Como a exclusão
+ * de departamento preserva os documentos (eles seguem `deleted: false`), admins
+ * precisam conseguir editar/excluir/reprocessar documentos órfãos cujo departamento
+ * foi soft-deletado. O isolamento por `tenantId` continua sendo aplicado.
+ *
  * Lança `NotFoundError` se sem permissão.
  */
 async function assertCanWriteDepartment(
@@ -220,10 +259,11 @@ async function assertCanWriteDepartment(
   departmentId: string,
   role: string
 ): Promise<void> {
-  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN') {
+  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN') {
+    // Sem `deleted: false`: departamento soft-deletado ainda permite operar nos docs preservados.
     const dept = await db
       .collection('departments')
-      .findOne({ id: departmentId, tenantId, deleted: false });
+      .findOne({ id: departmentId, tenantId });
     if (!dept) {
       throw new NotFoundError('Departamento não encontrado');
     }
@@ -641,11 +681,17 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     // Parse e validação de query params
     const query = ListDocumentsQuerySchema.parse(request.query);
 
-    // Resolve o tenantId efetivo:
-    // - roles normais: sempre o do JWT
-    // - SUPER_ADMIN com ?tenantId=xxx: filtra pelo tenant informado
-    // - SUPER_ADMIN sem ?tenantId: null (sem restrição de tenant — vê todos)
-    const effectiveTenantId = resolveTenantId(request, query.tenantId, false);
+    // Resolve o contexto de tenant:
+    // - roles normais: sempre o do JWT (mode: 'single')
+    // - SUPER_ADMIN com ?tenantId=xxx: mode 'single'
+    // - SUPER_ADMIN sem ?tenantId: mode 'all' (sem filtro)
+    // - MULTI_TENANT_ADMIN com ?tenantId=xxx (∈ lista): mode 'single'
+    // - MULTI_TENANT_ADMIN sem ?tenantId: mode 'allowed' ($in)
+    const tenantContext = resolveTenantContext(request, { explicitTenantId: query.tenantId, write: false });
+
+    // Mantém compatibilidade com helpers que esperam string | null
+    const effectiveTenantId: string | null =
+      tenantContext.mode === 'single' ? tenantContext.tenantId : null;
 
     // ------------------------------------------------------------------
     // 1. Resolver departamentos acessíveis
@@ -667,9 +713,14 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     // ------------------------------------------------------------------
     type DocFilter = Record<string, unknown>;
     const baseFilter: DocFilter = { deleted: false };
-    if (effectiveTenantId !== null) {
-      baseFilter['tenantId'] = effectiveTenantId;
+
+    if (tenantContext.mode === 'single') {
+      baseFilter['tenantId'] = tenantContext.tenantId;
+    } else if (tenantContext.mode === 'allowed') {
+      // MULTI_TENANT_ADMIN: filtra por $in sobre os tenants permitidos
+      baseFilter['tenantId'] = { $in: tenantContext.tenantIds };
     }
+    // mode: 'all' (SUPER_ADMIN sem tenantId) — sem filtro de tenant
 
     // Restrição de departamentos por role
     if (readableDepartmentIds !== null) {
@@ -761,6 +812,11 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       // SUPER_ADMIN não tem tenantId no JWT — busca o documento sem restrição
       // de tenant e resolve o tenantId a partir do próprio documento.
       doc = await findDocumentGlobally(db, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      // MTA sem tenantId explícito: restringe a busca à lista de tenants permitidos.
+      // Garante isolamento — documentos de empresas fora da lista são tratados
+      // como inexistentes (spec §10, invariante 4).
+      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
       const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
@@ -772,7 +828,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     }
 
     // Verifica permissão de leitura no departamento do documento.
-    // Para SUPER_ADMIN o tenantId vem do próprio documento (sempre permitido).
+    // Para SUPER_ADMIN/MTA o tenantId vem do próprio documento (sempre permitido).
     await assertCanReadDepartment(db, userId, doc.tenantId, doc.departmentId, role);
 
     request.log.info(
@@ -804,12 +860,15 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     // ------------------------------------------------------------------
     // 1. Buscar documento
     //    SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
+    //    MULTI_TENANT_ADMIN: restringe à lista allowedTenantIds.
     //    Demais roles: busca escopada ao tenant do JWT.
     // ------------------------------------------------------------------
     let doc: DocumentDoc | null;
 
     if (role === 'SUPER_ADMIN') {
       doc = await findDocumentGlobally(db, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
       const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
@@ -887,12 +946,15 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     // ------------------------------------------------------------------
     // 1. Buscar documento
     //    SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
+    //    MULTI_TENANT_ADMIN: restringe à lista allowedTenantIds.
     //    Demais roles: busca escopada ao tenant do JWT.
     // ------------------------------------------------------------------
     let doc: DocumentDoc | null;
 
     if (role === 'SUPER_ADMIN') {
       doc = await findDocumentGlobally(db, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
       const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
@@ -1052,11 +1114,14 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const { id } = request.params as { id: string };
 
     // SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
+    // MULTI_TENANT_ADMIN: restringe à lista allowedTenantIds.
     // Demais roles: busca escopada ao tenant do JWT.
     let doc: DocumentDoc | null;
 
     if (role === 'SUPER_ADMIN') {
       doc = await findDocumentGlobally(db, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
       const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
@@ -1127,11 +1192,14 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const { id } = request.params as { id: string };
 
     // SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
+    // MULTI_TENANT_ADMIN: restringe à lista allowedTenantIds.
     // Demais roles: busca escopada ao tenant do JWT.
     let doc: DocumentDoc | null;
 
     if (role === 'SUPER_ADMIN') {
       doc = await findDocumentGlobally(db, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
       const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
@@ -1231,6 +1299,8 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     if (role === 'SUPER_ADMIN') {
       doc = await findDocumentGlobally(db, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
       const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });

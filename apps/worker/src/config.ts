@@ -36,6 +36,11 @@ const EnvSchema = z.object({
   EXTRACTOR: z.enum(['python']).default('python'),
   /** URL do microserviço de extração Python. */
   EXTRACTOR_URL: z.string().url().optional(),
+  /**
+   * Timeout total (ms) da chamada ao extractor. OCR em CPU é lento; default 10 min.
+   * 0 desabilita o timeout.
+   */
+  EXTRACTOR_TIMEOUT_MS: z.coerce.number().int().nonnegative().default(600_000),
 
   // Embeddings (sempre OpenAI, nunca OpenRouter)
   OPENAI_API_KEY: z.string().min(1).optional(),

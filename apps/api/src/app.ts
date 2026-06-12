@@ -11,6 +11,7 @@ import { authPlugin } from './plugins/auth.js';
 import { rateLimitPlugin } from './plugins/rate-limit.js';
 import { authRoutes } from './routes/auth.js';
 import { adminTenantsRoutes } from './routes/admin/tenants.js';
+import { multiTenantAdminsRoutes } from './routes/admin/multi-tenant-admins.js';
 import { usersRoutes } from './routes/users.js';
 import { departmentsRoutes } from './routes/departments.js';
 import { documentTypesRoutes } from './routes/document-types.js';
@@ -127,6 +128,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   await app.register(authRoutes);
   await app.register(adminTenantsRoutes);
+  await app.register(multiTenantAdminsRoutes);
   await app.register(usersRoutes);
   await app.register(departmentsRoutes);
   await app.register(documentTypesRoutes);

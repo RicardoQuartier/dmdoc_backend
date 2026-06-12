@@ -5,9 +5,13 @@ import { RoleSchema } from './role.js';
  * Identidade autenticada carregada no access token e exposta nas respostas de
  * autenticação. É a projeção PÚBLICA do usuário — nunca inclui `passwordHash`.
  *
- * `tenantId` é `null` apenas para SUPER_ADMIN, que não pertence a nenhuma
- * empresa fixa (spec §10, invariante 3). Para os demais papéis é sempre uma
- * empresa concreta.
+ * `tenantId` é `null` para SUPER_ADMIN e MULTI_TENANT_ADMIN, que não pertencem
+ * a nenhuma empresa fixa (spec §10, invariante 3). Para os demais papéis é
+ * sempre uma empresa concreta.
+ *
+ * `allowedTenantIds` é significativo apenas para MULTI_TENANT_ADMIN (lista os
+ * tenants que o MTA pode acessar, máx 20 no MVP). Para os demais papéis é
+ * sempre um array vazio.
  */
 export const AuthUserSchema = z.object({
   id: z.string().uuid(),
@@ -15,6 +19,7 @@ export const AuthUserSchema = z.object({
   name: z.string().min(1).max(200),
   role: RoleSchema,
   tenantId: z.string().uuid().nullable(),
+  allowedTenantIds: z.array(z.string().uuid()).default([]),
 });
 
 export type AuthUser = z.infer<typeof AuthUserSchema>;
@@ -43,10 +48,26 @@ export const TokenPairSchema = z.object({
 export type TokenPair = z.infer<typeof TokenPairSchema>;
 
 /**
+ * Resumo de empresa retornado no login do MULTI_TENANT_ADMIN para que o cliente
+ * possa apresentar o seletor de contexto sem precisar de um request adicional.
+ */
+export const AllowedTenantSummarySchema = z.object({
+  id: z.string().uuid(),
+  name: z.string(),
+});
+
+export type AllowedTenantSummary = z.infer<typeof AllowedTenantSummarySchema>;
+
+/**
  * Resposta de `POST /auth/login`: o par de tokens + os dados básicos do usuário.
+ *
+ * `allowedTenants` é preenchido apenas quando o role é MULTI_TENANT_ADMIN —
+ * contém nome + id dos tenants da lista para evitar roundtrips adicionais no
+ * frontend.
  */
 export const LoginResponseSchema = TokenPairSchema.extend({
   user: AuthUserSchema,
+  allowedTenants: z.array(AllowedTenantSummarySchema).optional(),
 });
 
 export type LoginResponse = z.infer<typeof LoginResponseSchema>;

@@ -19,7 +19,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "form-data": "^4.0.1"
+    "form-data": "^4.0.1",
+    "undici": "^6.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

@@ -119,8 +119,14 @@ async function main(): Promise<void> {
 
   // Extractor — microserviço unificado em Python (PyMuPDF/docx/xlsx/pptx + EasyOCR).
   const extractorUrl = config.EXTRACTOR_URL ?? 'http://localhost:8000/extract';
-  const extractor = createExtractor({ type: 'python', python: { url: extractorUrl } });
-  logger.info({ extractor: config.EXTRACTOR, extractorUrl }, 'extractor criado');
+  const extractor = createExtractor({
+    type: 'python',
+    python: { url: extractorUrl, timeoutMs: config.EXTRACTOR_TIMEOUT_MS },
+  });
+  logger.info(
+    { extractor: config.EXTRACTOR, extractorUrl, timeoutMs: config.EXTRACTOR_TIMEOUT_MS },
+    'extractor criado'
+  );
 
   const deps: PipelineDeps = {
     s3,

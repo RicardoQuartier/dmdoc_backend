@@ -10,16 +10,24 @@ import { UserStore } from '../auth/user-store.js';
 /**
  * Contexto de autenticação injetado na request por `authenticate`.
  *
- * `tenantId` é `null` SOMENTE para SUPER_ADMIN — ele não opera implicitamente
- * sobre nenhuma empresa; seleciona a empresa-alvo por parâmetro EXPLÍCITO de
- * rota (spec §10, invariante 3). Para os demais papéis, `tenantId` é a empresa
- * dona do contexto, e é com ele que o `TenantRepository` garante o 404
- * cross-tenant (recurso de outra empresa é inalcançável, nunca 403).
+ * `tenantId` é `null` para SUPER_ADMIN e MULTI_TENANT_ADMIN — ambos não operam
+ * implicitamente sobre nenhuma empresa. SUPER_ADMIN seleciona a empresa-alvo
+ * por parâmetro EXPLÍCITO de rota (spec §10, invariante 3). MULTI_TENANT_ADMIN
+ * opera sobre `allowedTenantIds` — leituras buscam em todos os tenants da lista,
+ * escritas exigem `tenantId` explícito validado contra a lista.
+ *
+ * Para os demais papéis, `tenantId` é a empresa dona do contexto, e é com ele
+ * que o `TenantRepository` garante o 404 cross-tenant (recurso de outra empresa
+ * é inalcançável, nunca 403).
+ *
+ * `allowedTenantIds` é significativo apenas para MULTI_TENANT_ADMIN; para os
+ * demais papéis é sempre um array vazio.
  */
 export interface RequestUser {
   sub: string;
   role: AccessClaims['role'];
   tenantId: string | null;
+  allowedTenantIds: string[];
 }
 
 declare module 'fastify' {
@@ -86,7 +94,11 @@ const authPluginImpl: FastifyPluginAsync<AuthPluginOptions> = async (app, option
         sub: claims.sub,
         role: claims.role,
         tenantId: claims.tenantId,
+        allowedTenantIds: claims.allowedTenantIds,
       };
+      // SUPER_ADMIN e MULTI_TENANT_ADMIN não têm empresa fixa — tenantId null.
+      // Para MTA o contexto de tenant é resolvido dinamicamente por
+      // resolveTenantContext() em cada rota que precisar.
       request.tenantId = claims.tenantId;
     }
   );

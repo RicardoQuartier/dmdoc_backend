@@ -4,7 +4,7 @@ import { TenantRepository } from '@dmdoc/db-mongo';
 import type { TenantDocument } from '@dmdoc/db-mongo';
 import { ConflictError, NotFoundError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
-import { resolveTenantId } from '../auth/resolve-tenant.js';
+import { resolveTenantId, resolveTenantContext } from '../auth/resolve-tenant.js';
 
 interface DepartmentDoc extends TenantDocument {
   parentId: string | null;
@@ -38,7 +38,8 @@ const TenantIdQuerySchema = z.object({
  * Rotas de CRUD de departamentos.
  *
  * GET retorna array plano ordenado (raízes primeiro, filhos depois).
- * DELETE faz cascade soft-delete de documentos e permissões vinculados.
+ * DELETE exclui logicamente apenas o departamento; documentos e permissões
+ * vinculados são preservados.
  *
  * SUPER_ADMIN: informa tenantId via body (POST) ou ?tenantId (PATCH, DELETE).
  */
@@ -52,11 +53,11 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
   app.get('/departments', { preHandler: app.authenticate }, async (request, reply) => {
     const { tenantId: tenantIdParam } = ListDepartmentsQuerySchema.parse(request.query);
     const db = app.db;
-    const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
+    const role = request.user?.role;
 
     let items: DepartmentDoc[];
 
-    if (isSuperAdmin) {
+    if (role === 'SUPER_ADMIN') {
       const filter: Record<string, unknown> = { deleted: false };
       if (tenantIdParam !== undefined) filter['tenantId'] = tenantIdParam;
 
@@ -66,9 +67,30 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
         .sort({ level: 1, name: 1 })
         .limit(1000)
         .toArray()) as unknown as DepartmentDoc[];
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      // MTA sem tenantId explícito: retorna departamentos de todos os tenants
+      // da lista allowedTenantIds. Com tenantId explícito: resolveTenantContext
+      // valida que está na lista e retorna mode:'single'.
+      const context = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: false });
+      const filter: Record<string, unknown> = { deleted: false };
+
+      if (context.mode === 'single') {
+        filter['tenantId'] = context.tenantId;
+      } else {
+        // mode: 'allowed' — filtra por $in sobre os tenants permitidos
+        const allowedTenantIds = request.user?.allowedTenantIds ?? [];
+        filter['tenantId'] = { $in: allowedTenantIds };
+      }
+
+      items = (await db
+        .collection('departments')
+        .find(filter)
+        .sort({ level: 1, name: 1 })
+        .limit(1000)
+        .toArray()) as unknown as DepartmentDoc[];
     } else {
       const tenantId = request.tenantId;
-      // tenantId deve ser sempre uma string UUID para roles não-SUPER_ADMIN.
+      // tenantId deve ser sempre uma string UUID para roles não-SUPER_ADMIN/MTA.
       // A checagem explícita protege contra execuções fora do fluxo normal de
       // autenticação e evita que uma query sem tenantId vaze dados de todos os
       // tenants (BSON serializa `undefined` descartando a chave do filtro).
@@ -90,10 +112,10 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
   /**
    * POST /departments — cria departamento.
    * SUPER_ADMIN: informar `tenantId` no body (obrigatório).
-   * Valida hierarquia e profundidade máxima.
+   * Valida hierarquia (profundidade ilimitada).
    */
   app.post('/departments', { preHandler: app.authenticate }, async (request, reply) => {
-    requireRole(request, 'TENANT_ADMIN');
+    requireRole(request, 'TENANT_ADMIN', 'MULTI_TENANT_ADMIN');
 
     const body = CreateDepartmentBodySchema.parse(request.body);
     const effectiveTenantId = resolveTenantId(request, body.tenantId, true);
@@ -110,9 +132,6 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
       const parent = await repo.findById(parentId);
       if (!parent) throw new NotFoundError('Departamento pai não encontrado');
       level = parent.level + 1;
-      if (level > 3) {
-        throw new ConflictError('Profundidade máxima de 4 níveis atingida');
-      }
     }
 
     const dept = await repo.insertOne({
@@ -132,7 +151,7 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
    * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
    */
   app.patch('/departments/:id', { preHandler: app.authenticate }, async (request, reply) => {
-    requireRole(request, 'TENANT_ADMIN');
+    requireRole(request, 'TENANT_ADMIN', 'MULTI_TENANT_ADMIN');
 
     const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
     const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
@@ -154,14 +173,19 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
   });
 
   /**
-   * DELETE /departments/:id — cascade soft-delete.
+   * DELETE /departments/:id — exclusão lógica somente do departamento.
    * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
    *
-   * Proíbe deleção se houver sub-departamentos ativos.
-   * Propaga soft-delete para documentos e permissões vinculadas.
+   * Marca apenas o departamento como `deleted: true`. Documentos e permissões
+   * vinculados são PRESERVADOS (continuam `deleted: false`) para que documentos
+   * já carregados não sumam e continuem encontráveis na busca e nas listagens
+   * por quem tem `canRead`.
+   *
+   * Proíbe a deleção se houver sub-departamentos ativos (filhos diretos com
+   * `deleted: false`) → ConflictError 409.
    */
   app.delete('/departments/:id', { preHandler: app.authenticate }, async (request, reply) => {
-    requireRole(request, 'TENANT_ADMIN');
+    requireRole(request, 'TENANT_ADMIN', 'MULTI_TENANT_ADMIN');
 
     const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
     const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
@@ -182,23 +206,14 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
       throw new ConflictError('Departamento possui sub-departamentos ativos');
     }
 
-    // Soft-delete do departamento
+    // Soft-delete apenas do departamento. Documentos e permissões vinculados
+    // são intencionalmente preservados (continuam deleted: false).
     await repo.softDelete(id);
 
-    // Cascade: soft-delete de documentos do departamento
-    await db
-      .collection('documents')
-      .updateMany(
-        { tenantId, departmentId: id, deleted: false },
-        { $set: { deleted: true } }
-      );
-
-    // Cascade: soft-delete de permissões do departamento
-    await db
-      .collection('department_permissions')
-      .updateMany({ departmentId: id }, { $set: { deleted: true } });
-
-    request.log.info({ tenantId, departmentId: id }, 'departamento removido (soft delete)');
+    request.log.info(
+      { tenantId, departmentId: id },
+      'departamento removido (soft delete); documentos e permissões preservados'
+    );
     return reply.status(204).send();
   });
 };

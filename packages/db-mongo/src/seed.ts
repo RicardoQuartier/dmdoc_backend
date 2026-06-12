@@ -141,6 +141,10 @@ export async function seed(client: MongoDbClient): Promise<void> {
   const tenant2AdminPassword = envOr('SEED_TENANT2_ADMIN_PASSWORD', '123qwe');
   const testTenant2Name = envOr('SEED_TENANT2_NAME', 'Empresa Teste 2 Ltda');
 
+  // --- MULTI_TENANT_ADMIN de desenvolvimento ---
+  const mtaEmail = envOr('SEED_MTA_EMAIL', 'mta@local.com');
+  const mtaPassword = envOr('SEED_MTA_PASSWORD', '123qwe');
+
   // --- SUPER_ADMIN (sem empresa) ---
   const superAdminHash = await argon2.hash(superAdminPassword);
   const superAdmin = await upsertUser(db, {
@@ -198,6 +202,36 @@ export async function seed(client: MongoDbClient): Promise<void> {
     role: 'TENANT_ADMIN',
   });
   log.info({ email: tenant2AdminEmail, id: tenant2Admin.id, tenantId: tenantId2 }, 'TENANT_ADMIN 2 garantido');
+
+  // --- MULTI_TENANT_ADMIN de desenvolvimento ---
+  // Sem empresa fixa (tenantId: null); tem acesso aos dois tenants de teste.
+  // Credenciais: mta@local.com / 123qwe (sobreponíveis por env).
+  const mtaHash = await argon2.hash(mtaPassword);
+  await db.collection('users').findOneAndUpdate(
+    { tenantId: null, email: mtaEmail },
+    {
+      $setOnInsert: {
+        id: newId(),
+        tenantId: null,
+        email: mtaEmail,
+        passwordHash: mtaHash,
+        createdAt: new Date(),
+        deleted: false,
+      },
+      $set: {
+        name: 'Multi-Tenant Admin',
+        role: 'MULTI_TENANT_ADMIN' as Role,
+        active: true,
+        // Lista dos dois tenants de teste para poder testar acesso cross-tenant
+        allowedTenantIds: [tenantId, tenantId2],
+      },
+    },
+    { upsert: true, returnDocument: 'after' },
+  );
+  log.info(
+    { email: mtaEmail, allowedTenantIds: [tenantId, tenantId2] },
+    'MULTI_TENANT_ADMIN garantido',
+  );
 
   // --- Tipos globais (tenantId: null, isGlobal: true) ---
   for (const seedType of globalTypeSeeds()) {

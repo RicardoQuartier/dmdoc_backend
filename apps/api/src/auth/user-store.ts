@@ -4,10 +4,12 @@ import type { AuthUser } from '@dmdoc/shared-types';
 /**
  * Documento de usuário como ARMAZENADO na coleção `users` (spec §5.3).
  *
- * Difere de `@dmdoc/shared-types#User` em um ponto: `tenantId` é nullable para
- * acomodar o SUPER_ADMIN, que não pertence a nenhuma empresa fixa (spec §10).
- * Inclui `passwordHash`, que NUNCA sai desta camada para fora (a projeção
- * pública é `AuthUser`).
+ * `tenantId` é nullable para SUPER_ADMIN e MULTI_TENANT_ADMIN, que não
+ * pertencem a nenhuma empresa fixa (spec §10). Inclui `passwordHash`, que NUNCA
+ * sai desta camada para fora (a projeção pública é `AuthUser`).
+ *
+ * `allowedTenantIds` é populado apenas para MULTI_TENANT_ADMIN. Para os demais
+ * papéis o campo está ausente do documento Mongo (tratado como []).
  */
 export interface UserDocument {
   id: string;
@@ -18,6 +20,7 @@ export interface UserDocument {
   role: AuthUser['role'];
   active: boolean;
   createdAt: Date;
+  allowedTenantIds?: string[];
 }
 
 export const USERS_COLLECTION = 'users';
@@ -75,6 +78,9 @@ function stripMongoId(doc: UserDocument & { _id?: unknown; deleted?: boolean }):
 
 /**
  * Projeta um `UserDocument` na identidade pública `AuthUser` (sem passwordHash).
+ *
+ * `allowedTenantIds` é repassado para MTA; para os demais papéis o campo está
+ * ausente no documento e é normalizado para [].
  */
 export function toAuthUser(user: UserDocument): AuthUser {
   return {
@@ -83,5 +89,6 @@ export function toAuthUser(user: UserDocument): AuthUser {
     name: user.name,
     role: user.role,
     tenantId: user.tenantId,
+    allowedTenantIds: user.allowedTenantIds ?? [],
   };
 }

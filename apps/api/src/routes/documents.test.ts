@@ -672,3 +672,158 @@ describe('POST /documents — validações de entrada', () => {
     expect(res.statusCode).toBe(404);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Regressão: departamento excluído preserva acesso aos documentos órfãos.
+//
+// Regra de negócio: a exclusão de um departamento marca APENAS o departamento
+// como deleted:true; os documentos (e department_permissions) continuam
+// deleted:false. Admins precisam continuar acessando/editando esses documentos
+// órfãos — os guards de ACL (assertCanReadDepartment/assertCanWriteDepartment)
+// não devem exigir department.deleted === false.
+// ---------------------------------------------------------------------------
+describe('documentos órfãos — departamento soft-deletado preserva acesso', () => {
+  /**
+   * Cria um documento READY no departamento informado, diretamente no banco.
+   * Retorna o id do documento criado.
+   */
+  async function seedReadyDocument(departmentId: string, tenantId: string): Promise<string> {
+    const docId = newId();
+    await testDb.db.collection('documents').insertOne({
+      id: docId,
+      tenantId,
+      departmentId,
+      documentTypeId: null,
+      filename: 'orfao.pdf',
+      originalFilename: 'orfao.pdf',
+      contentHash: 'b'.repeat(64),
+      sizeBytes: 1024,
+      mimeType: 'application/pdf',
+      s3Key: `tenants/${tenantId}/documents/${'b'.repeat(64)}/orfao.pdf`,
+      status: 'READY',
+      failureReason: null,
+      tags: [],
+      mongoContentId: null,
+      indexValues: {},
+      uploadedById: ADMIN_A_ID,
+      uploadedAt: new Date(),
+      processedAt: new Date(),
+      costUsdCents: 0,
+      deleted: false,
+    });
+    return docId;
+  }
+
+  it('GET /documents/:id retorna 200 para documento cujo departamento foi excluído', async () => {
+    const docId = await seedReadyDocument(DEPT_A_ID, TENANT_A);
+
+    // Exclui o departamento via endpoint real (cascade preserva o documento)
+    const delRes = await app.inject({
+      method: 'DELETE',
+      url: `/departments/${DEPT_A_ID}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(delRes.statusCode).toBe(204);
+
+    // Sanidade: departamento está soft-deletado, documento permanece vivo
+    const deptDb = await testDb.db.collection('departments').findOne({ id: DEPT_A_ID });
+    expect(deptDb?.deleted).toBe(true);
+    const docDb = await testDb.db.collection('documents').findOne({ id: docId });
+    expect(docDb?.deleted).toBe(false);
+
+    // GET detalhe deve continuar retornando 200 (antes regredia para 404)
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().id).toBe(docId);
+    expect(res.json().departmentId).toBe(DEPT_A_ID);
+  });
+
+  it('GET /documents/:id/download retorna 200 para documento órfão', async () => {
+    const docId = await seedReadyDocument(DEPT_A_ID, TENANT_A);
+
+    const delRes = await app.inject({
+      method: 'DELETE',
+      url: `/departments/${DEPT_A_ID}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(delRes.statusCode).toBe(204);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}/download`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(typeof res.json().url).toBe('string');
+  });
+
+  it('PATCH /documents/:id funciona para documento órfão (não 404 por causa do depto)', async () => {
+    const docId = await seedReadyDocument(DEPT_A_ID, TENANT_A);
+
+    const delRes = await app.inject({
+      method: 'DELETE',
+      url: `/departments/${DEPT_A_ID}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(delRes.statusCode).toBe(204);
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { tags: ['revisado'] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().tags).toContain('revisado');
+  });
+
+  it('DELETE /documents/:id funciona para documento órfão (não 404 por causa do depto)', async () => {
+    const docId = await seedReadyDocument(DEPT_A_ID, TENANT_A);
+
+    const delDept = await app.inject({
+      method: 'DELETE',
+      url: `/departments/${DEPT_A_ID}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(delDept.statusCode).toBe(204);
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(204);
+    const docDb = await testDb.db.collection('documents').findOne({ id: docId });
+    expect(docDb?.deleted).toBe(true);
+  });
+
+  it('POST /documents para departamento JÁ excluído continua retornando 404 (sem regressão)', async () => {
+    // Exclui o departamento A antes de qualquer upload
+    const delRes = await app.inject({
+      method: 'DELETE',
+      url: `/departments/${DEPT_A_ID}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(delRes.statusCode).toBe(204);
+
+    const { payload, headers } = buildUploadForm({ departmentId: DEPT_A_ID });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenAdminA}`, ...headers },
+      payload,
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+  });
+});

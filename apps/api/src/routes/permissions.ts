@@ -3,9 +3,10 @@ import { z } from 'zod';
 import { TenantRepository, newId } from '@dmdoc/db-mongo';
 import type { TenantDocument } from '@dmdoc/db-mongo';
 import type { User } from '@dmdoc/shared-types';
+import { ADMIN_ROLES } from '@dmdoc/shared-types';
 import { NotFoundError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
-import { resolveTenantId } from '../auth/resolve-tenant.js';
+import { resolveTenantContext } from '../auth/resolve-tenant.js';
 import { AuditLogger } from '../auth/audit.js';
 
 interface UserDoc extends TenantDocument {
@@ -59,38 +60,38 @@ export const permissionsRoutes: FastifyPluginAsync = async (app) => {
    */
   app.get('/users/:id/permissions', { preHandler: app.authenticate }, async (request, reply) => {
     const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
-    const effectiveTenantId = resolveTenantId(request, tenantIdParam, false);
+    const ctx = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: false });
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const db = app.db;
 
-    if (effectiveTenantId !== null) {
-      // Caminho normal: verifica que o usuário existe no tenant
-      const usersRepo = new TenantRepository<UserDoc>(db.collection('users'), { tenantId: effectiveTenantId });
+    // Resolve o tenant efetivo do usuário-alvo conforme o escopo do solicitante.
+    // Para MTA sem ?tenantId (mode 'allowed') localizamos o usuário entre os
+    // allowedTenantIds e usamos o tenantId dele para escopar as permissões.
+    let permissionTenantId: string | null;
+
+    if (ctx.mode === 'single') {
+      // Verifica que o usuário existe no tenant escopado.
+      const usersRepo = new TenantRepository<UserDoc>(db.collection('users'), { tenantId: ctx.tenantId });
       const user = await usersRepo.findById(id);
       if (!user) throw new NotFoundError();
-
-      const permissions = await db
-        .collection('department_permissions')
-        .find({ userId: id, tenantId: effectiveTenantId, deleted: false })
-        .toArray();
-
-      const result = permissions.map(stripMongoId).map((p) => ({
-        departmentId: (p as { departmentId: string }).departmentId,
-        canRead: (p as { canRead: boolean }).canRead,
-        canWrite: (p as { canWrite: boolean }).canWrite,
-      }));
-
-      return reply.status(200).send({ permissions: result });
+      permissionTenantId = ctx.tenantId;
+    } else if (ctx.mode === 'allowed') {
+      const user = (await db
+        .collection('users')
+        .findOne({ id, tenantId: { $in: ctx.tenantIds }, deleted: false })) as unknown as UserDoc | null;
+      if (!user) throw new NotFoundError();
+      permissionTenantId = user.tenantId;
+    } else {
+      // SUPER_ADMIN sem filtro: busca global por userId.
+      const user = await db.collection('users').findOne({ id, deleted: false });
+      if (!user) throw new NotFoundError();
+      permissionTenantId = null;
     }
 
-    // SUPER_ADMIN sem filtro de tenant: busca global por userId
-    const user = await db.collection('users').findOne({ id, deleted: false });
-    if (!user) throw new NotFoundError();
+    const permFilter: Record<string, unknown> = { userId: id, deleted: false };
+    if (permissionTenantId !== null) permFilter['tenantId'] = permissionTenantId;
 
-    const permissions = await db
-      .collection('department_permissions')
-      .find({ userId: id, deleted: false })
-      .toArray();
+    const permissions = await db.collection('department_permissions').find(permFilter).toArray();
 
     const result = permissions.map(stripMongoId).map((p) => ({
       departmentId: (p as { departmentId: string }).departmentId,
@@ -112,12 +113,17 @@ export const permissionsRoutes: FastifyPluginAsync = async (app) => {
    * SUPER_ADMIN: tenantId obrigatório via ?tenantId.
    */
   app.put('/users/:id/permissions', { preHandler: app.authenticate }, async (request, reply) => {
-    requireRole(request, 'TENANT_ADMIN');
+    requireRole(request, ...ADMIN_ROLES);
 
     const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
-    const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
-    // effectiveTenantId nunca é null aqui (requireForSuperAdmin: true)
-    const tenantId = effectiveTenantId as string;
+    // write: true exige tenant explícito para SUPER_ADMIN e MULTI_TENANT_ADMIN.
+    // MTA com ?tenantId ∈ allowedTenantIds → mode 'single'; fora da lista → 404.
+    // SA/MTA sem ?tenantId → erro (mode nunca cai em 'single'). O usuário-alvo e
+    // todos os departamentos são validados contra o tenant resolvido abaixo.
+    const ctx = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: true });
+    /* c8 ignore next */
+    if (ctx.mode !== 'single') throw new NotFoundError();
+    const tenantId = ctx.tenantId;
 
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const { permissions } = PutPermissionsBodySchema.parse(request.body);

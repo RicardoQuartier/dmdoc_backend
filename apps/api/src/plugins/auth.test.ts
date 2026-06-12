@@ -74,6 +74,7 @@ describe('plugin authenticate', () => {
       sub: USER_ID,
       tenantId: TENANT_A,
       role: 'TENANT_ADMIN',
+      allowedTenantIds: [],
     });
 
     const res = await app.inject({
@@ -93,6 +94,7 @@ describe('plugin authenticate', () => {
       sub: SUPER_ID,
       tenantId: null,
       role: 'SUPER_ADMIN',
+      allowedTenantIds: [],
     });
 
     const res = await app.inject({

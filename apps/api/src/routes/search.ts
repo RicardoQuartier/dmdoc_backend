@@ -11,7 +11,7 @@ import type { Config } from '../config.js';
 import { embedQuery } from '../services/embedding.js';
 import { parseCitations } from '../services/citation-parser.js';
 import { RAG_ANSWER_PROMPT } from '../prompts/rag-answer.js';
-import { resolveTenantId } from '../auth/resolve-tenant.js';
+import { resolveTenantContext } from '../auth/resolve-tenant.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais
@@ -41,8 +41,10 @@ interface DocumentDoc {
 
 /**
  * Resolve os departmentIds que o usuário pode LER.
- * TENANT_ADMIN / SUPER_ADMIN: null (sem restrição).
- * UPLOADER / USER: somente onde canRead: true.
+ * TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN: null (sem restrição de ACL).
+ *   Para MTA, os tenants já estão restritos pelo filtro $in de tenantIds — não
+ *   há matriz de permissões por departamento adicional (o MTA é um admin de empresa).
+ * UPLOADER / USER: somente onde canRead: true no tenant do JWT.
  */
 async function resolveReadableDepartmentIds(
   db: Db,
@@ -50,7 +52,7 @@ async function resolveReadableDepartmentIds(
   tenantId: string,
   role: string
 ): Promise<string[] | null> {
-  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN') {
+  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN') {
     return null;
   }
   const perms = await db
@@ -83,11 +85,15 @@ interface StructuredFilters {
  * Aplica filtros estruturados na coleção `documents` e retorna os documentIds
  * que passam. Retorna `null` quando não há filtros (sem restrição por documentId).
  *
+ * Aceita `tenantId` (string — mode 'single') ou `tenantIds` (string[] — mode
+ * 'allowed', MULTI_TENANT_ADMIN). Para mode 'all' ambos são undefined.
+ *
  * spec §9 etapa 4.
  */
 async function resolveFilteredDocumentIds(
   db: Db,
-  tenantId: string,
+  tenantId: string | undefined,
+  tenantIds: string[] | undefined,
   allowedDepartmentIds: string[] | null,
   filters: StructuredFilters | undefined
 ): Promise<string[] | null> {
@@ -103,7 +109,14 @@ async function resolveFilteredDocumentIds(
   }
 
   type DocFilter = Record<string, unknown>;
-  const filter: DocFilter = { tenantId, deleted: false, status: 'READY' };
+  const filter: DocFilter = { deleted: false, status: 'READY' };
+
+  // Injeta filtro de tenant conforme o modo de contexto
+  if (tenantIds !== undefined && tenantIds.length > 0) {
+    filter['tenantId'] = { $in: tenantIds };
+  } else if (tenantId !== undefined) {
+    filter['tenantId'] = tenantId;
+  }
 
   if (filters?.departmentIds !== undefined) {
     const requested = filters.departmentIds;
@@ -199,21 +212,33 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     const db = app.db;
 
     // ------------------------------------------------------------------
-    // 1. Validar body e resolver tenantId
+    // 1. Validar body e resolver contexto de tenant
     // ------------------------------------------------------------------
     const body = SearchRequestSchema.parse(request.body);
 
     const { tenantId: tenantIdParam } = z.object({ tenantId: z.string().uuid().optional() }).parse(request.query);
-    const tenantId = resolveTenantId(request, tenantIdParam, true) as string;
+    const context = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: false });
     const { query, searchMode, filters, topK, generateAnswer } = body;
 
-    const log = request.log.child({ tenantId, userId, traceId: request.id });
+    // tenantId / tenantIds para os pipelines de busca conforme o mode
+    const singleTenantId = context.mode === 'single' ? context.tenantId : undefined;
+    const multiTenantIds = context.mode === 'allowed' ? context.tenantIds : undefined;
+
+    // Para logs: usa o tenantId singular quando disponível
+    const logTenantId = singleTenantId ?? (multiTenantIds ? `[${multiTenantIds.join(',')}]` : 'all');
+    const log = request.log.child({ tenantId: logTenantId, userId, traceId: request.id });
 
     // ------------------------------------------------------------------
     // 2. Resolver departamentos acessíveis (permissões ACL)
-    //    spec §9 etapa 1 — TENANT_ADMIN/SUPER_ADMIN sem restrição
+    //    spec §9 etapa 1 — TENANT_ADMIN/SUPER_ADMIN/MTA: sem restrição (null)
+    //    UPLOADER/USER: somente onde canRead: true no tenant do JWT
     // ------------------------------------------------------------------
-    let allowedDepartmentIds = await resolveReadableDepartmentIds(db, userId, tenantId, role);
+    let allowedDepartmentIds = await resolveReadableDepartmentIds(
+      db,
+      userId,
+      singleTenantId ?? '',
+      role
+    );
 
     // Se o request filtra por departamentos específicos, interseccionar
     if (filters?.departmentIds !== undefined && filters.departmentIds.length > 0) {
@@ -238,7 +263,8 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     // ------------------------------------------------------------------
     const filterDocumentIds = await resolveFilteredDocumentIds(
       db,
-      tenantId,
+      singleTenantId,
+      multiTenantIds,
       allowedDepartmentIds,
       filters
     );
@@ -266,7 +292,8 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     // 5. Busca — modo selecionado via searchMode (spec §9 etapa 3)
     // ------------------------------------------------------------------
     const baseParams = {
-      tenantId,
+      ...(singleTenantId !== undefined ? { tenantId: singleTenantId } : {}),
+      ...(multiTenantIds !== undefined ? { tenantIds: multiTenantIds } : {}),
       allowedDepartmentIds,
       topK,
       ...(filterDocumentIds !== null ? { filterDocumentIds } : {}),

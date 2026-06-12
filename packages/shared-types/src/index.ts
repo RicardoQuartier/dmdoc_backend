@@ -1,4 +1,4 @@
-export { RoleSchema, type Role } from './role.js';
+export { RoleSchema, type Role, ADMIN_ROLES, type AdminRole } from './role.js';
 export {
   AuthUserSchema,
   type AuthUser,
@@ -10,6 +10,8 @@ export {
   type LoginResponse,
   RefreshRequestSchema,
   type RefreshRequest,
+  AllowedTenantSummarySchema,
+  type AllowedTenantSummary,
 } from './auth.js';
 export { TenantSchema, type Tenant } from './tenant.js';
 export { UserSchema, type User } from './user.js';

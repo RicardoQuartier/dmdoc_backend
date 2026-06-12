@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { requireRole } from '../auth/role-guard.js';
-import { resolveTenantId } from '../auth/resolve-tenant.js';
+import { resolveTenantContext } from '../auth/resolve-tenant.js';
 import { NotFoundError } from '../errors/index.js';
 
 interface TenantDoc {
@@ -27,16 +27,28 @@ const TenantIdQuerySchema = z.object({
  * Acesso:
  *   - TENANT_ADMIN: usa o tenantId do JWT
  *   - SUPER_ADMIN: exige ?tenantId explícito
+ *   - MULTI_TENANT_ADMIN: exige ?tenantId explícito, validado contra allowedTenantIds
+ *     (404 se não constar). Não há acesso a métricas agregadas de todos os tenants.
  *
  * Spec §7 (Admin), entregável 37 da Fase 5.
  */
 export const usageRoutes: FastifyPluginAsync = async (app) => {
   app.get('/usage', { preHandler: app.authenticate }, async (request, reply) => {
-    requireRole(request, 'TENANT_ADMIN');
+    requireRole(request, 'TENANT_ADMIN', 'MULTI_TENANT_ADMIN');
 
     const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
-    const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
-    const tenantId = effectiveTenantId as string;
+
+    // resolveTenantContext em modo write=true força tenantId explícito para SA e MTA.
+    // Para TENANT_ADMIN retorna mode:'single' com o tenantId do token.
+    // Nos demais casos (SA/MTA sem explicitTenantId) lança ConflictError/NotFoundError
+    // antes de chegar aqui — portanto ctx.mode é sempre 'single' após esta linha.
+    const ctx = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: true });
+    if (ctx.mode !== 'single') {
+      // Ramo defensivo: write:true garante que never chegamos aqui, mas o
+      // TypeScript não infere o narrowing via throw do resolveTenantContext.
+      throw new NotFoundError('tenantId é obrigatório para esta operação');
+    }
+    const tenantId = ctx.tenantId;
 
     const db = app.db;
 

@@ -22,20 +22,23 @@ import type { Config } from '../config.js';
  */
 
 /**
- * Conteúdo do access token, validado na verificação. `tenantId` é `null` para
- * SUPER_ADMIN (sem empresa fixa).
+ * Conteúdo do access token, validado na verificação.
+ *
+ * `tenantId` é `null` para SUPER_ADMIN e MULTI_TENANT_ADMIN (sem empresa fixa).
+ *
+ * `allowedTenantIds` carrega a lista de empresas acessíveis pelo
+ * MULTI_TENANT_ADMIN. Para os demais papéis é sempre um array vazio. Limite de
+ * 20 UUIDs no MVP (~400-500 bytes extras no token — aceitável).
  */
 const AccessClaimsSchema = z.object({
   sub: z.string().uuid(),
   tenantId: z.string().uuid().nullable(),
   role: RoleSchema,
+  allowedTenantIds: z.array(z.string().uuid()).default([]),
 });
 
-export interface AccessClaims {
-  sub: string;
-  tenantId: string | null;
-  role: Role;
-}
+// Inferido do schema para garantir consistência com os defaults Zod.
+export type AccessClaims = z.infer<typeof AccessClaimsSchema>;
 
 const RefreshClaimsSchema = z.object({
   sub: z.string().uuid(),
@@ -126,7 +129,11 @@ export class TokenService {
     return this.verify(token, this.config.JWT_REFRESH_SECRET, RefreshClaimsSchema);
   }
 
-  private verify<T>(token: string, secret: string, schema: z.ZodType<T>): T {
+  private verify<Output, Input = Output>(
+    token: string,
+    secret: string,
+    schema: z.ZodType<Output, z.ZodTypeDef, Input>,
+  ): Output {
     let decoded: unknown;
     try {
       decoded = jwt.verify(token, secret);

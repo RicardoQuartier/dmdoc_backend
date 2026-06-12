@@ -1,11 +1,22 @@
 import { readFile } from 'node:fs/promises';
 import * as path from 'node:path';
 import FormData from 'form-data';
+import { Agent } from 'undici';
 import {
   type ExtractionResult,
   type ExtractorProvider,
   ExtractionError,
 } from './types.js';
+
+/**
+ * Timeout padrão da chamada ao extractor, em milissegundos.
+ *
+ * O motor de OCR (EasyOCR) roda em CPU em dev e pode levar vários minutos por
+ * documento. O `headersTimeout`/`bodyTimeout` padrão do undici (300s) é curto
+ * demais e fazia o worker abortar com `HeadersTimeoutError` mesmo quando o
+ * extractor concluía a extração. 10 minutos dá folga suficiente.
+ */
+const DEFAULT_EXTRACTOR_TIMEOUT_MS = 600_000;
 
 /**
  * Configuração do microserviço de extração em Python (DMDoc Extractor).
@@ -17,6 +28,11 @@ import {
 export interface PythonExtractorConfig {
   /** URL completa do endpoint, ex.: http://extractor:8000/extract */
   url: string;
+  /**
+   * Timeout total da requisição em ms. Cobre headers e corpo da resposta.
+   * Default: 600000 (10 min) — OCR em CPU é lento. Use 0 para desabilitar.
+   */
+  timeoutMs?: number;
 }
 
 /** Resposta do microserviço de extração. */
@@ -37,9 +53,17 @@ interface PythonExtractResponse {
  */
 export class PythonExtractor implements ExtractorProvider {
   private readonly config: PythonExtractorConfig;
+  private readonly dispatcher: Agent;
 
   constructor(config: PythonExtractorConfig) {
     this.config = config;
+    const timeoutMs = config.timeoutMs ?? DEFAULT_EXTRACTOR_TIMEOUT_MS;
+    // Dispatcher dedicado: amplia os timeouts de headers e corpo do undici,
+    // que por padrão (300s) abortavam extrações de OCR longas.
+    this.dispatcher = new Agent({
+      headersTimeout: timeoutMs,
+      bodyTimeout: timeoutMs,
+    });
   }
 
   async extract(filePath: string, mimeType: string): Promise<ExtractionResult> {
@@ -55,11 +79,14 @@ export class PythonExtractor implements ExtractorProvider {
 
     let response: Response;
     try {
+      // `dispatcher` não faz parte do tipo padrão RequestInit, mas é suportado
+      // pelo fetch do undici (Node). Cast via unknown para anexá-lo.
       response = await fetch(this.config.url, {
         method: 'POST',
         headers: form.getHeaders(),
         body: form.getBuffer(),
-      });
+        dispatcher: this.dispatcher,
+      } as unknown as RequestInit);
     } catch (err) {
       throw new ExtractionError(
         `Network error calling extractor service: ${String(err)}`,

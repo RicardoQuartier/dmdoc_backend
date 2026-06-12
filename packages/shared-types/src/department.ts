@@ -1,8 +1,10 @@
 import { z } from 'zod';
 
 /**
- * Departamento de uma empresa. Organizado em árvore de até 4 níveis
- * (level 0 = raiz, level 3 = folha).
+ * Departamento de uma empresa. Organizado em árvore de profundidade ilimitada
+ * (level 0 = raiz). Os níveis 0-3 têm nomes semânticos
+ * (Empresa → Departamento → Categoria → Pasta de Tipo); níveis mais profundos
+ * são genéricos.
  *
  * Spec §5.3 (coleção `departments`).
  */
@@ -11,7 +13,7 @@ export const DepartmentSchema = z.object({
   tenantId: z.string().uuid(),
   parentId: z.string().uuid().nullable(),
   name: z.string().min(1).max(200),
-  level: z.number().int().min(0).max(3),
+  level: z.number().int().min(0),
   tags: z.array(z.string()),
   deleted: z.boolean(),
   createdAt: z.date(),
