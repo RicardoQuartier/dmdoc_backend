@@ -46,6 +46,8 @@ OFFICE_EXTENSIONS: dict[str, str] = {
     "application/vnd.ms-excel": ".xls",
     "application/vnd.oasis.opendocument.presentation": ".odp",
     "application/vnd.oasis.opendocument.text": ".odt",
+    "text/rtf": ".rtf",
+    "application/rtf": ".rtf",
 }
 
 # Resolução máxima enviada ao OCR (maior lado, px).
@@ -137,6 +139,35 @@ def ocr_image(img: np.ndarray) -> str:
 
 
 # ──────────────────────────── extração por formato ────────────────────────────
+
+
+def _libreoffice_to_pdf(data: bytes, ext: str) -> bytes:
+    """Converte documento Office/RTF para PDF via LibreOffice headless."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{ext}")
+        with open(input_path, "wb") as f:
+            f.write(data)
+        try:
+            result = subprocess.run(
+                ["libreoffice", "--headless", "--norestore",
+                 "--convert-to", "pdf", "--outdir", tmpdir, input_path],
+                capture_output=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            return b""
+        if result.returncode != 0:
+            return b""
+        pdf_name = os.path.basename(input_path).rsplit(".", 1)[0] + ".pdf"
+        pdf_path = os.path.join(tmpdir, pdf_name)
+        if not os.path.exists(pdf_path):
+            return b""
+        with open(pdf_path, "rb") as f:
+            return f.read()
+
+
+def extract_txt(data: bytes) -> dict:
+    text = data.decode("utf-8", errors="replace")
+    return {"text": text, "pageCount": 1, "ocrPages": []}
 
 
 def extract_pdf(data: bytes) -> dict:
@@ -264,6 +295,24 @@ async def extract(
         out = extract_xlsx(data)
     elif "presentationml" in mime or name.endswith(".pptx"):
         out = extract_pptx(data)
+    elif mime == "application/msword" or name.endswith(".doc"):
+        pdf = _libreoffice_to_pdf(data, ".doc")
+        out = extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
+    elif mime == "application/vnd.ms-excel" or name.endswith(".xls"):
+        pdf = _libreoffice_to_pdf(data, ".xls")
+        out = extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
+    elif mime == "application/vnd.ms-powerpoint" or name.endswith(".ppt"):
+        pdf = _libreoffice_to_pdf(data, ".ppt")
+        out = extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
+    elif mime in ("text/rtf", "application/rtf") or name.endswith(".rtf"):
+        pdf = _libreoffice_to_pdf(data, ".rtf")
+        out = extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
+    elif mime == "text/plain" or name.endswith(".txt"):
+        out = extract_txt(data)
+    elif mime.startswith("video/") or mime.startswith("audio/") or name.endswith(
+        (".mp4", ".avi", ".mov", ".mkv", ".webm", ".3gp", ".mp3", ".m4a")
+    ):
+        out = {"text": "", "pageCount": 1, "ocrPages": []}
     else:
         out = {"text": "", "pageCount": 1, "ocrPages": [], "error": f"unsupported mime: {mime}"}
 
@@ -276,16 +325,11 @@ async def convert_to_pdf(
     file: UploadFile = File(...),
     content_type: str = Form(default=""),
 ) -> Response:
-    """Converte um documento Office (PPTX, PPT, DOCX, DOC, XLSX, XLS, ODP, ODT) para PDF
-    usando LibreOffice em modo headless.
-
-    Consumido pela rota GET /documents/:id/preview da Fastify API.
-    """
+    """Converte documento Office para PDF usando LibreOffice headless."""
     data = await file.read()
     mime = content_type or file.content_type or ""
     name = (file.filename or "").lower()
 
-    # Determina extensão para nomear o arquivo de entrada corretamente.
     ext = OFFICE_EXTENSIONS.get(mime, "")
     if not ext:
         for suffix in OFFICE_EXTENSIONS.values():
@@ -298,40 +342,8 @@ async def convert_to_pdf(
             detail=f"formato não suportado para conversão: {mime or name}",
         )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, f"input{ext}")
-        with open(input_path, "wb") as f:
-            f.write(data)
-
-        try:
-            result = subprocess.run(
-                [
-                    "libreoffice",
-                    "--headless",
-                    "--norestore",
-                    "--convert-to", "pdf",
-                    "--outdir", tmpdir,
-                    input_path,
-                ],
-                capture_output=True,
-                timeout=60,
-            )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="timeout na conversão")
-
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"libreoffice falhou: {result.stderr.decode()[:500]}",
-            )
-
-        pdf_name = os.path.basename(input_path).rsplit(".", 1)[0] + ".pdf"
-        pdf_path = os.path.join(tmpdir, pdf_name)
-
-        if not os.path.exists(pdf_path):
-            raise HTTPException(status_code=500, detail="PDF não gerado pelo LibreOffice")
-
-        with open(pdf_path, "rb") as f:
-            pdf_bytes = f.read()
+    pdf_bytes = _libreoffice_to_pdf(data, ext)
+    if not pdf_bytes:
+        raise HTTPException(status_code=500, detail="falha na conversão do documento")
 
     return Response(content=pdf_bytes, media_type="application/pdf")
