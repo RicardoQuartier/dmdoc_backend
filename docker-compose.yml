@@ -41,6 +41,13 @@ services:
     build:
       context: ./services/extractor
     container_name: dmdoc-extractor
+    environment:
+      # CPUs antigas (ex.: i3 3ª geração / Ivy Bridge) têm AVX mas NÃO têm AVX2/FMA.
+      # O PyTorch (via EasyOCR) usa kernels AVX2/FMA por padrão e quebra com SIGILL
+      # (exit 132 / "Illegal instruction"). Forçar a capability para 'avx' faz o
+      # torch usar só kernels compatíveis. Se ainda quebrar, troque para 'default'
+      # (modo escalar, mais lento, porém universal).
+      ATEN_CPU_CAPABILITY: avx
     ports:
       - '5056:8000'
 
