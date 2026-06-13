@@ -5,9 +5,7 @@ import type { IndexField } from '@dmdoc/shared-types';
 import type { TenantDocument } from '@dmdoc/db-mongo';
 import { ForbiddenError, NotFoundError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
-// TODO: migrar para resolveTenantContext — cada handler precisa tratar mode:'allowed'
-//       (MULTI_TENANT_ADMIN em leitura) e ajustar a lógica de tipos globais separadamente.
-import { resolveTenantId } from '../auth/resolve-tenant.js';
+import { resolveTenantContext, resolveTenantId } from '../auth/resolve-tenant.js';
 import { ADMIN_ROLES } from '@dmdoc/shared-types';
 
 interface DocumentTypeDoc extends TenantDocument {
@@ -69,43 +67,44 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
   /**
    * GET /document-types — lista tipos de documento.
    *
-   * - SA com ?tenantId: tipos do tenant + tipos globais
    * - SA sem ?tenantId: todos os tipos de todos os tenants (incluindo globais)
+   * - SA/MTA com ?tenantId: tipos do tenant específico + tipos globais
+   * - MTA sem ?tenantId: tipos de todos os seus tenants + globais
    * - Outros: tipos do próprio tenant + globais
    */
   app.get('/document-types', { preHandler: app.authenticate }, async (request, reply) => {
     const { tenantId: tenantIdParam } = ListDocumentTypesQuerySchema.parse(request.query);
     const db = app.db;
-    const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
+
+    const ctx = resolveTenantContext(request, { explicitTenantId: tenantIdParam });
 
     let items: Record<string, unknown>[];
 
-    if (isSuperAdmin) {
-      if (tenantIdParam !== undefined) {
-        // SA com tenantId: tipos do tenant específico + tipos globais
-        items = await db
-          .collection('document_types')
-          .find({
-            deleted: false,
-            $or: [{ tenantId: tenantIdParam }, { isGlobal: true, tenantId: null }],
-          })
-          .sort({ name: 1 })
-          .toArray() as unknown as Record<string, unknown>[];
-      } else {
-        // SA sem tenantId: todos os tipos de todos os tenants, incluindo globais
-        items = await db
-          .collection('document_types')
-          .find({ deleted: false })
-          .sort({ name: 1 })
-          .toArray() as unknown as Record<string, unknown>[];
-      }
-    } else {
-      const tenantId = request.tenantId!;
+    if (ctx.mode === 'all') {
+      items = await db
+        .collection('document_types')
+        .find({ deleted: false })
+        .sort({ name: 1 })
+        .toArray() as unknown as Record<string, unknown>[];
+    } else if (ctx.mode === 'allowed') {
       items = await db
         .collection('document_types')
         .find({
           deleted: false,
-          $or: [{ tenantId }, { isGlobal: true, tenantId: null }],
+          $or: [
+            { tenantId: { $in: ctx.tenantIds } },
+            { isGlobal: true, tenantId: null },
+          ],
+        })
+        .sort({ name: 1 })
+        .toArray() as unknown as Record<string, unknown>[];
+    } else {
+      // mode === 'single'
+      items = await db
+        .collection('document_types')
+        .find({
+          deleted: false,
+          $or: [{ tenantId: ctx.tenantId }, { isGlobal: true, tenantId: null }],
         })
         .sort({ name: 1 })
         .toArray() as unknown as Record<string, unknown>[];
