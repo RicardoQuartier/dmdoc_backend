@@ -106,7 +106,33 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
         .toArray()) as unknown as DepartmentDoc[];
     }
 
-    return reply.status(200).send(items);
+    // Contagem direta de documentos por departamento. Os departmentIds já estão
+    // escopados ao(s) tenant(s) permitido(s) acima, então o $in sobre eles é
+    // intrinsecamente multi-tenant safe. Não é recursivo: conta apenas
+    // documentos diretamente vinculados ao nó (departmentId == dept.id).
+    const departmentIds = items.map((d) => d.id);
+    const countMap = new Map<string, number>();
+
+    if (departmentIds.length > 0) {
+      const counts = (await db
+        .collection('documents')
+        .aggregate([
+          { $match: { departmentId: { $in: departmentIds }, deleted: false } },
+          { $group: { _id: '$departmentId', count: { $sum: 1 } } },
+        ])
+        .toArray()) as Array<{ _id: string; count: number }>;
+
+      for (const { _id, count } of counts) {
+        countMap.set(_id, count);
+      }
+    }
+
+    const itemsWithCount = items.map((dept) => ({
+      ...dept,
+      documentCount: countMap.get(dept.id) ?? 0,
+    }));
+
+    return reply.status(200).send(itemsWithCount);
   });
 
   /**

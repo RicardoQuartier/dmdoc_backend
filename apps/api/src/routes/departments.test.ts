@@ -181,3 +181,55 @@ describe('DELETE /departments/:id — preserva documentos e permissões', () => 
     expect(res.json().error.code).toBe('NOT_FOUND');
   });
 });
+
+describe('GET /departments — documentCount', () => {
+  it('retorna a contagem direta de documentos (deleted:false) por departamento', async () => {
+    const deptComDocs = newId();
+    const deptVazio = newId();
+
+    await testDb.db.collection('departments').insertMany([
+      {
+        id: deptComDocs,
+        tenantId: TENANT_A,
+        parentId: null,
+        name: 'Financeiro',
+        level: 0,
+        tags: [],
+        deleted: false,
+        createdAt: new Date(),
+      },
+      {
+        id: deptVazio,
+        tenantId: TENANT_A,
+        parentId: null,
+        name: 'RH',
+        level: 0,
+        tags: [],
+        deleted: false,
+        createdAt: new Date(),
+      },
+    ]);
+
+    await testDb.db.collection('documents').insertMany([
+      { id: newId(), tenantId: TENANT_A, departmentId: deptComDocs, deleted: false, createdAt: new Date() },
+      { id: newId(), tenantId: TENANT_A, departmentId: deptComDocs, deleted: false, createdAt: new Date() },
+      // documento excluído logicamente não deve ser contado
+      { id: newId(), tenantId: TENANT_A, departmentId: deptComDocs, deleted: true, createdAt: new Date() },
+    ]);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments',
+      headers: { authorization: `Bearer ${tokenA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const items = res.json() as Array<{ id: string; documentCount: number }>;
+
+    const comDocs = items.find((d) => d.id === deptComDocs);
+    const vazio = items.find((d) => d.id === deptVazio);
+
+    expect(comDocs?.documentCount).toBe(2);
+    expect(vazio?.documentCount).toBe(0);
+  });
+});
