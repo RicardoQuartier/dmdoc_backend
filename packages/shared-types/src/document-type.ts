@@ -1,15 +1,7 @@
 import { z } from 'zod';
 
-/**
- * Tipos de campo de índice. Spec §5.2.
- *
- * - TEXT: texto livre até 500 chars
- * - DATE: data (ISO 8601)
- * - NUMBER: numérico decimal
- * - CUSTOMER: referência a cliente (texto livre no MVP, integração Protheus pós-MVP)
- * - PROVIDER: referência a fornecedor (idem)
- */
-export const FieldTypeSchema = z.enum(['TEXT', 'DATE', 'NUMBER', 'CUSTOMER', 'PROVIDER']);
+/** Tipos de campo de índice. Spec §5.2. */
+export const FieldTypeSchema = z.enum(['TEXT', 'DATE', 'NUMBER']);
 
 export type FieldType = z.infer<typeof FieldTypeSchema>;
 

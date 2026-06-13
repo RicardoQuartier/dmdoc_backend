@@ -75,6 +75,17 @@ export interface HybridSearchParams extends SearchParams {
 }
 
 /**
+ * Parâmetros para busca por metadados na coleção `documents`.
+ */
+export interface MetadataSearchParams {
+  tenantId?: string;
+  tenantIds?: string[];
+  allowedDepartmentIds: string[] | null;
+  filterDocumentIds?: string[];
+  queryText: string;
+}
+
+/**
  * Monta o filtro de tenant para uso nos pipelines de busca.
  *
  * - `tenantId` (string): filtro de igualdade simples — mode 'single'.
@@ -97,6 +108,63 @@ function buildTenantFilter(
   return {};
 }
 
+
+/**
+ * Busca documentos na coleção `documents` pelos campos `originalFilename` e `tags`.
+ *
+ * Tokeniza a query em palavras (≥ 2 chars), constrói um padrão regex e procura
+ * em `originalFilename` (nome do arquivo enviado pelo usuário) e nos elementos
+ * de `tags`. Complementa a busca por conteúdo (chunks) permitindo encontrar
+ * documentos pelo nome ou pelas tags mesmo que a query não corresponda ao texto
+ * extraído.
+ *
+ * Retorna até 10 IDs de documentos (READY, não deletados) que passem nos filtros
+ * de tenant, departamento e lista de documentos pré-filtrados.
+ */
+export async function documentMetadataSearch(
+  db: Db,
+  params: MetadataSearchParams
+): Promise<string[]> {
+  const { tenantId, tenantIds, allowedDepartmentIds, filterDocumentIds, queryText } = params;
+
+  const words = queryText
+    .trim()
+    .split(/\s+/)
+    .filter((w) => w.length >= 2)
+    .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+
+  if (words.length === 0) return [];
+
+  const pattern = words.join('|');
+
+  const filter: Record<string, unknown> = {
+    deleted: false,
+    status: 'READY',
+    $or: [
+      { originalFilename: { $regex: pattern, $options: 'i' } },
+      { tags: { $elemMatch: { $regex: pattern, $options: 'i' } } },
+    ],
+  };
+
+  Object.assign(filter, buildTenantFilter(tenantId, tenantIds));
+
+  if (allowedDepartmentIds !== null) {
+    filter['departmentId'] = { $in: allowedDepartmentIds };
+  }
+
+  if (filterDocumentIds !== undefined && filterDocumentIds.length > 0) {
+    filter['id'] = { $in: filterDocumentIds };
+  }
+
+  const docs = await db
+    .collection<{ id: string }>('documents')
+    .find(filter)
+    .project<{ id: string }>({ _id: 0, id: 1 })
+    .limit(10)
+    .toArray();
+
+  return docs.map((d) => d.id);
+}
 
 /**
  * Busca lexical em chunks usando Atlas Search ($search).

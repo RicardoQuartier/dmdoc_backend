@@ -63,7 +63,7 @@ interface DepartmentPermissionDoc {
 interface IndexFieldDoc {
   id: string;
   name: string;
-  fieldType: 'TEXT' | 'DATE' | 'NUMBER' | 'CUSTOMER' | 'PROVIDER';
+  fieldType: 'TEXT' | 'DATE' | 'NUMBER';
   required: boolean;
   aiExtractionHint: string | null;
   order: number;
@@ -281,7 +281,7 @@ async function assertCanWriteDepartment(
  * Valida os valores de `indexValues` contra os `indexFields` do tipo de documento.
  *
  * Regras por fieldType (spec §5.3 + wiki "Tipos de índice"):
- *   - TEXT / CUSTOMER / PROVIDER: string não vazia, máx 500 chars
+ *   - TEXT: string não vazia, máx 500 chars
  *   - DATE: string no formato ISO 8601 (date-only ou datetime)
  *   - NUMBER: parseável como float finito
  *
@@ -310,9 +310,7 @@ function validateIndexValues(
     }
 
     switch (field.fieldType) {
-      case 'TEXT':
-      case 'CUSTOMER':
-      case 'PROVIDER': {
+      case 'TEXT': {
         if (typeof value !== 'string' || value.trim() === '') {
           errors.push(`Campo "${field.name}" deve ser texto não vazio`);
         } else if (value.length > 500) {

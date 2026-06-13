@@ -36,7 +36,7 @@ const PatchDocumentTypeBodySchema = z.object({
 
 const CreateIndexFieldBodySchema = z.object({
   name: z.string().min(1).max(200),
-  fieldType: z.enum(['TEXT', 'DATE', 'NUMBER', 'CUSTOMER', 'PROVIDER']),
+  fieldType: z.enum(['TEXT', 'DATE', 'NUMBER']),
   required: z.boolean().default(false),
   aiExtractionHint: z.string().nullable().default(null),
   order: z.number().int().nonnegative().default(0),
@@ -45,7 +45,7 @@ const CreateIndexFieldBodySchema = z.object({
 
 const PatchIndexFieldBodySchema = z.object({
   name: z.string().min(1).max(200).optional(),
-  fieldType: z.enum(['TEXT', 'DATE', 'NUMBER', 'CUSTOMER', 'PROVIDER']).optional(),
+  fieldType: z.enum(['TEXT', 'DATE', 'NUMBER']).optional(),
   required: z.boolean().optional(),
   aiExtractionHint: z.string().nullable().optional(),
   order: z.number().int().nonnegative().optional(),

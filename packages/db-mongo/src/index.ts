@@ -22,10 +22,12 @@ export {
   lexicalSearch,
   vectorSearch,
   hybridSearch,
+  documentMetadataSearch,
   type ChunkSearchResult,
   type SearchParams,
   type LexicalSearchParams,
   type VectorSearchParams,
   type HybridSearchParams,
+  type MetadataSearchParams,
   ChunkSearchResultSchema,
 } from './search.js';

@@ -4,7 +4,8 @@ import type { FastifyPluginAsync, FastifyReply, FastifyBaseLogger } from 'fastif
 import type { Db } from 'mongodb';
 import { SearchRequestSchema } from '@dmdoc/shared-types';
 import type { SearchChunk, Citation } from '@dmdoc/shared-types';
-import { hybridSearch, lexicalSearch, vectorSearch } from '@dmdoc/db-mongo';
+import { hybridSearch, lexicalSearch, vectorSearch, documentMetadataSearch } from '@dmdoc/db-mongo';
+import type { ChunkSearchResult } from '@dmdoc/db-mongo';
 import { createLLMProvider } from '@dmdoc/llm-provider';
 import type { LLMProvider } from '@dmdoc/llm-provider';
 import type { Config } from '../config.js';
@@ -277,7 +278,19 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     }
 
     // ------------------------------------------------------------------
-    // 4. Embedding da query — apenas quando searchMode exige vetorial
+    // 4. Inicia busca por metadados em paralelo (não bloqueia o embedding)
+    //    Busca originalFilename e tags na coleção documents.
+    // ------------------------------------------------------------------
+    const metadataSearchPromise = documentMetadataSearch(db, {
+      ...(singleTenantId !== undefined ? { tenantId: singleTenantId } : {}),
+      ...(multiTenantIds !== undefined ? { tenantIds: multiTenantIds } : {}),
+      allowedDepartmentIds,
+      ...(filterDocumentIds !== null ? { filterDocumentIds } : {}),
+      queryText: query,
+    });
+
+    // ------------------------------------------------------------------
+    // 5. Embedding da query — apenas quando searchMode exige vetorial
     // ------------------------------------------------------------------
     let embeddingCostUsd = 0;
     let queryEmbedding: number[] | null = null;
@@ -289,7 +302,7 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     }
 
     // ------------------------------------------------------------------
-    // 5. Busca — modo selecionado via searchMode (spec §9 etapa 3)
+    // 6. Busca por conteúdo — modo selecionado via searchMode (spec §9 etapa 3)
     // ------------------------------------------------------------------
     const baseParams = {
       ...(singleTenantId !== undefined ? { tenantId: singleTenantId } : {}),
@@ -327,10 +340,75 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
       }
     }
 
-    log.info({ returned: searchResults.length, topK, searchMode }, 'busca concluída');
+    log.info({ returned: searchResults.length, topK, searchMode }, 'busca por conteúdo concluída');
+
+    // ------------------------------------------------------------------
+    // 7. Mescla com resultados de busca por metadados (nome + tags)
+    //    Documentos encontrados por metadado que já aparecem nos chunks
+    //    de conteúdo são ignorados (sem duplicatas).
+    // ------------------------------------------------------------------
+    const metadataDocIds = await metadataSearchPromise;
+    const contentDocIds = new Set(searchResults.map((r) => r.documentId));
+    const metadataOnlyDocIds = metadataDocIds.filter((id) => !contentDocIds.has(id)).slice(0, 5);
+
+    let metadataChunks: ChunkSearchResult[] = [];
+    if (metadataOnlyDocIds.length > 0) {
+      const chunkFilter: Record<string, unknown> = { documentId: { $in: metadataOnlyDocIds } };
+      if (multiTenantIds !== undefined) {
+        chunkFilter['tenantId'] = { $in: multiTenantIds };
+      } else if (singleTenantId !== undefined) {
+        chunkFilter['tenantId'] = singleTenantId;
+      }
+      if (allowedDepartmentIds !== null) {
+        chunkFilter['departmentId'] = { $in: allowedDepartmentIds };
+      }
+
+      interface RawChunkDoc {
+        documentId: string;
+        tenantId: string;
+        departmentId: string;
+        documentTypeName: string | null;
+        pageNumber: number | null;
+        chunkIndex: number;
+        text: string;
+        tokenCount: number;
+      }
+
+      const rawChunks = await db
+        .collection<RawChunkDoc>('chunks')
+        .find(chunkFilter)
+        .sort({ chunkIndex: 1 })
+        .project<RawChunkDoc>({
+          _id: 0,
+          documentId: 1,
+          tenantId: 1,
+          departmentId: 1,
+          documentTypeName: 1,
+          pageNumber: 1,
+          chunkIndex: 1,
+          text: 1,
+          tokenCount: 1,
+        })
+        .toArray();
+
+      const seenDocIds = new Set<string>();
+      metadataChunks = rawChunks
+        .filter((c) => {
+          if (seenDocIds.has(c.documentId)) return false;
+          seenDocIds.add(c.documentId);
+          return true;
+        })
+        .map((c) => ({ ...c, score: 0 }));
+
+      if (metadataChunks.length > 0) {
+        log.info({ metadataMatched: metadataChunks.length }, 'chunks adicionados via busca por metadados');
+      }
+    }
+
+    const allSearchResults = [...searchResults, ...metadataChunks];
 
     // Enriquece chunks com o nome original do documento (originalFilename)
-    const uniqueDocIds = [...new Set(searchResults.map((r) => r.documentId))];
+    const uniqueDocIds = [...new Set(allSearchResults.map((r) => r.documentId))];
     const docDocs = uniqueDocIds.length > 0
       ? await db.collection('documents')
           .find({ id: { $in: uniqueDocIds } })
@@ -339,7 +417,7 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
       : [];
     const docNameMap = new Map(docDocs.map((d) => [d.id, d.originalFilename]));
 
-    const chunks: SearchChunk[] = searchResults.map((r) => ({
+    const chunks: SearchChunk[] = allSearchResults.map((r) => ({
       documentId: r.documentId,
       documentName: docNameMap.get(r.documentId) ?? null,
       tenantId: r.tenantId,
@@ -351,7 +429,7 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     }));
 
     // ------------------------------------------------------------------
-    // 6. Sem geração de resposta → retorno JSON síncrono
+    // 8. Sem geração de resposta → retorno JSON síncrono
     // ------------------------------------------------------------------
     if (!generateAnswer || chunks.length === 0) {
       log.info({ generateAnswer, chunksFound: chunks.length }, 'busca sem geração de resposta');
@@ -364,7 +442,7 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     }
 
     // ------------------------------------------------------------------
-    // 7. Com geração de resposta → SSE streaming (spec §9 etapas 6-7)
+    // 9. Com geração de resposta → SSE streaming (spec §9 etapas 6-7)
     // ------------------------------------------------------------------
     return generateSSEResponse(reply, {
       query,
