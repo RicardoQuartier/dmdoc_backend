@@ -831,12 +831,20 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     // Para SUPER_ADMIN/MTA o tenantId vem do próprio documento (sempre permitido).
     await assertCanReadDepartment(db, userId, doc.tenantId, doc.departmentId, role);
 
+    // Enriquece com o número de páginas extraído (mora em document_content,
+    // não na coleção documents). Nulo enquanto a extração não rodou.
+    const content = await db
+      .collection<{ extraction?: { pageCount?: number } }>('document_content')
+      .findOne({ documentId: doc.id, tenantId: doc.tenantId }, { projection: { extraction: 1 } });
+    const pageCount =
+      typeof content?.extraction?.pageCount === 'number' ? content.extraction.pageCount : null;
+
     request.log.info(
       { tenantId: doc.tenantId, userId, documentId: doc.id },
       'detalhe de documento recuperado'
     );
 
-    return reply.status(200).send(doc);
+    return reply.status(200).send({ ...doc, pageCount });
   });
 
   // =========================================================================
