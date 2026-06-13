@@ -10,6 +10,7 @@ import { NotFoundError, QuotaExceededError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
 import { resolveTenantId, resolveTenantContext } from '../auth/resolve-tenant.js';
+import { getConfig } from '../config.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais que mapeiam as coleções do MongoDB (spec §5.3)
@@ -370,10 +371,10 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
    *   - indexValues    (field — JSON string opcional, mapa campo→valor)
    */
   app.post('/documents', { preHandler: app.authenticate }, async (request, reply) => {
-    // Apenas roles com permissão de escrita podem fazer upload
-    requireRole(request, 'TENANT_ADMIN', 'UPLOADER');
+    // TENANT_ADMIN e UPLOADER operam no tenant do JWT.
+    // MULTI_TENANT_ADMIN envia tenantId explícito no form — validado abaixo.
+    requireRole(request, 'TENANT_ADMIN', 'UPLOADER', 'MULTI_TENANT_ADMIN');
 
-    const tenantId = request.tenantId as string;
     const userId = request.user!.sub;
     const db = app.db;
 
@@ -398,6 +399,25 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       } else {
         textFields[part.fieldname] = part.value as string;
       }
+    }
+
+    // ------------------------------------------------------------------
+    // Resolução de tenantId após leitura do form (multipart não permite
+    // ler fields antes do loop). MTA envia tenantId explícito no form;
+    // demais roles usam o tenantId do JWT.
+    // ------------------------------------------------------------------
+    let tenantId: string;
+    if (request.user!.role === 'MULTI_TENANT_ADMIN') {
+      const explicitTenantId = textFields['tenantId'];
+      if (!explicitTenantId) {
+        throw new NotFoundError('MULTI_TENANT_ADMIN deve informar tenantId no upload');
+      }
+      if (!(request.user!.allowedTenantIds ?? []).includes(explicitTenantId)) {
+        throw new NotFoundError('Empresa não encontrada');
+      }
+      tenantId = explicitTenantId;
+    } else {
+      tenantId = request.tenantId as string;
     }
 
     if (!fileData || !fileBuffer) {
@@ -922,6 +942,143 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     );
 
     return reply.status(200).send({ url, expiresAt });
+  });
+
+  // =========================================================================
+  // GET /documents/:id/preview — converte Office→PDF via extractor e devolve PDF
+  // =========================================================================
+  /**
+   * GET /documents/:id/preview
+   *
+   * Baixa o arquivo original do S3, envia ao microserviço extractor para
+   * conversão Office→PDF (LibreOffice headless) e devolve o PDF inline.
+   * Usado pelo frontend para PPTX/PPT — o <iframe> carrega o blob URL.
+   *
+   * Suporta: pptx, ppt, docx, doc, xlsx, xls, odp, odt.
+   * Outros mime types retornam 422.
+   */
+  app.get('/documents/:id/preview', { preHandler: app.authenticate }, async (request, reply) => {
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const db = app.db;
+
+    const { id } = request.params as { id: string };
+
+    // ------------------------------------------------------------------
+    // 1. Buscar documento (mesmo padrão do /download)
+    // ------------------------------------------------------------------
+    let doc: DocumentDoc | null;
+
+    if (role === 'SUPER_ADMIN') {
+      doc = await findDocumentGlobally(db, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      doc = await repo.findById(id);
+    }
+
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    // ------------------------------------------------------------------
+    // 2. Verificar permissão de leitura no departamento
+    // ------------------------------------------------------------------
+    await assertCanReadDepartment(db, userId, doc.tenantId, doc.departmentId, role);
+
+    // ------------------------------------------------------------------
+    // 3. Validar mime type — apenas formatos que o extractor converte
+    // ------------------------------------------------------------------
+    const CONVERTIBLE_MIMES = new Set([
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'application/vnd.ms-powerpoint',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.ms-excel',
+      'application/vnd.oasis.opendocument.presentation',
+      'application/vnd.oasis.opendocument.text',
+    ]);
+
+    if (!CONVERTIBLE_MIMES.has(doc.mimeType)) {
+      return reply.status(422).send({ error: `mime type não suportado para preview: ${doc.mimeType}` });
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Baixar arquivo do S3 como buffer
+    // ------------------------------------------------------------------
+    const fileBuffer = await app.s3.downloadFile(doc.s3Key);
+
+    // ------------------------------------------------------------------
+    // 5. Enviar ao extractor para conversão Office→PDF
+    // ------------------------------------------------------------------
+    const { EXTRACTOR_URL } = getConfig();
+    const extractorBaseUrl = EXTRACTOR_URL.replace(/\/extract$/, '');
+    const formData = new FormData();
+    formData.append('file', new Blob([fileBuffer], { type: doc.mimeType }), doc.originalFilename);
+    formData.append('content_type', doc.mimeType);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 70_000);
+
+    let pdfBuffer: Buffer;
+    try {
+      const extractorResponse = await fetch(`${extractorBaseUrl}/convert/pdf`, {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal,
+      });
+
+      if (!extractorResponse.ok) {
+        const errText = await extractorResponse.text().catch(() => '');
+        request.log.error(
+          { tenantId: doc.tenantId, userId, documentId: doc.id, status: extractorResponse.status, body: errText },
+          'extractor retornou erro na conversão'
+        );
+        return reply.status(502).send({ error: 'falha na conversão do documento' });
+      }
+
+      pdfBuffer = Buffer.from(await extractorResponse.arrayBuffer());
+    } catch (err: unknown) {
+      if ((err as Error)?.name === 'AbortError') {
+        return reply.status(504).send({ error: 'timeout na conversão do documento' });
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    // ------------------------------------------------------------------
+    // 6. AuditLog de preview
+    // ------------------------------------------------------------------
+    const auditLogger = new AuditLogger(db);
+    try {
+      await auditLogger.record({
+        tenantId: doc.tenantId,
+        userId,
+        action: 'document.preview',
+        resource: `documents/${doc.id}`,
+        metadata: { filename: doc.originalFilename, mimeType: doc.mimeType },
+      });
+    } catch (auditError) {
+      request.log.error(
+        { err: auditError, tenantId: doc.tenantId, userId, documentId: doc.id },
+        'falha ao registrar audit log de preview'
+      );
+    }
+
+    request.log.info(
+      { tenantId: doc.tenantId, userId, documentId: doc.id, mimeType: doc.mimeType },
+      'preview PDF gerado via extractor'
+    );
+
+    return reply
+      .status(200)
+      .header('Content-Type', 'application/pdf')
+      .header('Content-Disposition', `inline; filename="${doc.id}.pdf"`)
+      .send(pdfBuffer);
   });
 
   // =========================================================================

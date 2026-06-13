@@ -20,6 +20,8 @@ coerente — resolve scans girados (RG digitalizado de lado).
 
 import io
 import os
+import subprocess
+import tempfile
 import zipfile
 
 import cv2
@@ -27,11 +29,24 @@ import easyocr
 import fitz  # PyMuPDF
 import numpy as np
 from docx import Document as DocxDocument
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
 from openpyxl import load_workbook
 from pptx import Presentation
 
 LANGS = os.environ.get("OCR_LANGS", "pt").split(",")
+
+# Mapeamento content-type → extensão de arquivo para conversão Office→PDF.
+OFFICE_EXTENSIONS: dict[str, str] = {
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.oasis.opendocument.presentation": ".odp",
+    "application/vnd.oasis.opendocument.text": ".odt",
+}
 
 # Resolução máxima enviada ao OCR (maior lado, px).
 MAX_DIM = 2048
@@ -254,3 +269,69 @@ async def extract(
 
     out["engine"] = "python"
     return out
+
+
+@app.post("/convert/pdf")
+async def convert_to_pdf(
+    file: UploadFile = File(...),
+    content_type: str = Form(default=""),
+) -> Response:
+    """Converte um documento Office (PPTX, PPT, DOCX, DOC, XLSX, XLS, ODP, ODT) para PDF
+    usando LibreOffice em modo headless.
+
+    Consumido pela rota GET /documents/:id/preview da Fastify API.
+    """
+    data = await file.read()
+    mime = content_type or file.content_type or ""
+    name = (file.filename or "").lower()
+
+    # Determina extensão para nomear o arquivo de entrada corretamente.
+    ext = OFFICE_EXTENSIONS.get(mime, "")
+    if not ext:
+        for suffix in OFFICE_EXTENSIONS.values():
+            if name.endswith(suffix):
+                ext = suffix
+                break
+    if not ext:
+        raise HTTPException(
+            status_code=422,
+            detail=f"formato não suportado para conversão: {mime or name}",
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{ext}")
+        with open(input_path, "wb") as f:
+            f.write(data)
+
+        try:
+            result = subprocess.run(
+                [
+                    "libreoffice",
+                    "--headless",
+                    "--norestore",
+                    "--convert-to", "pdf",
+                    "--outdir", tmpdir,
+                    input_path,
+                ],
+                capture_output=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=504, detail="timeout na conversão")
+
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"libreoffice falhou: {result.stderr.decode()[:500]}",
+            )
+
+        pdf_name = os.path.basename(input_path).rsplit(".", 1)[0] + ".pdf"
+        pdf_path = os.path.join(tmpdir, pdf_name)
+
+        if not os.path.exists(pdf_path):
+            raise HTTPException(status_code=500, detail="PDF não gerado pelo LibreOffice")
+
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+    return Response(content=pdf_bytes, media_type="application/pdf")

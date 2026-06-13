@@ -3,10 +3,13 @@
 # para a primeira requisição não pagar o download.
 FROM python:3.10-slim
 
-# Dependências nativas do OpenCV/PyMuPDF (libGL, glib).
+# Dependências nativas do OpenCV/PyMuPDF (libGL, glib) + LibreOffice para conversão Office→PDF.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
+    libreoffice-impress \
+    libreoffice-writer \
+    libreoffice-calc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

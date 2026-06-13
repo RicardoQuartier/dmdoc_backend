@@ -111,6 +111,20 @@ export class S3Service {
   }
 
   /**
+   * Baixa um objeto do S3 como Buffer (uso interno — ex.: conversão de preview).
+   */
+  async downloadFile(key: string): Promise<Buffer> {
+    const command = new GetObjectCommand({ Bucket: this.bucket, Key: key });
+    const response = await this.client.send(command);
+    if (!response.Body) throw new Error(`objeto S3 não encontrado: ${key}`);
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+  }
+
+  /**
    * Remove um objeto do S3.
    * Usado em rollback: se o insert no Mongo falhar após o upload, o arquivo
    * é removido do bucket para evitar objetos órfãos.
