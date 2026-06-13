@@ -61,4 +61,7 @@ export const REGULAR_INDEXES: Readonly<Record<string, readonly RegularIndex[]>> 
     { keys: { tenantId: 1, departmentId: 1 }, options: { name: 'by_tenant_department' } },
   ],
   audit_logs: [{ keys: { tenantId: 1, createdAt: -1 }, options: { name: 'by_tenant_created_at' } }],
+  department_templates: [
+    { keys: { name: 1 }, options: { name: 'uniq_name', unique: true } },
+  ],
 } as const;

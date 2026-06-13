@@ -1,0 +1,126 @@
+# department-templates.http
+# Testes manuais do CRUD de templates de departamentos (SUPER_ADMIN)
+# Requer um token de acesso SUPER_ADMIN em @token.
+#
+# Uso com VS Code REST Client ou JetBrains HTTP Client.
+
+@baseUrl = http://localhost:3000
+@token = <COLOQUE_SEU_TOKEN_SUPER_ADMIN_AQUI>
+
+### 1. Login (obter token SUPER_ADMIN)
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+  "email": "super@dmdoc.io",
+  "password": "senha_do_super_admin"
+}
+
+### 2. Criar template simples (2 nós)
+POST {{baseUrl}}/admin/department-templates
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "name": "Estrutura Padrão RH",
+  "description": "Template de departamentos para empresas com RH estruturado",
+  "nodes": [
+    {
+      "refId": "00000000-0000-0000-0000-000000000001",
+      "parentRefId": null,
+      "name": "Recursos Humanos",
+      "tags": ["rh"]
+    },
+    {
+      "refId": "00000000-0000-0000-0000-000000000002",
+      "parentRefId": "00000000-0000-0000-0000-000000000001",
+      "name": "Folha de Pagamento",
+      "tags": ["folha", "financeiro"]
+    }
+  ]
+}
+
+### 3. Listar templates (primeira página)
+GET {{baseUrl}}/admin/department-templates
+Authorization: Bearer {{token}}
+
+### 4. Listar templates com paginação
+GET {{baseUrl}}/admin/department-templates?limit=5&cursor=<nextCursor>
+Authorization: Bearer {{token}}
+
+### 5. Detalhe de um template
+GET {{baseUrl}}/admin/department-templates/<id-do-template>
+Authorization: Bearer {{token}}
+
+### 6. Atualizar nome e descrição
+PATCH {{baseUrl}}/admin/department-templates/<id-do-template>
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "name": "Estrutura Padrão RH v2",
+  "description": "Versão atualizada do template de RH"
+}
+
+### 7. Atualizar nodes (valida parentRefIds)
+PATCH {{baseUrl}}/admin/department-templates/<id-do-template>
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "nodes": [
+    {
+      "refId": "00000000-0000-0000-0000-000000000001",
+      "parentRefId": null,
+      "name": "Recursos Humanos",
+      "tags": ["rh"]
+    },
+    {
+      "refId": "00000000-0000-0000-0000-000000000002",
+      "parentRefId": "00000000-0000-0000-0000-000000000001",
+      "name": "Recrutamento",
+      "tags": []
+    },
+    {
+      "refId": "00000000-0000-0000-0000-000000000003",
+      "parentRefId": "00000000-0000-0000-0000-000000000001",
+      "name": "Treinamento",
+      "tags": []
+    }
+  ]
+}
+
+### 8. Erro esperado: parentRefId aponta para refId inexistente (deve retornar 422)
+POST {{baseUrl}}/admin/department-templates
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "name": "Template Inválido",
+  "nodes": [
+    {
+      "refId": "00000000-0000-0000-0000-000000000010",
+      "parentRefId": "00000000-0000-0000-0000-000000000099",
+      "name": "Departamento Órfão",
+      "tags": []
+    }
+  ]
+}
+
+### 9. Erro esperado: nome duplicado (deve retornar 409)
+POST {{baseUrl}}/admin/department-templates
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "name": "Estrutura Padrão RH v2",
+  "nodes": []
+}
+
+### 10. Excluir template (hard delete)
+DELETE {{baseUrl}}/admin/department-templates/<id-do-template>
+Authorization: Bearer {{token}}
+
+### 11. Erro esperado: template inexistente (deve retornar 404)
+GET {{baseUrl}}/admin/department-templates/00000000-0000-0000-0000-000000000000
+Authorization: Bearer {{token}}

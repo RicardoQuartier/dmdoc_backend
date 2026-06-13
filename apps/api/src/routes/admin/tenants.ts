@@ -4,11 +4,14 @@ import { MongoServerError } from 'mongodb';
 import { newId } from '@dmdoc/db-mongo';
 import { ConflictError, NotFoundError } from '../../errors/index.js';
 import { requireRole } from '../../auth/role-guard.js';
+import { applyTemplateToTenant } from '../../lib/apply-template-to-tenant.js';
 
 const CreateTenantBodySchema = z.object({
   name: z.string().min(1).max(200),
   diskQuotaBytes: z.number().int().nonnegative().default(10 * 1024 ** 3),
   userQuota: z.number().int().nonnegative().default(20),
+  /** UUID de um template de departamentos a aplicar ao novo tenant (opcional). */
+  templateId: z.string().uuid().optional(),
 });
 
 const PatchTenantBodySchema = z.object({
@@ -32,11 +35,16 @@ const ListTenantsQuerySchema = z.object({
 export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
   /**
    * POST /admin/tenants — cria nova empresa.
+   *
+   * `templateId` opcional: quando informado, os nós do template são inseridos
+   * como departamentos reais do novo tenant dentro da mesma transação MongoDB.
+   * Se o templateId não existir, a transação inteira é revertida (nenhum tenant
+   * nem departamento é persistido).
    */
   app.post('/admin/tenants', { preHandler: app.authenticate }, async (request, reply) => {
     requireRole(request, 'SUPER_ADMIN');
 
-    const { name, diskQuotaBytes, userQuota } = CreateTenantBodySchema.parse(request.body);
+    const { name, diskQuotaBytes, userQuota, templateId } = CreateTenantBodySchema.parse(request.body);
     const db = app.db;
 
     const doc = {
@@ -48,16 +56,42 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       createdAt: new Date(),
     };
 
+    // Obtém o MongoClient a partir do Db (driver Node.js expõe via db.client).
+    // Necessário para criar a session e usar transações multi-operação.
+    const mongoClient = db.client;
+    const session = mongoClient.startSession();
+
     try {
-      await db.collection('tenants').insertOne(doc);
-    } catch (err) {
-      if (err instanceof MongoServerError && err.code === 11000) {
-        throw new ConflictError('Nome de empresa já em uso');
-      }
-      throw err;
+      await session.withTransaction(async () => {
+        try {
+          await db.collection('tenants').insertOne(doc, { session });
+        } catch (err) {
+          if (err instanceof MongoServerError && err.code === 11000) {
+            throw new ConflictError('Nome de empresa já em uso');
+          }
+          throw err;
+        }
+
+        if (templateId !== undefined) {
+          await applyTemplateToTenant(
+            db,
+            doc.id,
+            templateId,
+            session,
+            request.log,
+          );
+        }
+      });
+    } finally {
+      await session.endSession();
     }
 
-    request.log.info({ tenantId: doc.id }, 'tenant criado');
+    if (templateId !== undefined) {
+      request.log.info({ tenantId: doc.id, templateId }, 'tenant criado com template');
+    } else {
+      request.log.info({ tenantId: doc.id }, 'tenant criado');
+    }
+
     return reply.status(201).send(doc);
   });
 

@@ -1,4 +1,4 @@
-import { MongoMemoryServer } from 'mongodb-memory-server';
+import { MongoMemoryServer, MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { Db } from 'mongodb';
 import { MongoDbClient } from '@dmdoc/db-mongo';
 import { loadConfig, type Config } from '../config.js';
@@ -60,6 +60,36 @@ export async function startTestDb(): Promise<TestDb> {
     stop: async () => {
       await client.close();
       await mongo.stop();
+    },
+  };
+}
+
+export interface TestReplSetDb {
+  replSet: MongoMemoryReplSet;
+  client: MongoDbClient;
+  db: Db;
+  stop: () => Promise<void>;
+}
+
+/**
+ * Sobe um MongoDB em memória como replica set de 1 nó.
+ *
+ * Necessário para testes que usam transações MongoDB (session.withTransaction),
+ * pois transações só funcionam com replica sets (não standalone).
+ *
+ * Use `startTestDb` para testes que não precisam de transações — é mais rápido.
+ */
+export async function startTestReplSetDb(): Promise<TestReplSetDb> {
+  const replSet = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+  const uri = replSet.getUri();
+  const client = await MongoDbClient.connect(uri, 'dmdoc_test');
+  return {
+    replSet,
+    client,
+    db: client.getDb(),
+    stop: async () => {
+      await client.close();
+      await replSet.stop();
     },
   };
 }

@@ -51,6 +51,18 @@ export {
   type DocumentProcessingJobData,
 } from './job.js';
 export {
+  TemplateNodeSchema,
+  type TemplateNode,
+  DepartmentTemplateSchema,
+  type DepartmentTemplate,
+  CreateDepartmentTemplateBodySchema,
+  type CreateDepartmentTemplateBody,
+  UpdateDepartmentTemplateBodySchema,
+  type UpdateDepartmentTemplateBody,
+  ListDepartmentTemplatesQuerySchema,
+  type ListDepartmentTemplatesQuery,
+} from './department-template.js';
+export {
   SearchRequestSchema,
   type SearchRequest,
   SearchResponseSchema,
