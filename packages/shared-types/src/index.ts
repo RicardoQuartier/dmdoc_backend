@@ -1,4 +1,12 @@
-export { RoleSchema, type Role, ADMIN_ROLES, type AdminRole } from './role.js';
+export {
+  RoleSchema,
+  type Role,
+  ADMIN_ROLES,
+  type AdminRole,
+  ROLE_LEVEL,
+  isGlobalRole,
+  canManageRole,
+} from './role.js';
 export {
   AuthUserSchema,
   type AuthUser,

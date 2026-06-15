@@ -2,12 +2,12 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { MongoServerError } from 'mongodb';
 import type { Db } from 'mongodb';
-import { TenantRepository } from '@dmdoc/db-mongo';
-import type { User } from '@dmdoc/shared-types';
-import { ADMIN_ROLES } from '@dmdoc/shared-types';
+import { TenantRepository, assertUserScopeInvariant, validateUserDocument } from '@dmdoc/db-mongo';
+import type { User, Role } from '@dmdoc/shared-types';
+import { ADMIN_ROLES, isGlobalRole } from '@dmdoc/shared-types';
 import type { TenantDocument } from '@dmdoc/db-mongo';
-import { ConflictError, NotFoundError } from '../errors/index.js';
-import { requireRole } from '../auth/role-guard.js';
+import { ConflictError, ForbiddenError, NotFoundError } from '../errors/index.js';
+import { requireRole, requireCanManageRole } from '../auth/role-guard.js';
 import { hashPassword } from '../auth/password.js';
 import { resolveTenantContext, resolveTenantId } from '../auth/resolve-tenant.js';
 
@@ -28,7 +28,10 @@ interface UserDoc extends TenantDocument {
 const CreateUserBodySchema = z.object({
   email: z.string().email(),
   name: z.string().min(1).max(200),
-  role: z.enum(['MULTI_TENANT_ADMIN', 'TENANT_ADMIN', 'UPLOADER', 'USER']),
+  // SUPER_ADMIN está no enum mas é protegido pela regra de nível
+  // (`requireCanManageRole`): só um SUPER_ADMIN — único level 100 — consegue
+  // criar outro SUPER_ADMIN. SUPER_ADMIN criado é sempre global (tenantId null).
+  role: z.enum(['SUPER_ADMIN', 'MULTI_TENANT_ADMIN', 'TENANT_ADMIN', 'UPLOADER', 'USER']),
   password: z.string().min(8),
   active: z.boolean().default(true),
   tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas; null para MTA
@@ -44,7 +47,10 @@ const CreateUserBodySchema = z.object({
 
 const PatchUserBodySchema = z.object({
   name: z.string().min(1).max(200).optional(),
-  role: z.enum(['MULTI_TENANT_ADMIN', 'TENANT_ADMIN', 'UPLOADER', 'USER']).optional(),
+  // SUPER_ADMIN no enum, protegido pela regra de nível no handler.
+  role: z
+    .enum(['SUPER_ADMIN', 'MULTI_TENANT_ADMIN', 'TENANT_ADMIN', 'UPLOADER', 'USER'])
+    .optional(),
   active: z.boolean().optional(),
   /**
    * Usado quando `role` é alterado para MULTI_TENANT_ADMIN.
@@ -86,36 +92,68 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
    * pertence a nenhuma empresa e não consome cota de tenant).
    */
   app.post('/users', { preHandler: app.authenticate }, async (request, reply) => {
+    // Gate base: apenas papéis administrativos (SUPER_ADMIN, MTA, TENANT_ADMIN).
     requireRole(request, ...ADMIN_ROLES);
 
     const body = CreateUserBodySchema.parse(request.body);
     const db = app.db;
 
-    // MULTI_TENANT_ADMIN: tenantId null, sem validação de cota de tenant.
-    // Apenas SUPER_ADMIN pode criar MTA (TENANT_ADMIN não tem permissão para
-    // criar papéis sem empresa).
-    if (body.role === 'MULTI_TENANT_ADMIN') {
-      if (request.user?.role !== 'SUPER_ADMIN') {
-        throw new ConflictError('Apenas SUPER_ADMIN pode criar usuários MULTI_TENANT_ADMIN');
+    // Hierarquia: o solicitante só cria papéis no mesmo nível ou abaixo
+    // (regra "inferior ou igual"). Isto barra, por ex., TENANT_ADMIN criando
+    // SUPER_ADMIN/MTA, e é o que torna SUPER_ADMIN criável só por SUPER_ADMIN.
+    requireCanManageRole(request, body.role);
+
+    // Escalonamento de privilégio: o gate de hierarquia acima é por NÍVEL, então
+    // um MULTI_TENANT_ADMIN (80 >= 80) passaria em `canManageRole` e conseguiria
+    // criar OUTRO MTA — atribuindo `allowedTenantIds` arbitrário e ganhando
+    // alcance a tenants fora do seu escopo. Regra de produto: apenas o
+    // SUPER_ADMIN cria/atribui papéis GLOBAIS (SUPER_ADMIN, MULTI_TENANT_ADMIN)
+    // e gerencia `allowedTenantIds`. Falha fechado em 403.
+    if (isGlobalRole(body.role) && request.user?.role !== 'SUPER_ADMIN') {
+      throw new ForbiddenError(
+        'Apenas SUPER_ADMIN pode criar papéis globais (SUPER_ADMIN, MULTI_TENANT_ADMIN)',
+      );
+    }
+
+    const passwordHash = await hashPassword(body.password);
+    const newId = crypto.randomUUID();
+    const createdAt = new Date();
+
+    // ----------------------------------------------------------------------
+    // Papéis GLOBAIS (SUPER_ADMIN, MULTI_TENANT_ADMIN): tenantId DEVE ser null.
+    // Não consomem cota de empresa. Não aceitam tenantId explícito (invariante
+    // de escopo — regra 5). allowedTenantIds só é relevante para MTA.
+    // ----------------------------------------------------------------------
+    if (isGlobalRole(body.role)) {
+      const { tenantId: tenantIdQuery } = TenantIdQuerySchema.parse(request.query);
+      if (tenantIdQuery !== undefined || body.tenantId !== undefined) {
+        throw new ForbiddenError(
+          `Papel global ${body.role} não pode ser associado a um tenantId`,
+        );
       }
 
-      const passwordHash = await hashPassword(body.password);
-      const newId = crypto.randomUUID();
-      const mtaDoc = {
+      const allowedTenantIds =
+        body.role === 'MULTI_TENANT_ADMIN' ? (body.allowedTenantIds ?? []) : [];
+
+      const globalDoc = {
         id: newId,
-        tenantId: null,
+        tenantId: null as string | null,
         email: body.email,
         name: body.name,
-        role: 'MULTI_TENANT_ADMIN' as const,
+        role: body.role,
         active: body.active,
         passwordHash,
-        createdAt: new Date(),
+        createdAt,
         deleted: false,
-        allowedTenantIds: body.allowedTenantIds ?? [],
+        ...(body.role === 'MULTI_TENANT_ADMIN' ? { allowedTenantIds } : {}),
       };
 
+      // Defesa em profundidade: invariante de escopo + schema canônico.
+      assertUserScopeInvariant({ role: globalDoc.role, tenantId: globalDoc.tenantId });
+      validateUserDocument(globalDoc);
+
       try {
-        await db.collection('users').insertOne(mtaDoc);
+        await db.collection('users').insertOne(globalDoc);
       } catch (err) {
         if (err instanceof MongoServerError && err.code === 11000) {
           throw new ConflictError('E-mail já em uso');
@@ -123,15 +161,18 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
         throw err;
       }
 
-      const { passwordHash: _, deleted: _d, _id: _mid, ...safeMta } = mtaDoc as typeof mtaDoc & { _id?: unknown };
-      request.log.info({ userId: newId, role: 'MULTI_TENANT_ADMIN' }, 'MULTI_TENANT_ADMIN criado');
-      return reply.status(201).send(safeMta);
+      const { passwordHash: _ph, deleted: _d, _id: _mid, ...safeGlobal } =
+        globalDoc as typeof globalDoc & { _id?: unknown };
+      request.log.info({ userId: newId, role: body.role }, 'usuário global criado');
+      return reply.status(201).send(safeGlobal);
     }
 
-    // Demais roles: resolveTenantId normal (obrigatório para SA, implícito para
-    // TENANT_ADMIN). Para SUPER_ADMIN e MULTI_TENANT_ADMIN o tenant alvo pode vir
-    // via ?tenantId (query) ou no corpo; query tem precedência. resolveTenantId já
-    // valida que MTA só opera em tenants ∈ allowedTenantIds (senão NotFoundError).
+    // ----------------------------------------------------------------------
+    // Papéis LOCAIS (TENANT_ADMIN, UPLOADER, USER): tenantId obrigatório.
+    // TENANT_ADMIN: tenantId vem do token (explicit ignorado). SUPER_ADMIN/MTA
+    // criando local: tenantId explícito obrigatório, validado contra escopo
+    // (MTA: ∈ allowedTenantIds, senão NotFoundError). resolveTenantId cuida disso.
+    // ----------------------------------------------------------------------
     const { tenantId: tenantIdQuery } = TenantIdQuerySchema.parse(request.query);
     const explicitTenantId = tenantIdQuery ?? body.tenantId;
     const effectiveTenantId = resolveTenantId(request, explicitTenantId, true);
@@ -149,20 +190,32 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
       throw new ConflictError('Cota de usuários atingida');
     }
 
-    const passwordHash = await hashPassword(body.password);
+    const localRole = body.role as Exclude<Role, 'SUPER_ADMIN' | 'MULTI_TENANT_ADMIN'>;
 
-    // Excluir tenantId e allowedTenantIds do body antes de inserir
-    const { tenantId: _ignored, allowedTenantIds: _allowedIgnored, ...insertData } = body;
+    // Defesa em profundidade: monta o documento final e valida escopo + schema
+    // ANTES da inserção. O TenantRepository injeta o tenantId; validamos com ele.
+    assertUserScopeInvariant({ role: localRole, tenantId });
+    validateUserDocument({
+      id: newId,
+      tenantId,
+      email: body.email,
+      passwordHash,
+      name: body.name,
+      role: localRole,
+      active: body.active,
+      createdAt,
+    });
 
     let user: UserDoc;
     try {
       user = await usersRepo.insertOne({
-        email: insertData.email,
-        name: insertData.name,
-        role: insertData.role as Exclude<typeof insertData.role, 'MULTI_TENANT_ADMIN'>,
-        active: insertData.active,
+        id: newId,
+        email: body.email,
+        name: body.name,
+        role: localRole,
+        active: body.active,
         passwordHash,
-        createdAt: new Date(),
+        createdAt,
       });
     } catch (err) {
       if (err instanceof MongoServerError && err.code === 11000) {
@@ -276,41 +329,69 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
     if (isSuperAdmin) {
       if (!existingDoc) throw new NotFoundError();
 
-      // Cast explícito para o union completo de roles, evitando narrowing indevido
-      // pelo TypeScript quando o valor vem de um documento Mongo tipado.
-      const currentRole = existingDoc.role as
-        | 'SUPER_ADMIN'
-        | 'MULTI_TENANT_ADMIN'
-        | 'TENANT_ADMIN'
-        | 'UPLOADER'
-        | 'USER';
+      const currentRole = existingDoc.role as Role;
       const newRole = updates.role;
+
+      // Hierarquia (regra 3): para modificar um usuário existente exigir AMBOS
+      // os níveis cobertos — role ATUAL e novo role. SUPER_ADMIN cobre tudo,
+      // mas a checagem é mantida por simetria e para falhar fechado.
+      requireCanManageRole(request, currentRole);
+      if (newRole !== undefined) requireCanManageRole(request, newRole);
 
       const setFields: Record<string, unknown> = {};
 
       if (updates.name !== undefined) setFields['name'] = updates.name;
       if (updates.active !== undefined) setFields['active'] = updates.active;
 
+      // tenantId final do documento após o update (para validar escopo).
+      let finalTenantId: string | null = existingDoc.tenantId;
+      const finalRole: Role = newRole ?? currentRole;
+
       if (newRole !== undefined) {
         setFields['role'] = newRole;
 
-        if (newRole === 'MULTI_TENANT_ADMIN') {
-          // Promoção para MTA: aplica allowedTenantIds se fornecido
-          setFields['allowedTenantIds'] = updates.allowedTenantIds ?? existingDoc.allowedTenantIds ?? [];
-          // Zera tenantId (MTA não pertence a empresa fixa)
+        if (isGlobalRole(newRole)) {
+          // Promoção/transição para papel GLOBAL: tenantId DEVE ser null.
           setFields['tenantId'] = null;
-        } else if (currentRole === 'MULTI_TENANT_ADMIN') {
-          // Rebaixamento de MTA (newRole já é outro role neste else): zera lista de tenants
-          setFields['allowedTenantIds'] = [];
+          finalTenantId = null;
+          if (newRole === 'MULTI_TENANT_ADMIN') {
+            setFields['allowedTenantIds'] =
+              updates.allowedTenantIds ?? existingDoc.allowedTenantIds ?? [];
+          } else {
+            // SUPER_ADMIN não tem allowedTenantIds.
+            setFields['allowedTenantIds'] = [];
+          }
+        } else {
+          // Transição para papel LOCAL: tenantId obrigatório. Se o usuário era
+          // global (tenantId null), SUPER_ADMIN deve informar ?tenantId destino.
+          if (existingDoc.tenantId === null) {
+            const { tenantId: targetTenantId } = TenantIdQuerySchema.parse(request.query);
+            if (targetTenantId === undefined) {
+              throw new ConflictError(
+                'Rebaixar papel global para local exige ?tenantId de destino',
+              );
+            }
+            const tenant = await db.collection('tenants').findOne({ id: targetTenantId });
+            if (!tenant) throw new NotFoundError('Empresa não encontrada');
+            setFields['tenantId'] = targetTenantId;
+            finalTenantId = targetTenantId;
+          }
+          if (currentRole === 'MULTI_TENANT_ADMIN') {
+            // Rebaixamento de MTA: zera lista de tenants.
+            setFields['allowedTenantIds'] = [];
+          }
         }
       } else if (updates.allowedTenantIds !== undefined && currentRole === 'MULTI_TENANT_ADMIN') {
-        // Atualiza allowedTenantIds sem mudar role (só faz sentido para MTA)
+        // Atualiza allowedTenantIds sem mudar role (só faz sentido para MTA).
         setFields['allowedTenantIds'] = updates.allowedTenantIds;
       }
 
       if (Object.keys(setFields).length === 0) {
         return reply.status(200).send(safeUser(existingDoc));
       }
+
+      // Defesa em profundidade: invariante de escopo do par (role, tenantId) final.
+      assertUserScopeInvariant({ role: finalRole, tenantId: finalTenantId });
 
       const updated = (await db
         .collection('users')
@@ -329,17 +410,38 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
     const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
     const tenantId = effectiveTenantId as string;
 
-    // TENANT_ADMIN e MTA não podem promover ninguém a MULTI_TENANT_ADMIN
-    // (papel sem empresa, criado/gerido apenas por SUPER_ADMIN).
-    if (updates.role === 'MULTI_TENANT_ADMIN') {
-      throw new ConflictError('Apenas SUPER_ADMIN pode atribuir o papel MULTI_TENANT_ADMIN');
-    }
-
     const usersRepo = new TenantRepository<UserDoc>(db.collection('users'), { tenantId });
+
+    // Busca o alvo DENTRO do escopo de tenant: cross-tenant ou inexistente → 404
+    // (nunca vaza existência). É também a fonte do role ATUAL para a hierarquia.
+    const target = await usersRepo.findById(id);
+    if (!target) throw new NotFoundError();
+
+    const currentRole = target.role as Role;
+    const newRole = updates.role;
+
+    // Hierarquia (regra 3): exigir nível >= role ATUAL E >= novo role. Isto
+    // impede TENANT_ADMIN de editar/rebaixar um superior e bloqueia promoção
+    // acima do próprio nível (ex.: TENANT_ADMIN → MTA/SUPER_ADMIN dá 403).
+    requireCanManageRole(request, currentRole);
+    if (newRole !== undefined) {
+      requireCanManageRole(request, newRole);
+      // Num escopo de tenant não pode existir usuário com papel global: barrar
+      // qualquer transição para papel global por esta rota (escopo local).
+      if (isGlobalRole(newRole)) {
+        throw new ForbiddenError(
+          'Não é possível atribuir papel global a um usuário escopado a uma empresa por esta rota',
+        );
+      }
+    }
 
     // allowedTenantIds é gerenciado somente via endpoints /admin/multi-tenant-admins
     // para roles não-SUPER_ADMIN; removemos do objeto de update.
     const { allowedTenantIds: _ignored, ...safeUpdates } = updates;
+
+    // Defesa em profundidade: escopo do par (role final, tenant) antes de gravar.
+    assertUserScopeInvariant({ role: newRole ?? currentRole, tenantId });
+
     const updated = await usersRepo.updateById(
       id,
       removeUndefined(safeUpdates) as Parameters<typeof usersRepo.updateById>[1],

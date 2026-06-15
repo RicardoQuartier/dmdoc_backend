@@ -19,6 +19,12 @@ export {
   type Page,
 } from './helpers.js';
 export {
+  assertUserScopeInvariant,
+  validateUserDocument,
+  UserScopeInvariantError,
+  type UserScopeCandidate,
+} from './user-write-validation.js';
+export {
   lexicalSearch,
   vectorSearch,
   hybridSearch,
