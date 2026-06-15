@@ -20,6 +20,7 @@
     "create-atlas-indexes": "tsx src/scripts/create-atlas-indexes.ts",
     "create-indexes": "tsx src/create-indexes.ts",
     "seed": "tsx src/seed.ts",
+    "seed:department-template-ric": "tsx src/seed-department-template-ric.ts",
     "db:fresh": "tsx src/db-fresh.ts"
   },
   "dependencies": {
