@@ -1,10 +1,16 @@
 import crypto from 'node:crypto';
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyBaseLogger } from 'fastify';
 import { z } from 'zod';
 import type { MultipartFile } from '@fastify/multipart';
-import { TenantRepository, newId, normalizeLimit } from '@dmdoc/db-mongo';
+import {
+  TenantRepository,
+  DocumentEventsRepository,
+  DOCUMENT_EVENTS_COLLECTION,
+  newId,
+  normalizeLimit,
+} from '@dmdoc/db-mongo';
 import type { TenantDocument } from '@dmdoc/db-mongo';
-import type { DocumentProcessingJobData } from '@dmdoc/shared-types';
+import type { DocumentProcessingJobData, DocumentEvent, CreateDocumentEventInput } from '@dmdoc/shared-types';
 import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import { NotFoundError, QuotaExceededError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
@@ -314,6 +320,64 @@ function validateIndexValues(
   return errors;
 }
 
+/**
+ * Resolve o `name` de um tipo de documento (tenant OU global) para denormalizar
+ * no evento de upload. Retorna `null` se o tipo não for informado ou não existir
+ * (o evento congela o que era conhecido no momento — não falha por isso).
+ *
+ * Não filtra por `deleted` no caminho global por consistência com a validação
+ * de tipo do upload; um tipo soft-deletado ainda rende o nome para o relatório.
+ */
+async function resolveDocumentTypeName(
+  db: import('mongodb').Db,
+  tenantId: string,
+  documentTypeId: string | null
+): Promise<string | null> {
+  if (documentTypeId === null) {
+    return null;
+  }
+  const docType = await db
+    .collection<{ name?: string }>('document_types')
+    .findOne(
+      { id: documentTypeId, $or: [{ tenantId }, { isGlobal: true }] },
+      { projection: { name: 1 } }
+    );
+  return typeof docType?.name === 'string' ? docType.name : null;
+}
+
+/**
+ * Emite um evento de upload na coleção append-only `document_events`.
+ *
+ * Falha de emissão NUNCA derruba a operação de upload (mesmo padrão do
+ * AuditLog): em erro, loga com Pino (tenantId/documentId/userId) e segue. Mas
+ * loga como ERRO — perder um evento distorce o relatório de cobrança.
+ */
+async function emitUploadEvent(
+  db: import('mongodb').Db,
+  log: FastifyBaseLogger,
+  tenantId: string,
+  input: CreateDocumentEventInput
+): Promise<void> {
+  try {
+    const eventsRepo = new DocumentEventsRepository(
+      db.collection<DocumentEvent>(DOCUMENT_EVENTS_COLLECTION),
+      { tenantId }
+    );
+    await eventsRepo.insertOne(input);
+  } catch (eventError) {
+    log.error(
+      {
+        err: eventError,
+        tenantId,
+        documentId: input.documentId,
+        userId: input.uploadedById,
+        deduplicated: input.deduplicated,
+      },
+      'falha ao emitir evento de upload (document_events)'
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Plugin de rotas
 // ---------------------------------------------------------------------------
@@ -497,6 +561,28 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     });
 
     if (existingDoc !== null && existingDoc.status !== 'FAILED') {
+      // O reenvio deduplicado É uma operação de upload: gera um NOVO evento
+      // (deduplicated:true) apontando para o documento já existente. Dimensões
+      // congeladas do arquivo ENVIADO agora (mimeType/sizeBytes) + tipo do doc
+      // reaproveitado. pageCount nasce null (backfill é por documentId no worker).
+      // wiki "Histórico de eventos de upload e relatório de uso (cobrança)".
+      const existingTypeName = await resolveDocumentTypeName(
+        db,
+        tenantId,
+        existingDoc.documentTypeId
+      );
+      await emitUploadEvent(db, request.log, tenantId, {
+        documentId: existingDoc.id,
+        uploadedById: userId,
+        eventType: 'upload',
+        mimeType,
+        documentTypeId: existingDoc.documentTypeId,
+        documentTypeName: existingTypeName,
+        sizeBytes: fileSize,
+        pageCount: null,
+        deduplicated: true,
+      });
+
       request.log.info(
         { tenantId, userId, documentId: existingDoc.id, contentHash },
         'documento deduplicado — retornando existente'
@@ -629,6 +715,32 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
         'falha ao registrar audit log de upload'
       );
     }
+
+    // ------------------------------------------------------------------
+    // 11. Evento de upload (document_events — append-only, cobrança)
+    //     Cobre o fluxo de upload NORMAL e também o caso FAILED: quando o
+    //     documento existente estava FAILED, o `if` de dedup acima não
+    //     retornou, então criamos um doc novo e este caminho emite o evento
+    //     com deduplicated:false e o novo documentId.
+    //     QUOTA_EXCEEDED nunca chega aqui (lança antes, no passo 4).
+    //     wiki "Histórico de eventos de upload e relatório de uso (cobrança)".
+    // ------------------------------------------------------------------
+    const documentTypeName = await resolveDocumentTypeName(
+      db,
+      tenantId,
+      documentTypeId ?? null
+    );
+    await emitUploadEvent(db, request.log, tenantId, {
+      documentId: document.id,
+      uploadedById: userId,
+      eventType: 'upload',
+      mimeType,
+      documentTypeId: documentTypeId ?? null,
+      documentTypeName,
+      sizeBytes: fileSize,
+      pageCount: null,
+      deduplicated: false,
+    });
 
     request.log.info(
       { tenantId, userId, documentId: document.id, sizeBytes: fileSize, contentHash },

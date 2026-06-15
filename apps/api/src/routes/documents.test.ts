@@ -72,6 +72,7 @@ beforeEach(async () => {
   await testDb.db.collection('department_permissions').deleteMany({});
   await testDb.db.collection('documents').deleteMany({});
   await testDb.db.collection('audit_logs').deleteMany({});
+  await testDb.db.collection('document_events').deleteMany({});
 
   // Inserir tenants
   await testDb.db.collection('tenants').insertMany([
@@ -969,5 +970,199 @@ describe('documentos órfãos — departamento soft-deletado preserva acesso', (
 
     expect(res.statusCode).toBe(404);
     expect(res.json().error.code).toBe('NOT_FOUND');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// document_events — registro imutável de upload (cobrança)
+//
+// Regra: TODO upload aceito gera exatamente 1 evento; reenvio dedup gera
+// novo evento (deduplicated:true); QUOTA_EXCEEDED não gera evento; a exclusão
+// do documento NÃO remove o evento; eventos são isolados por tenant.
+// wiki "Histórico de eventos de upload e relatório de uso (cobrança)".
+//
+// A coleção document_events é consultada DIRETAMENTE (sem o TenantRepository),
+// pois por regra de negócio não carrega `deleted` e não passa pelo wrapper.
+// ---------------------------------------------------------------------------
+
+interface RawDocumentEvent {
+  id: string;
+  tenantId: string;
+  documentId: string | null;
+  uploadedById: string;
+  eventType: string;
+  mimeType: string;
+  documentTypeId: string | null;
+  documentTypeName: string | null;
+  sizeBytes: number;
+  pageCount: number | null;
+  deduplicated: boolean;
+  createdAt: Date;
+  deleted?: unknown;
+}
+
+async function listEvents(tenantId: string): Promise<RawDocumentEvent[]> {
+  return testDb.db
+    .collection<RawDocumentEvent>('document_events')
+    .find({ tenantId })
+    .sort({ createdAt: 1 })
+    .toArray();
+}
+
+describe('POST /documents — emissão de evento em document_events', () => {
+  it('upload normal gera exatamente 1 evento com deduplicated:false e documentId correto', async () => {
+    const { payload, headers } = buildUploadForm({
+      departmentId: DEPT_A_ID,
+      documentTypeId: DOC_TYPE_ID,
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenAdminA}`, ...headers },
+      payload,
+    });
+
+    expect(res.statusCode).toBe(201);
+    const documentId = res.json().id as string;
+
+    const events = await listEvents(TENANT_A);
+    expect(events).toHaveLength(1);
+
+    const event = events[0]!;
+    expect(event.deduplicated).toBe(false);
+    expect(event.documentId).toBe(documentId);
+    expect(event.tenantId).toBe(TENANT_A);
+    expect(event.uploadedById).toBe(ADMIN_A_ID);
+    expect(event.eventType).toBe('upload');
+    expect(event.mimeType).toBe('application/pdf');
+    expect(event.documentTypeId).toBe(DOC_TYPE_ID);
+    expect(event.documentTypeName).toBe('Contrato A'); // denormalizado
+    expect(event.sizeBytes).toBeGreaterThan(0);
+    expect(event.pageCount).toBeNull(); // backfill posterior pelo worker
+    // Append-only: NÃO carrega o campo `deleted`
+    expect(event.deleted).toBeUndefined();
+  });
+
+  it('reenvio do mesmo arquivo (dedup) gera um SEGUNDO evento deduplicated:true para o mesmo documentId', async () => {
+    const content = Buffer.from('arquivo-para-evento-dedup');
+    const form1 = buildUploadForm({ content, departmentId: DEPT_A_ID });
+    const form2 = buildUploadForm({ content, departmentId: DEPT_A_ID });
+
+    const res1 = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenAdminA}`, ...form1.headers },
+      payload: form1.payload,
+    });
+    expect(res1.statusCode).toBe(201);
+    const documentId = res1.json().id as string;
+
+    const res2 = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenAdminA}`, ...form2.headers },
+      payload: form2.payload,
+    });
+    expect(res2.statusCode).toBe(200);
+    expect(res2.headers['x-deduplicated']).toBe('true');
+
+    const events = await listEvents(TENANT_A);
+    // Total de eventos = 2 (o upload original + o reenvio deduplicado)
+    expect(events).toHaveLength(2);
+
+    const [first, second] = events;
+    expect(first!.deduplicated).toBe(false);
+    expect(first!.documentId).toBe(documentId);
+
+    expect(second!.deduplicated).toBe(true);
+    // O evento de dedup aponta para o MESMO documento (nenhum novo doc criado)
+    expect(second!.documentId).toBe(documentId);
+    expect(second!.sizeBytes).toBe(first!.sizeBytes);
+  });
+
+  it('documento deletado NÃO remove o evento — o histórico de upload é preservado', async () => {
+    const { payload, headers } = buildUploadForm({ departmentId: DEPT_A_ID });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenAdminA}`, ...headers },
+      payload,
+    });
+    expect(res.statusCode).toBe(201);
+    const documentId = res.json().id as string;
+
+    // Confirma que o evento existe antes do delete
+    const before = await listEvents(TENANT_A);
+    expect(before).toHaveLength(1);
+
+    // Exclui o documento (soft delete)
+    const delRes = await app.inject({
+      method: 'DELETE',
+      url: `/documents/${documentId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(delRes.statusCode).toBe(204);
+
+    // O evento continua na coleção (consulta direta — não filtra por deleted)
+    const after = await listEvents(TENANT_A);
+    expect(after).toHaveLength(1);
+    expect(after[0]!.documentId).toBe(documentId);
+    expect(after[0]!.deduplicated).toBe(false);
+  });
+
+  it('upload rejeitado por QUOTA_EXCEEDED NÃO gera evento', async () => {
+    // Cota de 1 byte — qualquer upload excede e lança antes da emissão
+    await testDb.db
+      .collection('tenants')
+      .updateOne({ id: TENANT_A }, { $set: { diskQuotaBytes: 1 } });
+
+    const { payload, headers } = buildUploadForm({ departmentId: DEPT_A_ID });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenAdminA}`, ...headers },
+      payload,
+    });
+
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('QUOTA_EXCEEDED');
+
+    // Nenhum evento foi emitido
+    const events = await listEvents(TENANT_A);
+    expect(events).toHaveLength(0);
+  });
+
+  it('eventos são isolados por tenant — eventos de A não aparecem ao consultar por B', async () => {
+    const formA = buildUploadForm({ departmentId: DEPT_A_ID });
+    const resA = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenAdminA}`, ...formA.headers },
+      payload: formA.payload,
+    });
+    expect(resA.statusCode).toBe(201);
+
+    const formB = buildUploadForm({ departmentId: DEPT_B_ID });
+    const resB = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenAdminB}`, ...formB.headers },
+      payload: formB.payload,
+    });
+    expect(resB.statusCode).toBe(201);
+
+    const eventsA = await listEvents(TENANT_A);
+    const eventsB = await listEvents(TENANT_B);
+
+    expect(eventsA).toHaveLength(1);
+    expect(eventsB).toHaveLength(1);
+    expect(eventsA[0]!.tenantId).toBe(TENANT_A);
+    expect(eventsB[0]!.tenantId).toBe(TENANT_B);
+    // Nenhum evento de A vaza para a consulta de B e vice-versa
+    expect(eventsA.every((e) => e.tenantId === TENANT_A)).toBe(true);
+    expect(eventsB.every((e) => e.tenantId === TENANT_B)).toBe(true);
   });
 });

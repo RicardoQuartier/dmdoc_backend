@@ -61,6 +61,19 @@ export const REGULAR_INDEXES: Readonly<Record<string, readonly RegularIndex[]>> 
     { keys: { tenantId: 1, departmentId: 1 }, options: { name: 'by_tenant_department' } },
   ],
   audit_logs: [{ keys: { tenantId: 1, createdAt: -1 }, options: { name: 'by_tenant_created_at' } }],
+  // Coleção append-only de eventos de upload (spec §5.3/§5.4). NÃO tem índice
+  // único nem sobre `deleted` — eventos são imutáveis e nunca soft-deletados.
+  document_events: [
+    // Relatório de uso por período (escopado por empresa, ordenado no tempo).
+    { keys: { tenantId: 1, createdAt: -1 }, options: { name: 'by_tenant_created_at' } },
+    // Relatório filtrado por usuário ("Equipe vs. Cliente") dentro de um período.
+    {
+      keys: { tenantId: 1, uploadedById: 1, createdAt: -1 },
+      options: { name: 'by_tenant_uploader_created_at' },
+    },
+    // Backfill de pageCount pelo worker, que localiza eventos pelo documentId.
+    { keys: { documentId: 1 }, options: { name: 'by_document' } },
+  ],
   department_templates: [
     { keys: { name: 1 }, options: { name: 'uniq_name', unique: true } },
   ],

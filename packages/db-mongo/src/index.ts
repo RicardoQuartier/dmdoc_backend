@@ -12,6 +12,11 @@ export {
   type UpdateInput,
 } from './tenant-repository.js';
 export {
+  DocumentEventsRepository,
+  createDocumentEventsRepository,
+  DOCUMENT_EVENTS_COLLECTION,
+} from './document-events-repository.js';
+export {
   newId,
   toObjectId,
   normalizeLimit,

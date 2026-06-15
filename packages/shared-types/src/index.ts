@@ -55,6 +55,14 @@ export {
 } from './document-content.js';
 export { ChunkSchema, type Chunk } from './chunk.js';
 export {
+  DocumentEventTypeSchema,
+  type DocumentEventType,
+  DocumentEventSchema,
+  type DocumentEvent,
+  CreateDocumentEventInputSchema,
+  type CreateDocumentEventInput,
+} from './document-event.js';
+export {
   DocumentProcessingJobDataSchema,
   type DocumentProcessingJobData,
 } from './job.js';
