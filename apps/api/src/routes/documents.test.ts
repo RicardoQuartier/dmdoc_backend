@@ -674,6 +674,150 @@ describe('POST /documents — validações de entrada', () => {
 });
 
 // ---------------------------------------------------------------------------
+// ACL por raiz com herança dinâmica (Fase 6).
+//
+// Conceder uma RAIZ dá acesso de leitura E escrita a toda a subárvore — filhos
+// atuais E futuros — sem materializar os filhos em department_permissions.
+// ---------------------------------------------------------------------------
+describe('ACL por raiz — herança dinâmica de acesso à subárvore', () => {
+  it('conceder raiz dá ao UPLOADER escrita em um filho existente e num filho criado depois', async () => {
+    // 1. UPLOADER com concessão da RAIZ (DEPT_A_ID), canRead=canWrite=true.
+    const uploaderRaizId = newId();
+    await seedUser(testDb.db, {
+      id: uploaderRaizId,
+      tenantId: TENANT_A,
+      email: 'uploader-raiz@empresa.com',
+      password: PASSWORD,
+      role: 'UPLOADER',
+    });
+    await testDb.db.collection('department_permissions').insertOne({
+      id: newId(),
+      userId: uploaderRaizId,
+      departmentId: DEPT_A_ID,
+      tenantId: TENANT_A,
+      canRead: true,
+      canWrite: true,
+      deleted: false,
+    });
+    const tokenRaiz = await login('uploader-raiz@empresa.com');
+
+    // 2. Filho EXISTENTE da raiz DEPT_A_ID (parentId = DEPT_A_ID, nível 1).
+    const childId = newId();
+    await testDb.db.collection('departments').insertOne({
+      id: childId,
+      tenantId: TENANT_A,
+      parentId: DEPT_A_ID,
+      name: 'Filho de A',
+      level: 1,
+      tags: [],
+      deleted: false,
+      createdAt: new Date(),
+    });
+
+    // Upload no filho existente — deve funcionar (acesso herdado da raiz).
+    const formChild = buildUploadForm({ departmentId: childId });
+    const resChild = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenRaiz}`, ...formChild.headers },
+      payload: formChild.payload,
+    });
+    expect(resChild.statusCode).toBe(201);
+    expect(resChild.json().departmentId).toBe(childId);
+
+    // 3. Filho CRIADO DEPOIS (sem re-salvar permissões) — também acessível.
+    const futureChildId = newId();
+    await testDb.db.collection('departments').insertOne({
+      id: futureChildId,
+      tenantId: TENANT_A,
+      parentId: childId,
+      name: 'Neto de A',
+      level: 2,
+      tags: [],
+      deleted: false,
+      createdAt: new Date(),
+    });
+
+    const formFuture = buildUploadForm({ departmentId: futureChildId });
+    const resFuture = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenRaiz}`, ...formFuture.headers },
+      payload: formFuture.payload,
+    });
+    expect(resFuture.statusCode).toBe(201);
+    expect(resFuture.json().departmentId).toBe(futureChildId);
+  });
+
+  it('GET /documents lista documentos de filhos quando só a raiz foi concedida', async () => {
+    // UPLOADER com concessão da raiz DEPT_A_ID.
+    const uploaderListId = newId();
+    await seedUser(testDb.db, {
+      id: uploaderListId,
+      tenantId: TENANT_A,
+      email: 'uploader-list@empresa.com',
+      password: PASSWORD,
+      role: 'UPLOADER',
+    });
+    await testDb.db.collection('department_permissions').insertOne({
+      id: newId(),
+      userId: uploaderListId,
+      departmentId: DEPT_A_ID,
+      tenantId: TENANT_A,
+      canRead: true,
+      canWrite: true,
+      deleted: false,
+    });
+    const tokenList = await login('uploader-list@empresa.com');
+
+    // Filho da raiz + documento READY nesse filho (inserido direto no banco).
+    const childId = newId();
+    await testDb.db.collection('departments').insertOne({
+      id: childId,
+      tenantId: TENANT_A,
+      parentId: DEPT_A_ID,
+      name: 'Filho listável',
+      level: 1,
+      tags: [],
+      deleted: false,
+      createdAt: new Date(),
+    });
+    const docId = newId();
+    await testDb.db.collection('documents').insertOne({
+      id: docId,
+      tenantId: TENANT_A,
+      departmentId: childId,
+      documentTypeId: null,
+      filename: 'filho.pdf',
+      originalFilename: 'filho.pdf',
+      contentHash: 'c'.repeat(64),
+      sizeBytes: 512,
+      mimeType: 'application/pdf',
+      s3Key: `tenants/${TENANT_A}/documents/${'c'.repeat(64)}/filho.pdf`,
+      status: 'READY',
+      failureReason: null,
+      tags: [],
+      mongoContentId: null,
+      indexValues: {},
+      uploadedById: uploaderListId,
+      uploadedAt: new Date(),
+      processedAt: new Date(),
+      costUsdCents: 0,
+      deleted: false,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenList}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json().items as Array<{ id: string }>).map((d) => d.id);
+    expect(ids).toContain(docId);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Regressão: departamento excluído preserva acesso aos documentos órfãos.
 //
 // Regra de negócio: a exclusão de um departamento marca APENAS o departamento

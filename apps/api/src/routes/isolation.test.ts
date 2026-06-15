@@ -245,13 +245,13 @@ describe('Isolamento multi-tenant — PUT /users/:id/permissions', () => {
       createdAt: new Date(),
     });
 
-    // Admin A tenta dar permissão ao usuário A num departamento de B
+    // Admin A tenta dar permissão ao usuário A numa raiz de B
     const res = await app.inject({
       method: 'PUT',
       url: `/users/${USER_A_ID}/permissions`,
       headers: { authorization: `Bearer ${tokenA}` },
       payload: {
-        permissions: [{ departmentId: deptId, canRead: true, canWrite: false }],
+        rootDepartmentIds: [deptId],
       },
     });
 

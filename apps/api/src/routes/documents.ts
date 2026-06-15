@@ -9,7 +9,8 @@ import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import { NotFoundError, QuotaExceededError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
-import { resolveTenantId, resolveTenantContext } from '../auth/resolve-tenant.js';
+import { resolveTenantContext } from '../auth/resolve-tenant.js';
+import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 import { getConfig } from '../config.js';
 
 // ---------------------------------------------------------------------------
@@ -51,14 +52,6 @@ interface DocumentDoc extends TenantDocument {
   uploadedAt: Date;
   processedAt: Date | null;
   costUsdCents: number;
-}
-
-interface DepartmentPermissionDoc {
-  userId: string;
-  departmentId: string;
-  tenantId: string;
-  canRead: boolean;
-  canWrite: boolean;
 }
 
 interface IndexFieldDoc {
@@ -175,36 +168,17 @@ async function findDocumentInTenants(
 }
 
 /**
- * Resolve quais departmentIds o usuário pode LER.
+ * Valida se o usuário pode LER um departamento específico.
  *
- * - TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN: `null` (sem restrição — retornar todos)
- *   Para MTA o isolamento já é garantido pelo filtro $in de tenantIds.
- * - UPLOADER / USER: apenas os departamentos onde `canRead: true`
- */
-async function resolveReadableDepartmentIds(
-  db: import('mongodb').Db,
-  userId: string,
-  tenantId: string | null,
-  role: string
-): Promise<string[] | null> {
-  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN') {
-    return null;
-  }
-  // Para roles normais, tenantId nunca é null (vem do JWT)
-  const perms = await db
-    .collection<DepartmentPermissionDoc>('department_permissions')
-    .find({ userId, tenantId: tenantId!, canRead: true })
-    .toArray();
-  return perms.map((p) => p.departmentId);
-}
-
-/**
- * Valida se o usuário tem permissão de LEITURA em um departamento específico.
+ * Modelo de ACL por raiz com herança dinâmica (Fase 6): o usuário tem acesso a
+ * um departamento quando ele pertence à subárvore de alguma raiz concedida. A
+ * checagem de acesso (leitura == escrita) usa o set expandido de
+ * `resolveAccessibleDepartmentIds`.
  *
  * - TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN: sempre permitido (desde
  *   que o dept exista no tenant). Para MTA o isolamento já foi feito ao buscar
  *   o documento com `findDocumentInTenants` — o tenantId aqui é o do documento.
- * - UPLOADER / USER: verifica `department_permissions` com `canRead: true`
+ * - UPLOADER / USER: o departamento deve pertencer ao set expandido.
  *
  * IMPORTANTE: o departamento NÃO é filtrado por `deleted: false`. A exclusão de
  * departamento preserva os documentos vinculados (eles seguem `deleted: false`),
@@ -221,8 +195,9 @@ async function assertCanReadDepartment(
   departmentId: string,
   role: string
 ): Promise<void> {
-  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN') {
-    // SUPER_ADMIN/MTA sem tenantId filtrado: aceita qualquer departamento existente.
+  const accessible = await resolveAccessibleDepartmentIds(db, userId, tenantId, role);
+  if (accessible === null) {
+    // Admin sem restrição de ACL: aceita qualquer departamento existente.
     // Sem `deleted: false`: departamento soft-deletado ainda dá acesso aos docs preservados.
     const deptFilter: Record<string, unknown> = { id: departmentId };
     if (tenantId !== null) {
@@ -234,17 +209,17 @@ async function assertCanReadDepartment(
     }
     return;
   }
-  // Para roles normais, tenantId nunca é null (vem do JWT)
-  const perm = await db
-    .collection<DepartmentPermissionDoc>('department_permissions')
-    .findOne({ userId, departmentId, tenantId: tenantId!, canRead: true });
-  if (!perm) {
+  if (!accessible.includes(departmentId)) {
     throw new NotFoundError('Departamento não encontrado ou sem permissão de leitura');
   }
 }
 
 /**
- * Valida se o usuário tem permissão de ESCRITA em um departamento específico.
+ * Valida se o usuário pode ESCREVER em um departamento específico.
+ *
+ * Modelo de ACL por raiz com herança dinâmica (Fase 6): conceder uma raiz dá
+ * acesso total (leitura == escrita) a toda a subárvore. O departamento é
+ * gravável quando pertence ao set expandido de `resolveAccessibleDepartmentIds`.
  *
  * IMPORTANTE: o departamento NÃO é filtrado por `deleted: false`. Como a exclusão
  * de departamento preserva os documentos (eles seguem `deleted: false`), admins
@@ -260,7 +235,9 @@ async function assertCanWriteDepartment(
   departmentId: string,
   role: string
 ): Promise<void> {
-  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN') {
+  const accessible = await resolveAccessibleDepartmentIds(db, userId, tenantId, role);
+  if (accessible === null) {
+    // Admin sem restrição de ACL: verifica apenas que o dept pertence ao tenant.
     // Sem `deleted: false`: departamento soft-deletado ainda permite operar nos docs preservados.
     const dept = await db
       .collection('departments')
@@ -270,10 +247,7 @@ async function assertCanWriteDepartment(
     }
     return;
   }
-  const perm = await db
-    .collection<DepartmentPermissionDoc>('department_permissions')
-    .findOne({ userId, departmentId, tenantId, canWrite: true });
-  if (!perm) {
+  if (!accessible.includes(departmentId)) {
     throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
   }
 }
@@ -457,30 +431,22 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const { departmentId, documentTypeId, indexValues } = fields_;
 
     // ------------------------------------------------------------------
-    // 2. Verificar permissão de escrita no departamento (ACL)
+    // 2. Verificar permissão de escrita no departamento (ACL por raiz)
     //    spec §10 invariante 5 + wiki "Permissões por departamento"
-    //    TENANT_ADMIN não precisa de permissão de ACL — tem acesso total
+    //    ACL por raiz com herança dinâmica (Fase 6): UPLOADER/USER podem
+    //    gravar em qualquer departamento cuja RAIZ foi concedida (pertencimento
+    //    ao set expandido). Admins têm acesso total. Recurso inacessível → 404.
+    //    Diferente de editar documentos órfãos, NÃO se pode arquivar um documento
+    //    NOVO em departamento soft-deletado: exige-se departamento ativo aqui.
     // ------------------------------------------------------------------
     const userRole = request.user!.role;
-    if (userRole === 'UPLOADER' || userRole === 'USER') {
-      const perm = await db.collection<DepartmentPermissionDoc>('department_permissions').findOne({
-        userId,
-        departmentId,
-        tenantId,
-        canWrite: true,
-      });
-      if (!perm) {
-        // Recurso não acessível → 404 (spec §10, invariante 4 — nunca 403)
-        throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
-      }
-    } else {
-      // TENANT_ADMIN: verificar que o departamento pertence ao tenant
-      const dept = await db
-        .collection('departments')
-        .findOne({ id: departmentId, tenantId, deleted: false });
-      if (!dept) {
-        throw new NotFoundError('Departamento não encontrado');
-      }
+    await assertCanWriteDepartment(db, userId, tenantId, departmentId, userRole);
+
+    const activeDept = await db
+      .collection('departments')
+      .findOne({ id: departmentId, tenantId, deleted: false });
+    if (!activeDept) {
+      throw new NotFoundError('Departamento não encontrado');
     }
 
     // ------------------------------------------------------------------
@@ -714,7 +680,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     // ------------------------------------------------------------------
     // 1. Resolver departamentos acessíveis
     // ------------------------------------------------------------------
-    const readableDepartmentIds = await resolveReadableDepartmentIds(
+    const readableDepartmentIds = await resolveAccessibleDepartmentIds(
       db,
       userId,
       effectiveTenantId,
