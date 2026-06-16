@@ -5,6 +5,7 @@ import type { TenantDocument } from '@dmdoc/db-mongo';
 import { ConflictError, NotFoundError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantId, resolveTenantContext } from '../auth/resolve-tenant.js';
+import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 
 interface DepartmentDoc extends TenantDocument {
   parentId: string | null;
@@ -16,6 +17,15 @@ interface DepartmentDoc extends TenantDocument {
 
 const ListDepartmentsQuerySchema = z.object({
   tenantId: z.string().uuid().optional(),
+  // `?writable=true` filtra o resultado para apenas os departamentos em que o
+  // usuário tem acesso de ESCRITA (== leitura, ACL por raiz com herança
+  // dinâmica). Usado para alimentar o seletor de departamento no upload, que só
+  // pode aceitar departamentos ativos. Coerção string→boolean no padrão do
+  // projeto (ver config.ts S3_FORCE_PATH_STYLE).
+  writable: z
+    .string()
+    .transform((v) => v === 'true')
+    .optional(),
 });
 
 const CreateDepartmentBodySchema = z.object({
@@ -51,11 +61,21 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
    * Demais roles: sempre escopadas ao próprio tenant.
    */
   app.get('/departments', { preHandler: app.authenticate }, async (request, reply) => {
-    const { tenantId: tenantIdParam } = ListDepartmentsQuerySchema.parse(request.query);
+    const { tenantId: tenantIdParam, writable } = ListDepartmentsQuerySchema.parse(request.query);
     const db = app.db;
     const role = request.user?.role;
 
     let items: DepartmentDoc[];
+
+    // Tenant efetivo para resolução de ACL no modo writable. Para SUPER_ADMIN/MTA
+    // o tenant vem do `?tenantId` (quando informado); para roles normais vem do
+    // contexto da request (JWT). Para roles admin a ACL não restringe (resolver
+    // retorna null), então o valor abaixo só importa para UPLOADER/USER, onde
+    // request.tenantId é sempre uma string.
+    const aclTenantId =
+      role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN'
+        ? tenantIdParam ?? null
+        : request.tenantId ?? null;
 
     if (role === 'SUPER_ADMIN') {
       const filter: Record<string, unknown> = { deleted: false };
@@ -104,6 +124,28 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
         .sort({ level: 1, name: 1 })
         .limit(1000)
         .toArray()) as unknown as DepartmentDoc[];
+    }
+
+    // Modo writable: filtra para apenas os departamentos em que o usuário tem
+    // acesso de escrita. Os três ramos acima já garantem `deleted: false`
+    // (departamentos ativos), requisito do upload — então aqui só resta cruzar
+    // com o conjunto acessível por ACL.
+    //
+    //  - resolver → null  (admin SUPER_ADMIN/MTA/TENANT_ADMIN): sem restrição,
+    //    mantém todos os departamentos ativos do escopo.
+    //  - resolver → string[]: filtra `id $in accessible`. Array vazio (nenhuma
+    //    raiz concedida) → lista vazia (200, não erro).
+    if (writable === true) {
+      const accessible = await resolveAccessibleDepartmentIds(
+        db,
+        request.user?.sub ?? '',
+        aclTenantId,
+        role ?? ''
+      );
+      if (accessible !== null) {
+        const accessibleSet = new Set(accessible);
+        items = items.filter((d) => accessibleSet.has(d.id));
+      }
     }
 
     // Contagem direta de documentos por departamento. Os departmentIds já estão

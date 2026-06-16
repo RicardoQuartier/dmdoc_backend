@@ -233,3 +233,151 @@ describe('GET /departments — documentCount', () => {
     expect(vazio?.documentCount).toBe(0);
   });
 });
+
+describe('GET /departments?writable=true — filtro por acesso de escrita (ACL)', () => {
+  const UPLOADER_ID = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
+
+  // Monta uma árvore com duas raízes:
+  //   Financeiro (raiz)          ← concedida ao uploader nos testes
+  //     └─ Contas a Pagar
+  //          └─ Notas (neta)
+  //     └─ Folha (será soft-deletada em um dos testes)
+  //   RH (raiz)                  ← NÃO concedida ao uploader
+  //     └─ Recrutamento
+  const FINANCEIRO = '21111111-1111-1111-1111-111111111111';
+  const CONTAS_PAGAR = '22222222-2222-2222-2222-222222222222';
+  const NOTAS = '23333333-3333-3333-3333-333333333333';
+  const FOLHA = '24444444-4444-4444-4444-444444444444';
+  const RH = '25555555-5555-5555-5555-555555555555';
+  const RECRUTAMENTO = '26666666-6666-6666-6666-666666666666';
+
+  async function seedTree(): Promise<void> {
+    await testDb.db.collection('departments').insertMany([
+      { id: FINANCEIRO, tenantId: TENANT_A, parentId: null, name: 'Financeiro', level: 0, tags: [], deleted: false, createdAt: new Date() },
+      { id: CONTAS_PAGAR, tenantId: TENANT_A, parentId: FINANCEIRO, name: 'Contas a Pagar', level: 1, tags: [], deleted: false, createdAt: new Date() },
+      { id: NOTAS, tenantId: TENANT_A, parentId: CONTAS_PAGAR, name: 'Notas', level: 2, tags: [], deleted: false, createdAt: new Date() },
+      { id: FOLHA, tenantId: TENANT_A, parentId: FINANCEIRO, name: 'Folha', level: 1, tags: [], deleted: false, createdAt: new Date() },
+      { id: RH, tenantId: TENANT_A, parentId: null, name: 'RH', level: 0, tags: [], deleted: false, createdAt: new Date() },
+      { id: RECRUTAMENTO, tenantId: TENANT_A, parentId: RH, name: 'Recrutamento', level: 1, tags: [], deleted: false, createdAt: new Date() },
+    ]);
+  }
+
+  async function seedUploader(): Promise<string> {
+    await seedUser(testDb.db, {
+      id: UPLOADER_ID,
+      tenantId: TENANT_A,
+      email: 'uploader-a@empresa.com',
+      password: PASSWORD,
+      role: 'UPLOADER',
+    });
+    return login('uploader-a@empresa.com');
+  }
+
+  async function grantRoot(rootId: string): Promise<void> {
+    await testDb.db.collection('department_permissions').insertOne({
+      userId: UPLOADER_ID,
+      departmentId: rootId,
+      tenantId: TENANT_A,
+      canRead: true,
+      canWrite: true,
+    });
+  }
+
+  it('(a) UPLOADER com uma raiz concedida → recebe apenas a subárvore daquela raiz, todos ativos', async () => {
+    await seedTree();
+    const token = await seedUploader();
+    await grantRoot(FINANCEIRO);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments?writable=true',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
+
+    // Subárvore de Financeiro: a própria raiz + Contas a Pagar + Notas + Folha.
+    // RH e Recrutamento (outra raiz, não concedida) NÃO aparecem.
+    expect(ids).toEqual([FINANCEIRO, CONTAS_PAGAR, NOTAS, FOLHA].sort());
+    expect(ids).not.toContain(RH);
+    expect(ids).not.toContain(RECRUTAMENTO);
+  });
+
+  it('(b) UPLOADER sem nenhuma raiz concedida → lista vazia (200)', async () => {
+    await seedTree();
+    const token = await seedUploader();
+    // sem grantRoot
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments?writable=true',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([]);
+  });
+
+  it('(c) departamento soft-deletado dentro da subárvore NÃO aparece no modo writable', async () => {
+    await seedTree();
+    const token = await seedUploader();
+    await grantRoot(FINANCEIRO);
+
+    // Soft-delete de "Folha" (filho direto de Financeiro, dentro da subárvore).
+    await testDb.db
+      .collection('departments')
+      .updateOne({ id: FOLHA }, { $set: { deleted: true } });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments?writable=true',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
+
+    // Folha foi excluída logicamente → some do writable, mesmo estando na subárvore.
+    expect(ids).toEqual([FINANCEIRO, CONTAS_PAGAR, NOTAS].sort());
+    expect(ids).not.toContain(FOLHA);
+  });
+
+  it('(d) TENANT_ADMIN com writable=true → recebe todos os departamentos ativos do tenant (sem restrição de ACL)', async () => {
+    await seedTree();
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments?writable=true',
+      headers: { authorization: `Bearer ${tokenA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
+
+    expect(ids).toEqual(
+      [FINANCEIRO, CONTAS_PAGAR, NOTAS, FOLHA, RH, RECRUTAMENTO].sort()
+    );
+  });
+
+  it('(e) GET /departments sem writable continua retornando todos os departamentos do tenant (comportamento inalterado)', async () => {
+    await seedTree();
+    const token = await seedUploader();
+    await grantRoot(FINANCEIRO); // mesmo com ACL, sem ?writable o filtro não se aplica
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
+
+    // Sem ?writable: comportamento atual — todos os departamentos do tenant,
+    // independente da ACL de escrita.
+    expect(ids).toEqual(
+      [FINANCEIRO, CONTAS_PAGAR, NOTAS, FOLHA, RH, RECRUTAMENTO].sort()
+    );
+  });
+});
