@@ -218,6 +218,26 @@ function registerErrorHandler(app: FastifyInstance): void {
       });
     }
 
+    // Erros do content-type parser do Fastify: corpo JSON vazio ou malformado.
+    // O cliente enviou `Content-Type: application/json` mas o corpo não pôde ser
+    // parseado (ausente ou JSON inválido) — falha do cliente (400 BAD_REQUEST),
+    // não um 500. Sem esse mapeamento, esses erros caíam no branch genérico e
+    // poluíam as métricas de erro 5xx (ver card mvp-launch).
+    // Códigos cobertos: FST_ERR_CTP_EMPTY_JSON_BODY, FST_ERR_CTP_INVALID_JSON_BODY.
+    const fastifyCode = (error as { code?: string }).code;
+    if (
+      fastifyCode === 'FST_ERR_CTP_EMPTY_JSON_BODY' ||
+      fastifyCode === 'FST_ERR_CTP_INVALID_JSON_BODY'
+    ) {
+      request.log.info({ err: error, code: fastifyCode }, 'corpo da requisição inválido');
+      return reply.status(400).send({
+        error: {
+          code: 'BAD_REQUEST',
+          message: 'Corpo da requisição ausente ou JSON inválido',
+        },
+      });
+    }
+
     // Erros de validação nativos do Fastify (schemas de rota).
     if (error.validation) {
       request.log.info({ err: error }, 'erro de validação (fastify)');

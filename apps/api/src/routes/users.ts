@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { MongoServerError } from 'mongodb';
@@ -10,6 +11,7 @@ import { ConflictError, ForbiddenError, NotFoundError } from '../errors/index.js
 import { requireRole, requireCanManageRole } from '../auth/role-guard.js';
 import { hashPassword } from '../auth/password.js';
 import { resolveTenantContext, resolveTenantId } from '../auth/resolve-tenant.js';
+import { AuditLogger } from '../auth/audit.js';
 
 interface UserDoc extends TenantDocument {
   email: string;
@@ -60,6 +62,10 @@ const PatchUserBodySchema = z.object({
     .array(z.string().uuid())
     .max(20, 'MULTI_TENANT_ADMIN suporta no máximo 20 tenants no MVP')
     .optional(),
+});
+
+const ResetPasswordBodySchema = z.object({
+  newPassword: z.string().min(8),
 });
 
 const ListUsersQuerySchema = z.object({
@@ -116,7 +122,7 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const passwordHash = await hashPassword(body.password);
-    const newId = crypto.randomUUID();
+    const newId = randomUUID();
     const createdAt = new Date();
 
     // ----------------------------------------------------------------------
@@ -473,6 +479,100 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
     if (!deleted) throw new NotFoundError();
 
     request.log.info({ tenantId, userId: id }, 'usuário removido (soft delete)');
+    return reply.status(204).send();
+  });
+
+  /**
+   * POST /users/:id/reset-password — reset de senha POR ADMIN.
+   *
+   * O ator define uma nova senha para um usuário que ele pode gerenciar. NÃO é
+   * self-service por email (fora do escopo do MVP).
+   *
+   * Regras (espelham PATCH /users/:id):
+   *   - Gate base: apenas papéis administrativos (requireRole(...ADMIN_ROLES)).
+   *   - Isolamento multi-tenant: o alvo é resolvido DENTRO do escopo de tenant do
+   *     ator. Alvo inexistente OU de outro tenant → 404 (nunca 403 por tenant).
+   *     SUPER_ADMIN: busca global. MTA: $in allowedTenantIds (via TenantRepository
+   *     com ?tenantId ∈ allowedTenantIds). TENANT_ADMIN: tenant do token.
+   *   - Hierarquia (regra "inferior ou igual"): o ator só reseta a senha de quem
+   *     ele pode gerenciar — requireCanManageRole contra o role ATUAL do alvo.
+   *     Caso contrário → 403 (ForbiddenError).
+   *   - Regrava `passwordHash` com argon2. A senha em claro NUNCA é logada.
+   *   - AuditLog da ação (ator, alvo, tenant) — spec §10, invariante 7.
+   */
+  app.post('/users/:id/reset-password', { preHandler: app.authenticate }, async (request, reply) => {
+    requireRole(request, ...ADMIN_ROLES);
+
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const { newPassword } = ResetPasswordBodySchema.parse(request.body);
+    const db = app.db;
+
+    const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
+
+    // 1. Resolve o alvo dentro do escopo de tenant do ator.
+    //    SUPER_ADMIN: busca global; demais roles (TENANT_ADMIN, MTA): escopados
+    //    via TenantRepository — cross-tenant ou inexistente → 404 (não vaza).
+    let target: UserDoc | null;
+    let targetTenantId: string | null;
+
+    if (isSuperAdmin) {
+      target = (await db
+        .collection('users')
+        .findOne({ id, deleted: false })) as unknown as UserDoc | null;
+      targetTenantId = target?.tenantId ?? null;
+    } else {
+      // MTA: tenant alvo via ?tenantId (∈ allowedTenantIds). Sem ele → NotFoundError
+      // (resolveTenantId write path). Fora da lista → 404. TENANT_ADMIN: tenant do token.
+      const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
+      const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
+      const tenantId = effectiveTenantId as string;
+
+      const usersRepo = new TenantRepository<UserDoc>(db.collection('users'), { tenantId });
+      target = await usersRepo.findById(id);
+      targetTenantId = tenantId;
+    }
+
+    if (!target) throw new NotFoundError();
+
+    // 2. Hierarquia: o ator só reseta a senha de quem ele pode gerenciar (regra
+    //    "inferior ou igual" contra o role ATUAL do alvo). Violação → 403.
+    requireCanManageRole(request, target.role as Role);
+
+    // 3. Regrava o passwordHash com argon2. A senha em claro nunca é persistida
+    //    nem logada.
+    const passwordHash = await hashPassword(newPassword);
+    const updated = (await db
+      .collection('users')
+      .findOneAndUpdate(
+        { id, deleted: false },
+        { $set: { passwordHash } },
+        { returnDocument: 'after' },
+      )) as unknown as UserDoc | null;
+    // Corrida improvável (alvo deletado entre find e update) → 404.
+    if (!updated) throw new NotFoundError();
+
+    // 4. AuditLog da ação de reset (ator, alvo, tenant). Falha de auditoria não
+    //    derruba a operação — apenas é logada (padrão do projeto).
+    const auditLogger = new AuditLogger(db);
+    try {
+      await auditLogger.record({
+        tenantId: targetTenantId,
+        userId: request.user!.sub,
+        action: 'user.reset_password',
+        resource: `users/${id}`,
+        metadata: { targetUserId: id, targetRole: target.role },
+      });
+    } catch (auditError) {
+      request.log.error(
+        { err: auditError, tenantId: targetTenantId, userId: id },
+        'falha ao registrar audit log de reset de senha',
+      );
+    }
+
+    request.log.info(
+      { tenantId: targetTenantId, userId: id, actorId: request.user!.sub },
+      'senha redefinida por admin',
+    );
     return reply.status(204).send();
   });
 };

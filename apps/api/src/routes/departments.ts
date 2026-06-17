@@ -17,15 +17,13 @@ interface DepartmentDoc extends TenantDocument {
 
 const ListDepartmentsQuerySchema = z.object({
   tenantId: z.string().uuid().optional(),
-  // `?writable=true` filtra o resultado para apenas os departamentos em que o
-  // usuário tem acesso de ESCRITA (== leitura, ACL por raiz com herança
-  // dinâmica). Usado para alimentar o seletor de departamento no upload, que só
-  // pode aceitar departamentos ativos. Coerção string→boolean no padrão do
-  // projeto (ver config.ts S3_FORCE_PATH_STYLE).
+  // Querystrings chegam como string. `writable=true` ativa o filtro de escrita
+  // (seletor de upload); qualquer outro valor (ou ausência) mantém o
+  // comportamento de gestão (lista todos os departamentos do escopo).
   writable: z
-    .string()
-    .transform((v) => v === 'true')
-    .optional(),
+    .enum(['true', 'false'])
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 const CreateDepartmentBodySchema = z.object({
@@ -126,25 +124,32 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
         .toArray()) as unknown as DepartmentDoc[];
     }
 
-    // Modo writable: filtra para apenas os departamentos em que o usuário tem
-    // acesso de escrita. Os três ramos acima já garantem `deleted: false`
-    // (departamentos ativos), requisito do upload — então aqui só resta cruzar
-    // com o conjunto acessível por ACL.
-    //
-    //  - resolver → null  (admin SUPER_ADMIN/MTA/TENANT_ADMIN): sem restrição,
-    //    mantém todos os departamentos ativos do escopo.
-    //  - resolver → string[]: filtra `id $in accessible`. Array vazio (nenhuma
-    //    raiz concedida) → lista vazia (200, não erro).
-    if (writable === true) {
+    // Filtro de ESCRITA (?writable=true) — superfície do seletor de upload.
+    // Retorna apenas departamentos em que o ator pode escrever (wiki "Permissões
+    // por departamento (ACL)" → seção "Seletor de departamento no upload"):
+    //   - Admin (TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN): sem restrição
+    //     de ACL — `resolveAccessibleDepartmentIds` retorna `null` e mantemos
+    //     todos os departamentos ATIVOS do escopo já carregados em `items`.
+    //   - UPLOADER / USER: subárvore expandida das raízes concedidas; sem raiz
+    //     concedida → conjunto vazio → resposta `[]` (200, não erro).
+    // `items` já está restrito a `deleted: false`, então a interseção com o
+    // conjunto acessível resulta apenas em departamentos ATIVOS — destino válido
+    // de upload (um soft-deletado dentro da subárvore concedida não aparece).
+    // Sem `writable`, o endpoint mantém o comportamento de gestão (lista tudo).
+    if (writable) {
+      const userId = request.user?.sub;
+      if (typeof userId !== 'string') {
+        throw new Error('userId ausente no contexto da request');
+      }
       const accessible = await resolveAccessibleDepartmentIds(
         db,
-        request.user?.sub ?? '',
-        aclTenantId,
+        userId,
+        request.tenantId ?? null,
         role ?? ''
       );
       if (accessible !== null) {
         const accessibleSet = new Set(accessible);
-        items = items.filter((d) => accessibleSet.has(d.id));
+        items = items.filter((dept) => accessibleSet.has(dept.id));
       }
     }
 
