@@ -55,8 +55,8 @@ services:
     image: minio/minio:latest
     container_name: dmdoc-minio
     ports:
-      - '9000:9000'   # API S3-compatible
-      - '9001:9001'   # Console web (http://localhost:5055)
+      - '5054:9000'   # API S3-compatible (http://localhost:5054 — usado por S3_PUBLIC_ENDPOINT)
+      - '5055:9001'   # Console web (http://localhost:5055)
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -110,6 +110,10 @@ services:
       MONGO_URI: mongodb://mongodb:27017?directConnection=true
       REDIS_URL: redis://redis:6379
       S3_ENDPOINT: http://minio:9000
+      # Endpoint público para assinar URLs de download/preview. minio:9000 é o host
+      # interno do Docker (irresolvível pelo navegador); o presigner precisa do host
+      # publicado para o host. MinIO publica a porta S3 (9000) em localhost:5054.
+      S3_PUBLIC_ENDPOINT: http://localhost:5054
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_S3_BUCKET: dmdoc-documents
