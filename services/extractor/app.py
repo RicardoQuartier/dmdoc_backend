@@ -13,12 +13,15 @@ Dispatch por formato:
 - XLSX  → openpyxl (células por planilha)
 - PPTX  → python-pptx (texto dos slides)
 
-OCR: o EasyOCR não recusa documentos de identidade (ao contrário de LLMs) e a
-auto-rotação testa os 4 ângulos da imagem inteira, escolhendo o de texto mais
-coerente — resolve scans girados (RG digitalizado de lado).
+OCR: o EasyOCR não recusa documentos de identidade (ao contrário de LLMs). A
+auto-rotação detecta a melhor orientação rodando o OCR numa MINIATURA pequena nos
+4 ângulos (barato) e depois roda o OCR completo UMA vez, na resolução final, na
+melhor orientação — resolve scans girados (RG digitalizado de lado) sem fazer 4
+passadas de OCR em alta resolução (causa do OOM em scans grandes).
 """
 
 import io
+import logging
 import os
 import subprocess
 import tempfile
@@ -33,6 +36,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from openpyxl import load_workbook
 from pptx import Presentation
+
+logger = logging.getLogger("dmdoc.extractor")
 
 LANGS = os.environ.get("OCR_LANGS", "pt").split(",")
 
@@ -50,8 +55,28 @@ OFFICE_EXTENSIONS: dict[str, str] = {
     "application/rtf": ".rtf",
 }
 
-# Resolução máxima enviada ao OCR (maior lado, px).
-MAX_DIM = 2048
+# Resolução máxima enviada ao OCR (maior lado, px). Reduzido de 2048 → 1600:
+# em scans de identidade (RG/CNH) 1600px no maior lado preserva os campos-chave
+# (nome, números, órgão) com folga para o OCR, mas corta ~40% do número de pixels
+# vs 2048 (1600²/2048² ≈ 0.61) — alívio direto de memória e tempo no EasyOCR, que
+# é O(pixels). Acurácia nos campos grandes de um documento de identidade é
+# praticamente inalterada nessa faixa.
+MAX_DIM = 1600
+# Maior lado (px) da MINIATURA usada na 1ª etapa da detecção de orientação. Nessa
+# etapa rodamos só o DETECTOR do EasyOCR (CRAFT, sem reconhecimento) nas 4 rotações
+# — barato — para contar caixas de texto e escolher os 2 ângulos candidatos.
+ORIENT_DIM = 640
+# Quantas orientações candidatas (as de maior nº de caixas detectadas) passam para a
+# 2ª etapa. O detector não distingue 0°↔180° nem 90°↔270° (caixas idênticas de
+# cabeça pra baixo), então levamos 2 candidatos ao reconhecimento para desambiguar
+# por texto real (len×confiança). Resultado: 4× detect (barato) + 2× reconhecimento
+# numa thumb, em vez de 4× reconhecimento full-res.
+ORIENT_CANDIDATES = 2
+# Teto explícito para o canvas interno do EasyOCR. O default do EasyOCR é
+# canvas_size=2560: se a imagem for menor ele faz UPSCALE até esse tamanho antes da
+# detecção, inflando memória sem ganho. Travamos o canvas no maior lado real (com
+# teto MAX_DIM) e mag_ratio=1.0 para proibir qualquer ampliação interna.
+OCR_CANVAS_CAP = MAX_DIM
 # Limiar de grayscale: pixel < CONTENT_THRESHOLD conta como conteúdo (não-branco).
 CONTENT_THRESHOLD = 220
 # Mínimo de caracteres alfanuméricos numa página de PDF para considerá-la "nativa"
@@ -99,16 +124,30 @@ def _crop_white(img: np.ndarray) -> np.ndarray:
     return img[top:bot, left:right]
 
 
-def _resize(img: np.ndarray) -> np.ndarray:
+def _resize(img: np.ndarray, max_dim: int) -> np.ndarray:
+    """Reduz a imagem para que o maior lado seja no máximo `max_dim` (nunca amplia)."""
     h, w = img.shape[:2]
-    scale = min(MAX_DIM / max(h, w), 1.0)
+    scale = min(max_dim / max(h, w), 1.0)
     if scale < 1.0:
-        img = cv2.resize(img, (int(w * scale), int(h * scale)))
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     return img
 
 
 def _ocr_once(img: np.ndarray) -> tuple[list[str], list[float], float]:
-    result = _reader.readtext(img, detail=1, paragraph=False)
+    """Roda o EasyOCR uma vez, com o canvas interno travado no tamanho real da
+    imagem (teto OCR_CANVAS_CAP) e mag_ratio=1.0 para proibir upscaling — o que
+    evita a explosão de memória do default canvas_size=2560."""
+    h, w = img.shape[:2]
+    canvas = min(max(h, w), OCR_CANVAS_CAP)
+    # canvas_size precisa ser >= 32 para o EasyOCR; thumbs pequenas ainda passam.
+    canvas = max(canvas, 32)
+    result = _reader.readtext(
+        img,
+        detail=1,
+        paragraph=False,
+        canvas_size=canvas,
+        mag_ratio=1.0,
+    )
     lines: list[str] = []
     confs: list[float] = []
     score = 0.0
@@ -125,17 +164,79 @@ def _ocr_once(img: np.ndarray) -> tuple[list[str], list[float], float]:
     return lines, confs, score
 
 
-def ocr_image(img: np.ndarray) -> str:
-    """OCR completo: recorta branco, reescala, testa 4 rotações e escolhe a de
-    texto mais coerente (maior soma de len*confiança)."""
-    img = _resize(_crop_white(img))
-    best: tuple[list[str], float] | None = None
+def _detect_box_count(img: np.ndarray, canvas: int) -> int:
+    """Conta caixas de texto usando SÓ o detector do EasyOCR (CRAFT, sem o passo de
+    reconhecimento, que é o caro). É o sinal barato de orientação."""
+    try:
+        result = _reader.detect(img, canvas_size=canvas, mag_ratio=1.0)
+    except Exception:  # noqa: BLE001 — detecção é best-effort
+        return 0
+    if not result:
+        return 0
+    horizontal = result[0]
+    boxes = horizontal[0] if horizontal else []
+    return len(boxes or [])
+
+
+def _candidate_rotations(img: np.ndarray) -> list[int | None]:
+    """1ª etapa da orientação: roda só o DETECTOR nas 4 rotações de uma miniatura e
+    devolve os ORIENT_CANDIDATES ângulos com mais caixas de texto. Barato (sem
+    reconhecimento). O detector não distingue 0°↔180° nem 90°↔270°, por isso vários
+    candidatos seguem para o reconhecimento."""
+    thumb = _resize(img, ORIENT_DIM)
+    canvas = max(min(max(thumb.shape[:2]), OCR_CANVAS_CAP), 32)
+    scored: list[tuple[int, int | None]] = []
     for code in _ROTATIONS.values():
-        rotated = img if code is None else cv2.rotate(img, code)
-        lines, _confs, score = _ocr_once(rotated)
-        if best is None or score > best[1]:
-            best = (lines, score)
-    return "\n".join(best[0]) if best else ""
+        rotated = thumb if code is None else cv2.rotate(thumb, code)
+        scored.append((_detect_box_count(rotated, canvas), code))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    candidates = [code for _count, code in scored[:ORIENT_CANDIDATES]]
+    return candidates or [None]
+
+
+def _best_rotation(img: np.ndarray) -> int | None:
+    """2ª etapa da orientação: entre os candidatos do detector, roda o RECONHECIMENTO
+    numa miniatura para desambiguar (ex.: 0° vs 180°) e escolhe o de maior score
+    (len×confiança). Retorna o código cv2.rotate (ou None para 0°)."""
+    candidates = _candidate_rotations(img)
+    if len(candidates) == 1:
+        return candidates[0]
+    thumb = _resize(img, ORIENT_DIM)
+    best_code: int | None = candidates[0]
+    best_score = -1.0
+    for code in candidates:
+        rotated = thumb if code is None else cv2.rotate(thumb, code)
+        _lines, _confs, score = _ocr_once(rotated)
+        if score > best_score:
+            best_score = score
+            best_code = code
+    return best_code
+
+
+def ocr_image(img: np.ndarray) -> str:
+    """OCR completo e robusto:
+    1. recorta a borda branca;
+    2. detecta a orientação em 2 etapas baratas (detector nas 4 rotações de uma
+       miniatura → reconhecimento só nos 2 candidatos), preservando a auto-rotação;
+    3. roda o OCR FULL uma única vez na melhor orientação, em MAX_DIM.
+
+    Antes o OCR rodava 4× em alta resolução só para achar a orientação — causa do
+    OOM/lentidão. Agora são 4× detect (barato) + 2× reconhecimento em miniatura +
+    1× reconhecimento full-res.
+
+    Toda a etapa de OCR é protegida por try/except: uma imagem patológica retorna
+    texto vazio + log, em vez de derrubar o worker uvicorn (e com ele o serviço)."""
+    try:
+        cropped = _crop_white(img)
+        best_code = _best_rotation(cropped)
+        full = _resize(cropped, MAX_DIM)
+        if best_code is not None:
+            full = cv2.rotate(full, best_code)
+        lines, _confs, _score = _ocr_once(full)
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001 — guarda de robustez: nunca derrubar o serviço
+        logger.exception("ocr_image falhou; retornando texto vazio para este item")
+        return ""
 
 
 # ──────────────────────────── extração por formato ────────────────────────────
