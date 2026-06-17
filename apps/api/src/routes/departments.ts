@@ -5,6 +5,7 @@ import type { TenantDocument } from '@dmdoc/db-mongo';
 import { ConflictError, NotFoundError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantId, resolveTenantContext } from '../auth/resolve-tenant.js';
+import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 
 interface DepartmentDoc extends TenantDocument {
   parentId: string | null;
@@ -16,6 +17,13 @@ interface DepartmentDoc extends TenantDocument {
 
 const ListDepartmentsQuerySchema = z.object({
   tenantId: z.string().uuid().optional(),
+  // Querystrings chegam como string. `writable=true` ativa o filtro de escrita
+  // (seletor de upload); qualquer outro valor (ou ausência) mantém o
+  // comportamento de gestão (lista todos os departamentos do escopo).
+  writable: z
+    .enum(['true', 'false'])
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 const CreateDepartmentBodySchema = z.object({
@@ -51,7 +59,7 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
    * Demais roles: sempre escopadas ao próprio tenant.
    */
   app.get('/departments', { preHandler: app.authenticate }, async (request, reply) => {
-    const { tenantId: tenantIdParam } = ListDepartmentsQuerySchema.parse(request.query);
+    const { tenantId: tenantIdParam, writable } = ListDepartmentsQuerySchema.parse(request.query);
     const db = app.db;
     const role = request.user?.role;
 
@@ -104,6 +112,35 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
         .sort({ level: 1, name: 1 })
         .limit(1000)
         .toArray()) as unknown as DepartmentDoc[];
+    }
+
+    // Filtro de ESCRITA (?writable=true) — superfície do seletor de upload.
+    // Retorna apenas departamentos em que o ator pode escrever (wiki "Permissões
+    // por departamento (ACL)" → seção "Seletor de departamento no upload"):
+    //   - Admin (TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN): sem restrição
+    //     de ACL — `resolveAccessibleDepartmentIds` retorna `null` e mantemos
+    //     todos os departamentos ATIVOS do escopo já carregados em `items`.
+    //   - UPLOADER / USER: subárvore expandida das raízes concedidas; sem raiz
+    //     concedida → conjunto vazio → resposta `[]` (200, não erro).
+    // `items` já está restrito a `deleted: false`, então a interseção com o
+    // conjunto acessível resulta apenas em departamentos ATIVOS — destino válido
+    // de upload (um soft-deletado dentro da subárvore concedida não aparece).
+    // Sem `writable`, o endpoint mantém o comportamento de gestão (lista tudo).
+    if (writable) {
+      const userId = request.user?.sub;
+      if (typeof userId !== 'string') {
+        throw new Error('userId ausente no contexto da request');
+      }
+      const accessible = await resolveAccessibleDepartmentIds(
+        db,
+        userId,
+        request.tenantId ?? null,
+        role ?? ''
+      );
+      if (accessible !== null) {
+        const accessibleSet = new Set(accessible);
+        items = items.filter((dept) => accessibleSet.has(dept.id));
+      }
     }
 
     // Contagem direta de documentos por departamento. Os departmentIds já estão
