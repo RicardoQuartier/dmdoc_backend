@@ -55,7 +55,7 @@ services:
     # identidade fica bem abaixo disto; o limite só protege contra entradas
     # patológicas. Se atingido, o container reinicia (restart) e o OCR volta —
     # sem derrubar o serviço de forma silenciosa para os demais tenants.
-    mem_limit: 4g
+    mem_limit: 1g
     restart: unless-stopped
     healthcheck:
       test: ['CMD', 'python', '-c', "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
