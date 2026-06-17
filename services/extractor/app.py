@@ -18,8 +18,15 @@ auto-rotação detecta a melhor orientação rodando o OCR numa MINIATURA pequen
 4 ângulos (barato) e depois roda o OCR completo UMA vez, na resolução final, na
 melhor orientação — resolve scans girados (RG digitalizado de lado) sem fazer 4
 passadas de OCR em alta resolução (causa do OOM em scans grandes).
+
+Concorrência: o OCR em CPU é síncrono e pode levar 30-120s. Para não bloquear o
+event loop do uvicorn (e matar o /health), todas as funções de extração com OCR
+são chamadas via asyncio.to_thread(). Um asyncio.Semaphore(1) serializa os jobs
+de OCR, evitando dois OCRs simultâneos que dobrariam a RAM. O endpoint /extract
+tem timeout de REQUEST_TIMEOUT_S segundos; se exceder, devolve HTTP 503.
 """
 
+import asyncio
 import io
 import logging
 import os
@@ -40,6 +47,18 @@ from pptx import Presentation
 logger = logging.getLogger("dmdoc.extractor")
 
 LANGS = os.environ.get("OCR_LANGS", "pt").split(",")
+
+# Timeout máximo (segundos) para o endpoint /extract. Se o processamento exceder
+# esse limite, o endpoint devolve HTTP 503 em vez de prender a conexão
+# indefinidamente. O worker BullMQ tem timeout próprio de 5 min; este guarda-chuva
+# é menor para liberar a thread e devolver uma resposta descritiva.
+REQUEST_TIMEOUT_S = int(os.environ.get("EXTRACT_TIMEOUT_S", "120"))
+
+# Semáforo global que serializa jobs de OCR. OCR em CPU não tem ganho real de
+# paralelismo (afinal é single-threaded no PyTorch), mas consome ~1-2 GiB por job.
+# Limitar a 1 job simultâneo é a forma mais simples de manter o pico de RAM
+# previsível, sem depender de filas externas.
+_ocr_semaphore = asyncio.Semaphore(1)
 
 # Mapeamento content-type → extensão de arquivo para conversão Office→PDF.
 OFFICE_EXTENSIONS: dict[str, str] = {
@@ -377,45 +396,78 @@ def health() -> dict:
     return {"status": "ok", "langs": LANGS}
 
 
+def _dispatch_extract(data: bytes, mime: str, name: str) -> dict:
+    """Despacha a extração para o handler correto com base no MIME/nome do arquivo.
+    Função síncrona; chamada via asyncio.to_thread() pelo endpoint /extract."""
+    if mime == "application/pdf" or name.endswith(".pdf"):
+        return extract_pdf(data)
+    if mime in ("image/jpeg", "image/png") or name.endswith((".jpg", ".jpeg", ".png")):
+        return extract_image(data)
+    if "wordprocessingml" in mime or name.endswith(".docx"):
+        return extract_docx(data)
+    if "spreadsheetml" in mime or name.endswith(".xlsx"):
+        return extract_xlsx(data)
+    if "presentationml" in mime or name.endswith(".pptx"):
+        return extract_pptx(data)
+    if mime == "application/msword" or name.endswith(".doc"):
+        pdf = _libreoffice_to_pdf(data, ".doc")
+        return extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
+    if mime == "application/vnd.ms-excel" or name.endswith(".xls"):
+        pdf = _libreoffice_to_pdf(data, ".xls")
+        return extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
+    if mime == "application/vnd.ms-powerpoint" or name.endswith(".ppt"):
+        pdf = _libreoffice_to_pdf(data, ".ppt")
+        return extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
+    if mime in ("text/rtf", "application/rtf") or name.endswith(".rtf"):
+        pdf = _libreoffice_to_pdf(data, ".rtf")
+        return extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
+    if mime == "text/plain" or name.endswith(".txt"):
+        return extract_txt(data)
+    if mime.startswith("video/") or mime.startswith("audio/") or name.endswith(
+        (".mp4", ".avi", ".mov", ".mkv", ".webm", ".3gp", ".mp3", ".m4a")
+    ):
+        return {"text": "", "pageCount": 1, "ocrPages": []}
+    return {"text": "", "pageCount": 1, "ocrPages": [], "error": f"unsupported mime: {mime}"}
+
+
 @app.post("/extract")
 async def extract(
     file: UploadFile = File(...),
     content_type: str = Form(default=""),
 ) -> dict:
+    """Extrai texto do documento recebido.
+
+    - Corre no ThreadPoolExecutor via asyncio.to_thread() para não bloquear o
+      event loop do uvicorn durante OCR em CPU (30-120s num scan de identidade).
+      Isso garante que GET /health continue respondendo e o healthcheck do Docker
+      não dispare reinícios desnecessários.
+    - O asyncio.Semaphore(1) serializa jobs de OCR: nunca dois OCRs simultâneos,
+      evitando pico duplo de RAM.
+    - REQUEST_TIMEOUT_S: se o processamento ultrapassar o limite, devolve HTTP 503
+      com mensagem descritiva, em vez de prender a conexão indefinidamente.
+    """
     data = await file.read()
     mime = content_type or file.content_type or ""
     name = (file.filename or "").lower()
 
-    if mime == "application/pdf" or name.endswith(".pdf"):
-        out = extract_pdf(data)
-    elif mime in ("image/jpeg", "image/png") or name.endswith((".jpg", ".jpeg", ".png")):
-        out = extract_image(data)
-    elif "wordprocessingml" in mime or name.endswith(".docx"):
-        out = extract_docx(data)
-    elif "spreadsheetml" in mime or name.endswith(".xlsx"):
-        out = extract_xlsx(data)
-    elif "presentationml" in mime or name.endswith(".pptx"):
-        out = extract_pptx(data)
-    elif mime == "application/msword" or name.endswith(".doc"):
-        pdf = _libreoffice_to_pdf(data, ".doc")
-        out = extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
-    elif mime == "application/vnd.ms-excel" or name.endswith(".xls"):
-        pdf = _libreoffice_to_pdf(data, ".xls")
-        out = extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
-    elif mime == "application/vnd.ms-powerpoint" or name.endswith(".ppt"):
-        pdf = _libreoffice_to_pdf(data, ".ppt")
-        out = extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
-    elif mime in ("text/rtf", "application/rtf") or name.endswith(".rtf"):
-        pdf = _libreoffice_to_pdf(data, ".rtf")
-        out = extract_pdf(pdf) if pdf else {"text": "", "pageCount": 1, "ocrPages": []}
-    elif mime == "text/plain" or name.endswith(".txt"):
-        out = extract_txt(data)
-    elif mime.startswith("video/") or mime.startswith("audio/") or name.endswith(
-        (".mp4", ".avi", ".mov", ".mkv", ".webm", ".3gp", ".mp3", ".m4a")
-    ):
-        out = {"text": "", "pageCount": 1, "ocrPages": []}
-    else:
-        out = {"text": "", "pageCount": 1, "ocrPages": [], "error": f"unsupported mime: {mime}"}
+    async def _run() -> dict:
+        async with _ocr_semaphore:
+            return await asyncio.to_thread(_dispatch_extract, data, mime, name)
+
+    try:
+        out = await asyncio.wait_for(_run(), timeout=REQUEST_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.error(
+            "extract timeout após %ds: mime=%s name=%s bytes=%d",
+            REQUEST_TIMEOUT_S, mime, name, len(data),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"extração excedeu o tempo limite de {REQUEST_TIMEOUT_S}s — "
+                "documento muito grande ou OCR lento demais neste ambiente"
+            ),
+        )
 
     out["engine"] = "python"
     return out
