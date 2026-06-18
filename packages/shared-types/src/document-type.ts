@@ -31,6 +31,10 @@ export type IndexField = z.infer<typeof IndexFieldSchema>;
  *
  * Unicidade `(tenantId, name)` por índice. Segue exclusão lógica (`deleted`).
  * Ver wiki "Tipos de documento globais e por empresa". Spec §5.3.
+ *
+ * Campo `departmentIds`: aplicável apenas a tipos de empresa (`isGlobal: false`).
+ * Tipos globais nunca têm `departmentIds`. A validação condicional (obrigatório
+ * quando `isGlobal: false`) é feita nos schemas de input da API, não aqui.
  */
 export const DocumentTypeSchema = z.object({
   id: z.string().uuid(),
@@ -41,6 +45,7 @@ export const DocumentTypeSchema = z.object({
   deleted: z.boolean(),
   createdAt: z.date(),
   indexFields: z.array(IndexFieldSchema),
+  departmentIds: z.array(z.string().uuid()).optional(),
 });
 
 export type DocumentType = z.infer<typeof DocumentTypeSchema>;

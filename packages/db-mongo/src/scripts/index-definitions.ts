@@ -41,6 +41,7 @@ export const REGULAR_INDEXES: Readonly<Record<string, readonly RegularIndex[]>> 
   document_types: [
     { keys: { tenantId: 1 }, options: { name: 'by_tenant' } },
     { keys: { tenantId: 1, name: 1 }, options: { name: 'uniq_tenant_name', unique: true } },
+    { keys: { tenantId: 1, departmentIds: 1 }, options: { name: 'by_tenant_departments' } },
   ],
   documents: [
     {
