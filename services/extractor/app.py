@@ -35,9 +35,22 @@ import tempfile
 import zipfile
 
 import cv2
+import torch
 import easyocr
 import fitz  # PyMuPDF
 import numpy as np
+
+# Backend quantizado do PyTorch. O modelo de reconhecimento do EasyOCR usa
+# quantização dinâmica (qlinear_dynamic). O backend padrão 'onednn' (e o
+# alternativo 'fbgemm') emitem kernels AVX2/FMA — que QUEBRAM com SIGILL
+# (exit 132) em CPUs antigas como Ivy Bridge (i3 3ª geração: AVX sim,
+# AVX2/FMA não). O 'qnnpack' é o backend portátil (originalmente para ARM)
+# e roda no x86 sem AVX2. Mais lento, porém universal — sem ele a inferência
+# derruba o container assim que recebe a primeira imagem. Complementa o
+# ATEN_CPU_CAPABILITY=default do docker-compose, que só cobre os kernels
+# não-quantizados do ATen.
+if "qnnpack" in torch.backends.quantized.supported_engines:
+    torch.backends.quantized.engine = "qnnpack"
 from docx import Document as DocxDocument
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
