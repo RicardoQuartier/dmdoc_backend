@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
+import type { Db } from 'mongodb';
 import { z } from 'zod';
 import { TenantRepository, newId } from '@dmdoc/db-mongo';
 import type { IndexField } from '@dmdoc/shared-types';
@@ -166,7 +167,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     }
 
     // Resolve nomes dos departamentos: coleta todos os departmentIds únicos
-    // de todos os tipos retornados e faz um único lookup.
+    // de todos os tipos retornados e faz um único lookup em batch.
     const allDeptIds = new Set<string>();
     for (const item of items) {
       const deptIds = item['departmentIds'] as string[] | undefined;
@@ -231,7 +232,12 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       };
       await db.collection('document_types').insertOne(docType);
       request.log.info({ documentTypeId: id }, 'tipo de documento global criado');
-      return reply.status(201).send(stripMongoId(docType as unknown as Record<string, unknown>));
+      // Tipos globais não têm departamentos — enrichWithDepartments retorna departments: [].
+      const enrichedGlobal = await enrichWithDepartments(
+        docType as unknown as Record<string, unknown>,
+        db as Db
+      );
+      return reply.status(201).send(enrichedGlobal);
     }
 
     const effectiveTenantId = resolveTenantId(request, body.tenantId, true);
@@ -268,7 +274,11 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     });
 
     request.log.info({ tenantId, documentTypeId: docType.id }, 'tipo de documento criado');
-    return reply.status(201).send(docType);
+    const enrichedDocType = await enrichWithDepartments(
+      docType as unknown as Record<string, unknown>,
+      db as Db
+    );
+    return reply.status(201).send(enrichedDocType);
   });
 
   /**
@@ -304,7 +314,12 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       );
       if (!result) throw new NotFoundError();
       request.log.info({ documentTypeId: id }, 'tipo de documento global atualizado');
-      return reply.status(200).send(stripMongoId(result as Record<string, unknown>));
+      // Tipos globais não têm departamentos — enrichWithDepartments retorna departments: [].
+      const enrichedGlobalPatch = await enrichWithDepartments(
+        result as Record<string, unknown>,
+        db as Db
+      );
+      return reply.status(200).send(enrichedGlobalPatch);
     }
 
     const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
@@ -331,7 +346,11 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     if (!updated) throw new NotFoundError();
 
     request.log.info({ tenantId, documentTypeId: id }, 'tipo de documento atualizado');
-    return reply.status(200).send(updated);
+    const enrichedUpdated = await enrichWithDepartments(
+      updated as unknown as Record<string, unknown>,
+      db as Db
+    );
+    return reply.status(200).send(enrichedUpdated);
   });
 
   /**
@@ -559,4 +578,36 @@ function removeUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> 
     }
   }
   return result;
+}
+
+/**
+ * Enriquece um único tipo de documento com o campo `departments: [{id, name}]`,
+ * resolvendo os nomes a partir da coleção `departments` do banco.
+ *
+ * Tipos globais (sem departmentIds) retornam sempre `departments: []`.
+ * Tipos de empresa retornam um objeto por departmentId com o nome resolvido;
+ * IDs sem documento correspondente (ex.: departamento soft-deleted) ficam com
+ * `name: ''` para não quebrar a resposta.
+ */
+async function enrichWithDepartments(
+  doc: Record<string, unknown>,
+  db: Db
+): Promise<Record<string, unknown>> {
+  const stripped = stripMongoId(doc);
+  const deptIds = stripped['departmentIds'] as string[] | undefined;
+
+  if (!Array.isArray(deptIds) || deptIds.length === 0) {
+    return { ...stripped, departments: [] };
+  }
+
+  const deptDocs = await db
+    .collection('departments')
+    .find({ id: { $in: deptIds }, deleted: false })
+    .project<DepartmentNameDoc>({ _id: 0, id: 1, name: 1 })
+    .toArray();
+
+  const nameMap = new Map<string, string>(deptDocs.map((d) => [d.id, d.name]));
+  const departments = deptIds.map((deptId) => ({ id: deptId, name: nameMap.get(deptId) ?? '' }));
+
+  return { ...stripped, departments };
 }
