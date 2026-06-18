@@ -55,7 +55,7 @@ const EnvSchema = z.object({
   MAX_UPLOAD_MB: z.coerce.number().int().positive().default(50),
 
   // Extractor Python — conversão de documentos Office→PDF para preview.
-  EXTRACTOR_URL: z.string().url().default('http://localhost:8000'),
+  EXTRACTOR_URL: z.string().url().default('http://localhost:5056/extract'),
 
   // LLM — geração de resposta RAG (spec §12).
   // LLM_PROVIDER=openai | openrouter

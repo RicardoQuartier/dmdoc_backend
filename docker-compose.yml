@@ -138,6 +138,7 @@ services:
       AWS_S3_BUCKET: dmdoc-documents
       AWS_REGION: us-east-1
       S3_FORCE_PATH_STYLE: 'true'
+      EXTRACTOR_URL: http://extractor:8000/extract
       CHOKIDAR_USEPOLLING: 'true'
     ports:
       - '5051:5051'
