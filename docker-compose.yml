@@ -48,6 +48,12 @@ services:
       # 'avx512' aqui — 'default' força o baseline (sem AVX2), única opção que roda
       # nessas CPUs. Mais lento no OCR, porém universal.
       ATEN_CPU_CAPABILITY: default
+      # Teto de tempo por requisição /extract. Default do app é 120s, suficiente
+      # para CPUs modernas. Neste ambiente (Ivy Bridge + backend quantizado
+      # qnnpack — ver app.py) o OCR roda sem AVX2/FMA e é bem mais lento; um
+      # .docx com 3-4 imagens embutidas já passa de 120s. Worker tem timeout
+      # próprio de 600s, então 480s deixa folga sem mascarar travamento real.
+      EXTRACT_TIMEOUT_S: '480'
     ports:
       - '5056:8000'
     # Guard-rail de memória: teto previsível para o OOM. Com a detecção de
