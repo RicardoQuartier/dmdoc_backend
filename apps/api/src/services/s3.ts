@@ -99,13 +99,22 @@ export class S3Service {
   /**
    * Gera uma URL pré-assinada para download do objeto.
    *
-   * @param key             Chave do objeto no bucket
-   * @param expiresInSeconds Validade em segundos (padrão: 3600 = 1 hora)
+   * @param key               Chave do objeto no bucket
+   * @param expiresInSeconds  Validade em segundos (padrão: 3600 = 1 hora)
+   * @param contentDisposition Valor do header `Content-Disposition` a embutir na URL
+   *                           assinada. Quando presente, o S3/MinIO injeta o header na
+   *                           resposta — útil para forçar download com nome de arquivo
+   *                           (`attachment; filename="..."`) em vez de abrir inline.
    */
-  async getSignedDownloadUrl(key: string, expiresInSeconds = 3600): Promise<string> {
+  async getSignedDownloadUrl(
+    key: string,
+    expiresInSeconds = 3600,
+    contentDisposition?: string
+  ): Promise<string> {
     const command = new GetObjectCommand({
       Bucket: this.bucket,
       Key: key,
+      ...(contentDisposition !== undefined && { ResponseContentDisposition: contentDisposition }),
     });
     return getSignedUrl(this.presignClient, command, { expiresIn: expiresInSeconds });
   }

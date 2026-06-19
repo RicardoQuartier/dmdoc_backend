@@ -75,6 +75,11 @@ interface IndexFieldDoc {
 // Schemas para novas rotas
 // ---------------------------------------------------------------------------
 
+/** Schema dos query params do GET /documents/:id/download. */
+const DownloadQuerySchema = z.object({
+  open: z.coerce.boolean().optional(),
+});
+
 /** Schema dos query params do GET /documents. */
 const ListDocumentsQuerySchema = z.object({
   tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas — filtrar por tenant específico
@@ -990,9 +995,16 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     // ------------------------------------------------------------------
     // 3. Gerar URL assinada (5 minutos = 300 segundos)
+    //    ?open=true → ResponseContentDisposition=attachment para que o SO
+    //    abra o arquivo com o app padrão em vez de exibi-lo inline no browser.
     // ------------------------------------------------------------------
+    const { open } = DownloadQuerySchema.parse(request.query);
     const expiresInSeconds = 300;
-    const url = await app.s3.getSignedDownloadUrl(doc.s3Key, expiresInSeconds);
+    const contentDisposition =
+      open === true
+        ? `attachment; filename="${encodeURIComponent(doc.originalFilename)}"`
+        : undefined;
+    const url = await app.s3.getSignedDownloadUrl(doc.s3Key, expiresInSeconds, contentDisposition);
     const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
 
     // ------------------------------------------------------------------
