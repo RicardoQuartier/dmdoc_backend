@@ -115,6 +115,13 @@ CONTENT_THRESHOLD = 220
 # (com camada de texto). Abaixo disso, a página é tratada como escaneada → OCR.
 MIN_PAGE_ALNUM = 20
 
+# MIMEs e extensões de imagem suportados pelo cv2.imdecode (libwebp embutida).
+_IMAGE_MIMES = frozenset({
+    "image/jpeg", "image/png", "image/webp",
+    "image/gif", "image/bmp", "image/tiff", "image/tif",
+})
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif")
+
 _ROTATIONS = {
     0: None,
     90: cv2.ROTATE_90_CLOCKWISE,
@@ -355,7 +362,7 @@ def extract_docx(data: bytes) -> dict:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             for name in zf.namelist():
                 if name.startswith("word/media/") and name.lower().endswith(
-                    (".png", ".jpg", ".jpeg")
+                    (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif")
                 ):
                     img = cv2.imdecode(np.frombuffer(zf.read(name), np.uint8), cv2.IMREAD_COLOR)
                     if img is not None:
@@ -414,7 +421,7 @@ def _dispatch_extract(data: bytes, mime: str, name: str) -> dict:
     Função síncrona; chamada via asyncio.to_thread() pelo endpoint /extract."""
     if mime == "application/pdf" or name.endswith(".pdf"):
         return extract_pdf(data)
-    if mime in ("image/jpeg", "image/png") or name.endswith((".jpg", ".jpeg", ".png")):
+    if mime in _IMAGE_MIMES or name.endswith(_IMAGE_EXTS):
         return extract_image(data)
     if "wordprocessingml" in mime or name.endswith(".docx"):
         return extract_docx(data)
