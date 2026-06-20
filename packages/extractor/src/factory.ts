@@ -1,43 +1,25 @@
-import { PythonExtractor, type PythonExtractorConfig } from './python.js';
+import { RedisExtractor, type RedisExtractorConfig } from './redis-extractor.js';
 import { type ExtractorProvider } from './types.js';
 
-export type ExtractorType = 'python';
+export type ExtractorType = 'redis';
 
 export interface ExtractorConfig {
   type: ExtractorType;
-  /** Obrigatório quando type === 'python'. */
-  python?: PythonExtractorConfig;
+  /** Obrigatório quando type === 'redis'. */
+  redis?: RedisExtractorConfig;
 }
 
-/**
- * Fábrica de extractores.
- *
- * Toda a extração é delegada ao microserviço Python (PyMuPDF/docx/xlsx/pptx +
- * EasyOCR), que cobre todos os formatos em dev e prod. A configuração é sempre
- * injetada pelo chamador (worker/config.ts via Zod); este pacote nunca lê
- * `process.env` diretamente.
- *
- * @example
- * ```ts
- * const extractor = createExtractor({
- *   type: 'python',
- *   python: { url: env.EXTRACTOR_URL },
- * });
- * const result = await extractor.extract('/tmp/doc.pdf', 'application/pdf');
- * ```
- */
 export function createExtractor(config: ExtractorConfig): ExtractorProvider {
   switch (config.type) {
-    case 'python': {
-      const pythonConfig = config.python;
-      if (!pythonConfig) {
-        throw new Error('createExtractor: python config is required when type is "python"');
+    case 'redis': {
+      const redisConfig = config.redis;
+      if (!redisConfig) {
+        throw new Error('createExtractor: redis config is required when type is "redis"');
       }
-      return new PythonExtractor(pythonConfig);
+      return new RedisExtractor(redisConfig);
     }
 
     default: {
-      // Garante exhaustiveness em TypeScript
       const _exhaustive: never = config.type;
       throw new Error(`createExtractor: unknown extractor type "${String(_exhaustive)}"`);
     }

@@ -20,14 +20,20 @@ export interface ExtractionResult {
 }
 
 /**
+ * Entrada para extração de documento — endereça o arquivo via S3.
+ * O extractor é responsável por buscar o conteúdo diretamente do storage.
+ */
+export interface ExtractInput {
+  s3Key: string;
+  s3Bucket: string;
+  mimeType: string;
+}
+
+/**
  * Contrato de todo extrator de documentos.
- *
- * As implementações recebem o caminho local do arquivo (já baixado do S3)
- * e o MIME type detectado. Não lêem variáveis de ambiente diretamente —
- * configuração é injetada pelo chamador via fábrica `createExtractor`.
  */
 export interface ExtractorProvider {
-  extract(filePath: string, mimeType: string): Promise<ExtractionResult>;
+  extract(input: ExtractInput): Promise<ExtractionResult>;
 }
 
 /**

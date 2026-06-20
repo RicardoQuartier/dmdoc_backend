@@ -3,36 +3,37 @@
 Substitui o Unstructured e o NativeExtractor (Node): um único serviço que extrai
 texto de todos os formatos suportados, com OCR de alta qualidade para scans.
 
-Endpoint: POST /extract  (multipart: file + content_type)
-Resposta: { text, pageCount, ocrPages: [int], engine: "python" }
+Modos de operação:
+  - Fila Redis (primário): consumer loop BRPOP em 'extract:requests'; baixa o
+    arquivo do S3 diretamente; publica resultado em 'extract:result:{requestId}'.
+    Elimina timeout HTTP — o worker aguarda via BLPOP sem limite de tempo.
+  - Endpoint HTTP /extract (legado): mantido para compatibilidade e testes manuais.
+  - Endpoint HTTP /convert/pdf: conversão Office→PDF para preview, não afetado.
 
 Dispatch por formato:
 - PDF   → PyMuPDF (texto nativo); páginas escaneadas (sem texto) caem para OCR
-- JPG/PNG → OCR (EasyOCR) com remoção de borda branca + auto-rotação
+- JPG/PNG/WebP → OCR (EasyOCR) com remoção de borda branca + auto-rotação
 - DOCX  → python-docx (parágrafos + tabelas) + OCR de imagens embutidas
 - XLSX  → openpyxl (células por planilha)
 - PPTX  → python-pptx (texto dos slides)
 
-OCR: o EasyOCR não recusa documentos de identidade (ao contrário de LLMs). A
-auto-rotação detecta a melhor orientação rodando o OCR numa MINIATURA pequena nos
-4 ângulos (barato) e depois roda o OCR completo UMA vez, na resolução final, na
-melhor orientação — resolve scans girados (RG digitalizado de lado) sem fazer 4
-passadas de OCR em alta resolução (causa do OOM em scans grandes).
-
-Concorrência: o OCR em CPU é síncrono e pode levar 30-120s. Para não bloquear o
-event loop do uvicorn (e matar o /health), todas as funções de extração com OCR
-são chamadas via asyncio.to_thread(). Um asyncio.Semaphore(1) serializa os jobs
-de OCR, evitando dois OCRs simultâneos que dobrariam a RAM. O endpoint /extract
-tem timeout de REQUEST_TIMEOUT_S segundos; se exceder, devolve HTTP 503.
+OCR: auto-rotação em 2 etapas baratas (detector nas 4 rotações de miniatura →
+reconhecimento só nos 2 candidatos) + OCR full-res 1×. Resolve scans girados
+sem fazer 4 passadas em alta resolução (causa de OOM).
 """
 
 import asyncio
 import io
+import json
 import logging
 import os
 import subprocess
 import tempfile
+import threading
 import zipfile
+
+import boto3
+import redis as redis_lib
 
 import cv2
 import torch
@@ -58,14 +59,29 @@ from openpyxl import load_workbook
 from pptx import Presentation
 
 logger = logging.getLogger("dmdoc.extractor")
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("%(levelname)-8s %(name)s - %(message)s"))
+logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 LANGS = os.environ.get("OCR_LANGS", "pt").split(",")
 
-# Timeout máximo (segundos) para o endpoint /extract. Se o processamento exceder
-# esse limite, o endpoint devolve HTTP 503 em vez de prender a conexão
-# indefinidamente. O worker BullMQ tem timeout próprio de 5 min; este guarda-chuva
-# é menor para liberar a thread e devolver uma resposta descritiva.
+# Timeout máximo (segundos) para o endpoint /extract legado (HTTP direto).
+# O consumer Redis não usa este timeout — processa sem limite de tempo.
 REQUEST_TIMEOUT_S = int(os.environ.get("EXTRACT_TIMEOUT_S", "120"))
+
+# Configuração do consumer Redis
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "")
+S3_BUCKET = os.environ.get("S3_BUCKET", "dmdoc-documents")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+# TTL do result key no Redis — cleanup automático se o worker morrer antes de ler.
+RESULT_KEY_TTL_SECS = 3600
+EXTRACT_REQUEST_QUEUE = "extract:requests"
+EXTRACT_RESULT_PREFIX = "extract:result:"
 
 # Semáforo global que serializa jobs de OCR. OCR em CPU não tem ganho real de
 # paralelismo (afinal é single-threaded no PyTorch), mas consome ~1-2 GiB por job.
@@ -132,6 +148,105 @@ _ROTATIONS = {
 _reader = easyocr.Reader(LANGS, gpu=False)
 
 app = FastAPI(title="DMDoc Extractor", version="1.0.0")
+
+
+# ──────────────────────────── Redis consumer ────────────────────────────
+
+
+def _make_s3_client():
+    kwargs = dict(
+        region_name=AWS_REGION,
+        aws_access_key_id=AWS_ACCESS_KEY_ID or None,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY or None,
+    )
+    if S3_ENDPOINT:
+        kwargs["endpoint_url"] = S3_ENDPOINT
+    return boto3.client("s3", **kwargs)
+
+
+def _extraction_consumer_loop() -> None:
+    """Consumer Redis que processa pedidos de extração sem timeout HTTP.
+
+    Roda em thread background (daemon=True) iniciada no startup do FastAPI.
+    BRPOP bloqueia indefinidamente até chegar um pedido; processa um job por vez,
+    serializando OCR naturalmente sem necessidade de asyncio.Semaphore.
+    Em erro de conexão: dorme 5s e reconecta.
+    Em erro de extração: publica {error} no result key para o worker não ficar preso.
+    """
+    import time
+
+    rconn = redis_lib.from_url(REDIS_URL, decode_responses=True)
+    s3 = _make_s3_client()
+    logger.info("extraction consumer loop iniciado (fila=%s)", EXTRACT_REQUEST_QUEUE)
+
+    while True:
+        try:
+            item = rconn.brpop(EXTRACT_REQUEST_QUEUE, timeout=0)
+            if item is None:
+                continue
+
+            _, raw = item
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                logger.error("payload JSON inválido na fila: %.200s — %s", raw, exc)
+                continue
+
+            request_id = payload.get("requestId", "")
+            s3_key = payload.get("s3Key", "")
+            s3_bucket = payload.get("s3Bucket", S3_BUCKET)
+            mime = payload.get("mimeType", "")
+            result_key = f"{EXTRACT_RESULT_PREFIX}{request_id}"
+
+            logger.info(
+                "extraindo requestId=%s s3Key=%s mime=%s",
+                request_id, s3_key, mime,
+            )
+
+            try:
+                s3_resp = s3.get_object(Bucket=s3_bucket, Key=s3_key)
+                data = s3_resp["Body"].read()
+                name = s3_key.split("/")[-1].lower()
+                result = _dispatch_extract(data, mime, name)
+                result["engine"] = "python"
+                out = json.dumps(result)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "falha ao processar requestId=%s s3Key=%s: %s",
+                    request_id, s3_key, exc,
+                )
+                out = json.dumps({"error": str(exc), "text": "", "pageCount": 1, "ocrPages": []})
+
+            pipe = rconn.pipeline()
+            pipe.rpush(result_key, out)
+            pipe.expire(result_key, RESULT_KEY_TTL_SECS)
+            pipe.execute()
+            logger.info("resultado publicado requestId=%s", request_id)
+
+        except redis_lib.exceptions.ConnectionError as exc:
+            logger.error(
+                "Redis connection error no consumer loop: %s — reconectando em 5s", exc
+            )
+            time.sleep(5)
+            try:
+                rconn = redis_lib.from_url(REDIS_URL, decode_responses=True)
+                s3 = _make_s3_client()
+            except Exception:  # noqa: BLE001
+                logger.exception("falha ao reconectar Redis/S3")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("erro inesperado no consumer loop: %s", exc)
+            time.sleep(1)
+
+
+@app.on_event("startup")
+def _start_consumer() -> None:
+    t = threading.Thread(
+        target=_extraction_consumer_loop,
+        daemon=True,
+        name="extraction-consumer",
+    )
+    t.start()
+    logger.info("extraction consumer thread iniciado")
 
 
 # ──────────────────────────── OCR ────────────────────────────

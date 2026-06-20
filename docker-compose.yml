@@ -34,9 +34,8 @@ services:
 
   # Microserviço de extração de texto (Python) — unifica TODOS os formatos:
   # PyMuPDF (PDF), python-docx (DOCX), openpyxl (XLSX), python-pptx (PPTX) e
-  # EasyOCR para scans/imagens (RG, CNH, certificados). Substitui o Unstructured
-  # e o NativeExtractor. Não recusa documentos de identidade (ao contrário de LLMs)
-  # e corrige rotação. Chamado por HTTP pelo worker.
+  # EasyOCR para scans/imagens (RG, CNH, certificados). Comunicação via fila Redis
+  # (BRPOP extract:requests → download S3 → RPUSH extract:result:{id}) — sem timeout HTTP.
   extractor:
     build:
       context: ./services/extractor
@@ -48,21 +47,22 @@ services:
       # 'avx512' aqui — 'default' força o baseline (sem AVX2), única opção que roda
       # nessas CPUs. Mais lento no OCR, porém universal.
       ATEN_CPU_CAPABILITY: default
-      # Teto de tempo por requisição /extract. Default do app é 120s, suficiente
-      # para CPUs modernas. Neste ambiente (Ivy Bridge + backend quantizado
-      # qnnpack — ver app.py) o OCR roda sem AVX2/FMA e é bem mais lento; um
-      # .docx com 3-4 imagens embutidas já passa de 120s. Worker tem timeout
-      # próprio de 600s, então 480s deixa folga sem mascarar travamento real.
       EXTRACT_TIMEOUT_S: '480'
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: dmdoc-documents
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
     ports:
       - '5056:8000'
-    # Guard-rail de memória: teto previsível para o OOM. Com a detecção de
-    # orientação por miniatura + canvas do EasyOCR travado, o pico de um scan de
-    # identidade fica bem abaixo disto; o limite só protege contra entradas
-    # patológicas. Se atingido, o container reinicia (restart) e o OCR volta —
-    # sem derrubar o serviço de forma silenciosa para os demais tenants.
     mem_limit: 1g
     restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ['CMD', 'python', '-c', "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
       interval: 30s
@@ -174,8 +174,7 @@ services:
       AWS_S3_BUCKET: dmdoc-documents
       AWS_REGION: us-east-1
       S3_FORCE_PATH_STYLE: 'true'
-      EXTRACTOR: python
-      EXTRACTOR_URL: http://extractor:8000/extract
+      EXTRACT_BLPOP_TIMEOUT_SECS: '7200'
       CHOKIDAR_USEPOLLING: 'true'
     volumes:
       - .:/app

@@ -1,5 +1,4 @@
 import type { Job } from 'bullmq';
-import type { S3Client } from '@aws-sdk/client-s3';
 import type { Db } from 'mongodb';
 import type { Logger } from 'pino';
 import OpenAI from 'openai';
@@ -11,7 +10,6 @@ import { embedChunks } from './embed.js';
 import { persistProcessingResult } from './persist.js';
 
 export interface PipelineDeps {
-  s3: S3Client;
   s3Bucket: string;
   extractor: ExtractorProvider;
   openai: OpenAI;
@@ -44,7 +42,6 @@ export async function runPipeline(
 ): Promise<void> {
   const { tenantId, documentId } = job.data;
   const {
-    s3,
     s3Bucket,
     extractor,
     openai,
@@ -64,7 +61,6 @@ export async function runPipeline(
   try {
     // Etapa 1: Extração de texto
     const extractResult = await extractDocument(job.data, {
-      s3,
       s3Bucket,
       extractor,
       db,

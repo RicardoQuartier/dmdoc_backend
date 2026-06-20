@@ -1,5 +1,5 @@
 import { Worker, type Job } from 'bullmq';
-import { S3Client } from '@aws-sdk/client-s3';
+import { Redis } from 'ioredis';
 import OpenAI from 'openai';
 import { MongoDbClient } from '@dmdoc/db-mongo';
 import { createExtractor } from '@dmdoc/extractor';
@@ -16,27 +16,6 @@ import { runPipeline, type PipelineDeps } from './pipeline/index.js';
 const WORKER_CONCURRENCY = 5;
 
 /**
- * Cria o cliente S3 com as configurações do ambiente.
- * `endpoint` é opcional — usado para MinIO em dev ou S3-compatible em prod.
- */
-function createS3Client(): S3Client {
-  return new S3Client({
-    region: config.AWS_REGION,
-    ...(config.S3_ENDPOINT
-    ? { endpoint: config.S3_ENDPOINT, forcePathStyle: config.S3_FORCE_PATH_STYLE }
-    : {}),
-    ...(config.AWS_ACCESS_KEY_ID && config.AWS_SECRET_ACCESS_KEY
-      ? {
-          credentials: {
-            accessKeyId: config.AWS_ACCESS_KEY_ID,
-            secretAccessKey: config.AWS_SECRET_ACCESS_KEY,
-          },
-        }
-      : {}),
-  });
-}
-
-/**
  * Cria o processor do BullMQ que valida e executa o pipeline completo.
  *
  * As deps são construídas uma única vez no boot e injetadas em cada job.
@@ -45,7 +24,6 @@ function createS3Client(): S3Client {
 function createDocumentProcessor(deps: PipelineDeps) {
   return async (job: Job<DocumentProcessingJobData>): Promise<void> => {
     // Validar payload do job na borda do worker (spec §8)
-    // Mutamos job.data para garantir que os tipos Zod estão validados
     job.data = DocumentProcessingJobDataSchema.parse(job.data);
     await runPipeline(job, deps);
   };
@@ -53,9 +31,6 @@ function createDocumentProcessor(deps: PipelineDeps) {
 
 /**
  * Cria o Worker BullMQ ligado à fila de processamento de documentos.
- *
- * As deps (MongoDB, S3, OpenAI, extractor) são passadas por injeção para
- * permitir testes sem recursos reais.
  */
 export function createDocumentWorker(
   deps: PipelineDeps
@@ -93,11 +68,11 @@ export function createDocumentWorker(
 }
 
 /**
- * Entrypoint do worker. Inicializa todas as dependências (MongoDB, S3, OpenAI,
- * extractor) e cria o Worker BullMQ.
+ * Entrypoint do worker. Inicializa todas as dependências e cria o Worker BullMQ.
  *
- * Erros não tratados são logados; o processo não é derrubado por falha de job
- * individual (spec §8: "worker nunca derruba o processo").
+ * O extractor usa comunicação assíncrona via Redis: o worker enfileira pedidos em
+ * `extract:requests` e aguarda resultados via BLPOP em `extract:result:{requestId}`.
+ * Isso elimina o timeout HTTP e permite que o Python processe no seu próprio ritmo.
  */
 async function main(): Promise<void> {
   logger.info('inicializando dependências do worker');
@@ -107,29 +82,30 @@ async function main(): Promise<void> {
   const db = mongoClient.getDb();
   logger.info({ db: config.MONGO_DB }, 'MongoDB conectado');
 
-  // S3
-  const s3 = createS3Client();
-  logger.info({ bucket: config.AWS_S3_BUCKET, region: config.AWS_REGION }, 'S3 client criado');
-
   // OpenAI (embeddings)
   const openai = new OpenAI({
     apiKey: config.OPENAI_API_KEY ?? '',
   });
   logger.info({ model: config.EMBEDDING_MODEL }, 'OpenAI client criado');
 
-  // Extractor — microserviço unificado em Python (PyMuPDF/docx/xlsx/pptx + EasyOCR).
-  const extractorUrl = config.EXTRACTOR_URL ?? 'http://localhost:8000/extract';
+  // Conexão Redis dedicada para RPUSH de pedidos de extração.
+  // Separada da conexão BullMQ para não interferir com os comandos bloqueantes do Worker.
+  const extractionPushConn = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null });
+
   const extractor = createExtractor({
-    type: 'python',
-    python: { url: extractorUrl, timeoutMs: config.EXTRACTOR_TIMEOUT_MS },
+    type: 'redis',
+    redis: {
+      redisUrl: config.REDIS_URL,
+      blpopTimeoutSecs: config.EXTRACT_BLPOP_TIMEOUT_SECS,
+      pushConnection: extractionPushConn,
+    },
   });
   logger.info(
-    { extractor: config.EXTRACTOR, extractorUrl, timeoutMs: config.EXTRACTOR_TIMEOUT_MS },
-    'extractor criado'
+    { blpopTimeoutSecs: config.EXTRACT_BLPOP_TIMEOUT_SECS },
+    'extractor Redis criado'
   );
 
   const deps: PipelineDeps = {
-    s3,
     s3Bucket: config.AWS_S3_BUCKET,
     extractor,
     openai,
@@ -150,6 +126,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, 'encerrando worker');
     await worker.close();
+    extractionPushConn.disconnect();
     await mongoClient.close();
     process.exit(0);
   };
