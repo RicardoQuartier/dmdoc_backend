@@ -318,50 +318,33 @@ def _ocr_once(img: np.ndarray) -> tuple[list[str], list[float], float]:
     return lines, confs, score
 
 
-def _detect_box_count(img: np.ndarray, canvas: int) -> int:
-    """Conta caixas de texto usando SÓ o detector do EasyOCR (CRAFT, sem o passo de
-    reconhecimento, que é o caro). É o sinal barato de orientação."""
-    try:
-        result = _reader.detect(img, canvas_size=canvas, mag_ratio=1.0)
-    except Exception:  # noqa: BLE001 — detecção é best-effort
-        return 0
-    if not result:
-        return 0
-    horizontal = result[0]
-    boxes = horizontal[0] if horizontal else []
-    return len(boxes or [])
-
-
-def _candidate_rotations(img: np.ndarray) -> list[int | None]:
-    """1ª etapa da orientação: roda só o DETECTOR nas 4 rotações de uma miniatura e
-    devolve os ORIENT_CANDIDATES ângulos com mais caixas de texto. Barato (sem
-    reconhecimento). O detector não distingue 0°↔180° nem 90°↔270°, por isso vários
-    candidatos seguem para o reconhecimento."""
-    thumb = _resize(img, ORIENT_DIM)
-    canvas = max(min(max(thumb.shape[:2]), OCR_CANVAS_CAP), 32)
-    scored: list[tuple[int, int | None]] = []
-    for code in _ROTATIONS.values():
-        rotated = thumb if code is None else cv2.rotate(thumb, code)
-        scored.append((_detect_box_count(rotated, canvas), code))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    candidates = [code for _count, code in scored[:ORIENT_CANDIDATES]]
-    return candidates or [None]
-
-
 def _best_rotation(img: np.ndarray) -> int | None:
-    """2ª etapa da orientação: entre os candidatos do detector, roda o RECONHECIMENTO
-    numa miniatura para desambiguar (ex.: 0° vs 180°) e escolhe o de maior score
-    (len×confiança). Retorna o código cv2.rotate (ou None para 0°)."""
-    candidates = _candidate_rotations(img)
-    if len(candidates) == 1:
-        return candidates[0]
+    """Escolhe a orientação por RECONHECIMENTO numa miniatura (ORIENT_DIM), testando
+    as 4 rotações. O score (len×confiança) separa de forma confiável a orientação
+    correta das erradas — texto de lado ou de cabeça para baixo gera leituras de
+    score baixo. Retorna o código cv2.rotate (ou None para 0°).
+
+    Por que NÃO usar a contagem de caixas do detector (abordagem anterior): em página
+    de texto corrido, girar 90°/270° transforma as linhas em colunas e o CRAFT
+    fragmenta em MAIS caixas — a orientação errada vencia e a imagem já em pé era
+    descartada antes da desambiguação, fazendo o OCR rodar de lado e sair como lixo.
+    Reconhecer as 4 rotações na miniatura é barato: a imagem é pequena, e o OOM que
+    motivou a heurística vinha do reconhecimento em FULL-RES, não da miniatura.
+
+    Viés para o upright: só giramos se outra orientação superar a vertical (0°) por
+    uma margem clara (10%). Um documento já em pé nunca deve ser girado por ruído de
+    reconhecimento na miniatura."""
     thumb = _resize(img, ORIENT_DIM)
-    best_code: int | None = candidates[0]
-    best_score = -1.0
-    for code in candidates:
-        rotated = thumb if code is None else cv2.rotate(thumb, code)
-        _lines, _confs, score = _ocr_once(rotated)
-        if score > best_score:
+    _lines, _confs, upright_score = _ocr_once(thumb)
+    best_code: int | None = None
+    best_score = upright_score
+    for code in (
+        cv2.ROTATE_90_CLOCKWISE,
+        cv2.ROTATE_180,
+        cv2.ROTATE_90_COUNTERCLOCKWISE,
+    ):
+        _lines, _confs, score = _ocr_once(cv2.rotate(thumb, code))
+        if score > best_score * 1.10:
             best_score = score
             best_code = code
     return best_code
