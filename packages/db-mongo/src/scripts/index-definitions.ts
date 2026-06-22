@@ -78,4 +78,9 @@ export const REGULAR_INDEXES: Readonly<Record<string, readonly RegularIndex[]>> 
   department_templates: [
     { keys: { name: 1 }, options: { name: 'uniq_name', unique: true } },
   ],
+  global_type_tenant_depts: [
+    { keys: { tenantId: 1 }, options: { name: 'by_tenant' } },
+    { keys: { globalTypeId: 1, tenantId: 1 }, options: { name: 'uniq_global_tenant', unique: true } },
+    { keys: { globalTypeId: 1 }, options: { name: 'by_global_type' } },
+  ],
 } as const;

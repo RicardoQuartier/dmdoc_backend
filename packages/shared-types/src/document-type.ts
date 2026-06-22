@@ -49,3 +49,16 @@ export const DocumentTypeSchema = z.object({
 });
 
 export type DocumentType = z.infer<typeof DocumentTypeSchema>;
+
+/** Configuração por tenant de departamentos visíveis para um tipo global. */
+export const GlobalTypeTenantDeptConfigSchema = z.object({
+  id: z.string().uuid(),
+  globalTypeId: z.string().uuid(),
+  tenantId: z.string().uuid(),
+  departmentIds: z.array(z.string().uuid()),
+  deleted: z.boolean(),
+  createdAt: z.date(),
+  updatedAt: z.date(),
+});
+
+export type GlobalTypeTenantDeptConfig = z.infer<typeof GlobalTypeTenantDeptConfigSchema>;

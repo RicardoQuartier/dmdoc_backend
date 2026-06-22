@@ -74,6 +74,11 @@ const TenantIdQuerySchema = z.object({
   tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas
 });
 
+const SetGlobalTypeDeptConfigBodySchema = z.object({
+  departmentIds: z.array(z.string().uuid()).min(1),
+  tenantId: z.string().uuid().optional(), // SUPER_ADMIN / MTA apenas
+});
+
 /**
  * Rotas de CRUD de tipos de documento e seus campos de índice.
  *
@@ -139,12 +144,27 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
       let tenantFilter: Record<string, unknown>;
       if (accessibleDeptIds !== null) {
-        // UPLOADER/USER: só veem tipos globais ou tipos cujos departmentIds
-        // tenham interseção com os departamentos acessíveis.
+        // Carrega configurações de visibilidade de tipos globais para este tenant.
+        const globalConfigs = await db
+          .collection('global_type_tenant_depts')
+          .find({ tenantId: baseTenantId, deleted: false })
+          .project<{ globalTypeId: string; departmentIds: string[] }>({ _id: 0, globalTypeId: 1, departmentIds: 1 })
+          .toArray();
+
+        // Tipos globais visíveis = aqueles com config cujos depts intersectem com os acessíveis.
+        const visibleGlobalIds = globalConfigs
+          .filter((c) => c.departmentIds.some((id) => accessibleDeptIds.includes(id)))
+          .map((c) => c.globalTypeId);
+
+        const globalCondition =
+          visibleGlobalIds.length > 0
+            ? [{ isGlobal: true, tenantId: null, id: { $in: visibleGlobalIds } }]
+            : [];
+
         tenantFilter = {
           deleted: false,
           $or: [
-            { isGlobal: true, tenantId: null },
+            ...globalCondition,
             {
               tenantId: baseTenantId,
               departmentIds: { $in: accessibleDeptIds },
@@ -507,6 +527,129 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
         'campo de índice atualizado'
       );
       return reply.status(200).send(stripMongoId(updated as Record<string, unknown>));
+    }
+  );
+
+  /**
+   * GET /document-types/:id/dept-config — retorna config de departamentos do tenant
+   * para um tipo global. Apenas ADMIN_ROLES.
+   */
+  app.get(
+    '/document-types/:id/dept-config',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      requireRole(request, ...ADMIN_ROLES);
+
+      const { id } = z.object({ id: z.string() }).parse(request.params);
+      const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
+      const db = app.db;
+
+      const existing = await db.collection('document_types').findOne({ id, deleted: false });
+      if (!existing) throw new NotFoundError();
+      const doc = existing as unknown as DocumentTypeDoc;
+      if (!doc.isGlobal) throw new NotFoundError();
+
+      const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
+      const tenantId = effectiveTenantId as string;
+
+      const config = await db
+        .collection('global_type_tenant_depts')
+        .findOne({ globalTypeId: id, tenantId, deleted: false });
+
+      if (!config) return reply.status(200).send(null);
+
+      return reply.status(200).send(stripMongoId(config as unknown as Record<string, unknown>));
+    }
+  );
+
+  /**
+   * PUT /document-types/:id/dept-config — cria ou atualiza config de departamentos
+   * do tenant para um tipo global. Apenas ADMIN_ROLES.
+   */
+  app.put(
+    '/document-types/:id/dept-config',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      requireRole(request, ...ADMIN_ROLES);
+
+      const { id } = z.object({ id: z.string() }).parse(request.params);
+      const body = SetGlobalTypeDeptConfigBodySchema.parse(request.body);
+      const db = app.db;
+
+      const existing = await db.collection('document_types').findOne({ id, deleted: false });
+      if (!existing) throw new NotFoundError();
+      const doc = existing as unknown as DocumentTypeDoc;
+      if (!doc.isGlobal) throw new NotFoundError();
+
+      const effectiveTenantId = resolveTenantId(request, body.tenantId, true);
+      const tenantId = effectiveTenantId as string;
+
+      // Valida que todos os departmentIds existem e pertencem ao tenant.
+      const { departmentIds } = body;
+      const foundCount = await db
+        .collection('departments')
+        .countDocuments({ id: { $in: departmentIds }, tenantId, deleted: false });
+      if (foundCount !== departmentIds.length) {
+        request.log.warn(
+          { tenantId, globalTypeId: id, departmentIds },
+          'um ou mais departmentIds não encontrados no tenant'
+        );
+        throw new NotFoundError();
+      }
+
+      const now = new Date();
+      const configResult = await db
+        .collection('global_type_tenant_depts')
+        .findOneAndUpdate(
+          { globalTypeId: id, tenantId, deleted: false },
+          {
+            $set: { departmentIds, updatedAt: now },
+            $setOnInsert: { id: newId(), globalTypeId: id, tenantId, createdAt: now, deleted: false },
+          },
+          { upsert: true, returnDocument: 'after' }
+        );
+
+      request.log.info(
+        { tenantId, globalTypeId: id, departmentIds },
+        'config de departamentos para tipo global atualizada'
+      );
+      return reply.status(200).send(stripMongoId(configResult as unknown as Record<string, unknown>));
+    }
+  );
+
+  /**
+   * DELETE /document-types/:id/dept-config — remove config de departamentos
+   * do tenant para um tipo global (tipo fica invisível para todos no tenant).
+   */
+  app.delete(
+    '/document-types/:id/dept-config',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      requireRole(request, ...ADMIN_ROLES);
+
+      const { id } = z.object({ id: z.string() }).parse(request.params);
+      const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
+      const db = app.db;
+
+      const existing = await db.collection('document_types').findOne({ id, deleted: false });
+      if (!existing) throw new NotFoundError();
+      const doc = existing as unknown as DocumentTypeDoc;
+      if (!doc.isGlobal) throw new NotFoundError();
+
+      const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
+      const tenantId = effectiveTenantId as string;
+
+      const result = await db
+        .collection('global_type_tenant_depts')
+        .updateOne({ globalTypeId: id, tenantId, deleted: false }, { $set: { deleted: true, updatedAt: new Date() } });
+
+      if (result.matchedCount === 0) throw new NotFoundError();
+
+      request.log.info(
+        { tenantId, globalTypeId: id },
+        'config de departamentos para tipo global removida'
+      );
+      return reply.status(204).send();
     }
   );
 
