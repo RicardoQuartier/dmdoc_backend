@@ -133,7 +133,7 @@ async function upsertTenant(
     VALUES (
       gen_random_uuid(),
       ${opts.name},
-      ${opts.diskQuotaBytes.toString()},
+      ${opts.diskQuotaBytes.toString()}::bigint,
       ${opts.userQuota},
       true,
       NOW()
@@ -168,14 +168,15 @@ async function upsertUser(
   const id = newId();
   const allowedTenantIds = user.allowedTenantIds ?? null;
 
+  // postgres.js não infere o tipo de null para colunas UUID — cast explícito obrigatório.
   await sql`
     INSERT INTO users (
       id, tenant_id, email, password_hash, name, role, active,
       allowed_tenant_ids, created_at, deleted
     )
     VALUES (
-      ${id},
-      ${user.tenantId},
+      ${id}::uuid,
+      ${user.tenantId}::uuid,
       ${user.email},
       ${user.passwordHash},
       ${user.name},
@@ -192,15 +193,18 @@ async function upsertUser(
           allowed_tenant_ids = EXCLUDED.allowed_tenant_ids
   `;
 
-  const rows = await sql<Array<{ id: string }>>`
-    SELECT id FROM users
-    WHERE email = ${user.email}
-      AND (
-        (tenant_id IS NULL AND ${user.tenantId} IS NULL)
-        OR tenant_id = ${user.tenantId}
-      )
-    LIMIT 1
-  `;
+  // Busca condicional para evitar comparar null como parâmetro tipado.
+  const rows = user.tenantId
+    ? await sql<Array<{ id: string }>>`
+        SELECT id FROM users
+        WHERE email = ${user.email} AND tenant_id = ${user.tenantId}::uuid
+        LIMIT 1
+      `
+    : await sql<Array<{ id: string }>>`
+        SELECT id FROM users
+        WHERE email = ${user.email} AND tenant_id IS NULL
+        LIMIT 1
+      `;
   return { id: rows[0]?.id ?? '' };
 }
 

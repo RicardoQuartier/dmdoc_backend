@@ -26,7 +26,8 @@ CREATE TABLE tenants (
     disk_quota_bytes BIGINT     NOT NULL,
     user_quota      INTEGER     NOT NULL,
     active          BOOLEAN     NOT NULL DEFAULT true,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uniq_tenant_name UNIQUE (name)
 );
 
 -- ---------------------------------------------------------------------------
