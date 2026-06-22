@@ -1,4 +1,5 @@
-import { pathToFileURL } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import argon2 from 'argon2';
 import postgres from 'postgres';
 import { newId } from './helpers.js';
@@ -169,29 +170,41 @@ async function upsertUser(
   const allowedTenantIds = user.allowedTenantIds ?? null;
 
   // postgres.js não infere o tipo de null para colunas UUID — cast explícito obrigatório.
-  await sql`
-    INSERT INTO users (
-      id, tenant_id, email, password_hash, name, role, active,
-      allowed_tenant_ids, created_at, deleted
-    )
-    VALUES (
-      ${id}::uuid,
-      ${user.tenantId}::uuid,
-      ${user.email},
-      ${user.passwordHash},
-      ${user.name},
-      ${user.role},
-      true,
-      ${allowedTenantIds}::uuid[],
-      NOW(),
-      false
-    )
-    ON CONFLICT (tenant_id, email) DO UPDATE
-      SET name               = EXCLUDED.name,
-          role               = EXCLUDED.role,
-          active             = EXCLUDED.active,
-          allowed_tenant_ids = EXCLUDED.allowed_tenant_ids
-  `;
+  // Usuários sem tenant (SUPER_ADMIN, MULTI_TENANT_ADMIN) usam o índice parcial
+  // uniq_users_null_tenant_email; usuários com tenant usam o índice composto (tenant_id, email).
+  if (user.tenantId === null) {
+    await sql`
+      INSERT INTO users (
+        id, tenant_id, email, password_hash, name, role, active,
+        allowed_tenant_ids, created_at, deleted
+      )
+      VALUES (
+        ${id}::uuid, NULL::uuid, ${user.email}, ${user.passwordHash},
+        ${user.name}, ${user.role}, true, ${allowedTenantIds}::uuid[], NOW(), false
+      )
+      ON CONFLICT (email) WHERE tenant_id IS NULL DO UPDATE
+        SET name               = EXCLUDED.name,
+            role               = EXCLUDED.role,
+            active             = EXCLUDED.active,
+            allowed_tenant_ids = EXCLUDED.allowed_tenant_ids
+    `;
+  } else {
+    await sql`
+      INSERT INTO users (
+        id, tenant_id, email, password_hash, name, role, active,
+        allowed_tenant_ids, created_at, deleted
+      )
+      VALUES (
+        ${id}::uuid, ${user.tenantId}::uuid, ${user.email}, ${user.passwordHash},
+        ${user.name}, ${user.role}, true, ${allowedTenantIds}::uuid[], NOW(), false
+      )
+      ON CONFLICT (tenant_id, email) DO UPDATE
+        SET name               = EXCLUDED.name,
+            role               = EXCLUDED.role,
+            active             = EXCLUDED.active,
+            allowed_tenant_ids = EXCLUDED.allowed_tenant_ids
+    `;
+  }
 
   // Busca condicional para evitar comparar null como parâmetro tipado.
   const rows = user.tenantId
@@ -305,7 +318,7 @@ export async function seed(sql: postgres.Sql): Promise<void> {
     `;
     const typeId = typeRows[0]?.id ?? '';
 
-    // Upsert de cada index field
+    // Upsert de cada index field pela chave natural (document_type_id, name)
     for (const field of seedType.indexFields) {
       await sql`
         INSERT INTO document_type_index_fields (
@@ -323,14 +336,58 @@ export async function seed(sql: postgres.Sql): Promise<void> {
           true,
           false
         )
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (document_type_id, name) DO UPDATE
+          SET field_type          = EXCLUDED.field_type,
+              required            = EXCLUDED.required,
+              ai_extraction_hint  = EXCLUDED.ai_extraction_hint,
+              sort_order          = EXCLUDED.sort_order
       `;
     }
 
     console.log(JSON.stringify({ level: 'info', name: 'seed', msg: 'tipo global garantido', typeName: seedType.name, isGlobal: true }));
   }
 
+  // --- Template de departamentos "Ricardo" ---
+  await seedDepartmentTemplateRic(sql);
+
   console.log(JSON.stringify({ level: 'info', name: 'seed', msg: 'seed concluído' }));
+}
+
+/**
+ * Semeia o template de departamentos "Ricardo" (dump real da máquina de testes).
+ * Idempotente: upsert pela chave natural `name`.
+ */
+async function seedDepartmentTemplateRic(sql: postgres.Sql): Promise<void> {
+  const dataPath = fileURLToPath(
+    new URL('./data/department-template-ric.json', import.meta.url),
+  );
+  const raw = JSON.parse(readFileSync(dataPath, 'utf-8')) as {
+    name: string;
+    description: string;
+    nodes: unknown[];
+  };
+
+  await sql`
+    INSERT INTO department_templates (id, name, nodes, created_at, updated_at)
+    VALUES (
+      gen_random_uuid(),
+      ${raw.name},
+      ${sql.json(raw.nodes)},
+      NOW(),
+      NOW()
+    )
+    ON CONFLICT (name) DO UPDATE
+      SET nodes      = EXCLUDED.nodes,
+          updated_at = NOW()
+  `;
+
+  console.log(JSON.stringify({
+    level: 'info',
+    name: 'seed',
+    msg: 'template de departamentos garantido',
+    templateName: raw.name,
+    nodes: raw.nodes.length,
+  }));
 }
 
 async function main(): Promise<void> {

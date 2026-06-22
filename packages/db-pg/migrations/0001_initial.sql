@@ -128,6 +128,7 @@ CREATE TABLE document_type_index_fields (
 );
 
 CREATE INDEX idx_fields_by_doc_type ON document_type_index_fields (document_type_id);
+CREATE UNIQUE INDEX uniq_index_field_type_name ON document_type_index_fields (document_type_id, name);
 
 -- ---------------------------------------------------------------------------
 -- global_type_tenant_depts
