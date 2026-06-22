@@ -1,7 +1,7 @@
 import { Worker, type Job } from 'bullmq';
 import { Redis } from 'ioredis';
 import OpenAI from 'openai';
-import { MongoDbClient } from '@dmdoc/db-mongo';
+import { createPgClient } from '@dmdoc/db-pg';
 import { createExtractor } from '@dmdoc/extractor';
 import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import { config } from './config.js';
@@ -77,10 +77,9 @@ export function createDocumentWorker(
 async function main(): Promise<void> {
   logger.info('inicializando dependências do worker');
 
-  // MongoDB
-  const mongoClient = await MongoDbClient.connect(config.MONGO_URI, config.MONGO_DB);
-  const db = mongoClient.getDb();
-  logger.info({ db: config.MONGO_DB }, 'MongoDB conectado');
+  // PostgreSQL
+  const sql = createPgClient(config.DATABASE_URL);
+  logger.info('PostgreSQL conectado');
 
   // OpenAI (embeddings)
   const openai = new OpenAI({
@@ -110,7 +109,7 @@ async function main(): Promise<void> {
     extractor,
     openai,
     embeddingModel: config.EMBEDDING_MODEL,
-    db,
+    sql,
     logger,
     chunkTargetTokens: config.CHUNK_TARGET_TOKENS,
     chunkOverlapTokens: config.CHUNK_OVERLAP_TOKENS,
@@ -127,7 +126,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'encerrando worker');
     await worker.close();
     extractionPushConn.disconnect();
-    await mongoClient.close();
+    await sql.end();
     process.exit(0);
   };
 

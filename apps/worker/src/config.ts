@@ -14,9 +14,11 @@ const EnvSchema = z.object({
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
     .default('info'),
 
-  // MongoDB
-  MONGO_URI: z.string().url().default('mongodb://localhost:27017'),
-  MONGO_DB: z.string().min(1).default('dmdoc'),
+  // PostgreSQL
+  DATABASE_URL: z
+    .string()
+    .url()
+    .default('postgresql://dmdoc:dmdoc@localhost:5432/dmdoc'),
 
   // AWS S3
   AWS_REGION: z.string().min(1).default('us-east-1'),

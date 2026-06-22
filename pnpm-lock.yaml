@@ -117,9 +117,9 @@ importers:
       '@aws-sdk/client-s3':
         specifier: ^3.782.0
         version: 3.1064.0
-      '@dmdoc/db-mongo':
+      '@dmdoc/db-pg':
         specifier: workspace:*
-        version: link:../../packages/db-mongo
+        version: link:../../packages/db-pg
       '@dmdoc/extractor':
         specifier: workspace:*
         version: link:../../packages/extractor
@@ -135,15 +135,15 @@ importers:
       ioredis:
         specifier: 5.10.1
         version: 5.10.1
-      mongodb:
-        specifier: ^6.12.0
-        version: 6.21.0
       openai:
         specifier: ^4.93.0
         version: 4.104.0(zod@3.25.76)
       pino:
         specifier: ^9.6.0
         version: 9.14.0
+      postgres:
+        specifier: ^3.4.5
+        version: 3.4.9
       tiktoken:
         specifier: ^1.0.21
         version: 1.0.22
