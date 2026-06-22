@@ -8,9 +8,9 @@ export default defineConfig({
         import.meta.dirname,
         '../../packages/shared-types/src/index.ts'
       ),
-      '@dmdoc/db-mongo': path.resolve(
+      '@dmdoc/db-pg': path.resolve(
         import.meta.dirname,
-        '../../packages/db-mongo/src/index.ts'
+        '../../packages/db-pg/src/index.ts'
       ),
       '@dmdoc/llm-provider': path.resolve(
         import.meta.dirname,
@@ -19,8 +19,10 @@ export default defineConfig({
     },
   },
   test: {
-    // mongodb-memory-server baixa um binário do mongod no primeiro run.
     testTimeout: 120_000,
     hookTimeout: 120_000,
+    env: {
+      DATABASE_URL: 'postgresql://dmdoc:dmdoc@localhost:5432/dmdoc_test',
+    },
   },
 });
