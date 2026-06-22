@@ -4,3 +4,4 @@ export * from './tenant-context.js';
 export * from './helpers.js';
 export * from './tenant-repository.js';
 export * from './document-events-repository.js';
+export * from './search.js';
