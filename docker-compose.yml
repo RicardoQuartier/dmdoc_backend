@@ -2,17 +2,19 @@ name: dmdoc-backend
 
 services:
   # ---------------- Infraestrutura ----------------
-  mongodb:
-    # OBRIGATÓRIO: imagem Atlas Local — suporta $vectorSearch, $search e $rankFusion.
-    # NÃO usar a imagem padrão `mongo`, que não tem esses operadores.
-    image: mongodb/mongodb-atlas-local:latest
-    container_name: dmdoc-mongodb
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: dmdoc-postgres
     ports:
-      - '27017:27017'
+      - '5432:5432'
     volumes:
-      - mongodb_data:/data/db
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: dmdoc
+      POSTGRES_PASSWORD: dmdoc
+      POSTGRES_DB: dmdoc
     healthcheck:
-      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.runCommand('ping').ok"]
+      test: ['CMD-SHELL', 'pg_isready -U dmdoc -d dmdoc']
       interval: 10s
       timeout: 10s
       retries: 5
@@ -126,7 +128,7 @@ services:
     env_file:
       - ./.env
     environment:
-      MONGO_URI: mongodb://mongodb:27017?directConnection=true
+      DATABASE_URL: postgresql://dmdoc:dmdoc@postgres:5432/dmdoc
       REDIS_URL: redis://redis:6379
       S3_ENDPOINT: http://minio:9000
       # Endpoint público para assinar URLs de download/preview. minio:9000 é o host
@@ -151,7 +153,7 @@ services:
     depends_on:
       backend-install:
         condition: service_completed_successfully
-      mongodb:
+      postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -166,7 +168,7 @@ services:
     env_file:
       - ./.env
     environment:
-      MONGO_URI: mongodb://mongodb:27017?directConnection=true
+      DATABASE_URL: postgresql://dmdoc:dmdoc@postgres:5432/dmdoc
       REDIS_URL: redis://redis:6379
       S3_ENDPOINT: http://minio:9000
       AWS_ACCESS_KEY_ID: minioadmin
@@ -193,7 +195,7 @@ services:
         condition: service_started
 
 volumes:
-  mongodb_data:
+  postgres_data:
   redis_data:
   minio_data:
   backend_root_nm:
