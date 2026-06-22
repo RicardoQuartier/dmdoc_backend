@@ -48,6 +48,9 @@ CREATE TABLE users (
 );
 
 CREATE UNIQUE INDEX uniq_users_tenant_email ON users (tenant_id, email);
+-- Índice parcial para usuários sem tenant (SUPER_ADMIN, MULTI_TENANT_ADMIN):
+-- NULL != NULL no Postgres, então o índice composto acima não impede duplicatas quando tenant_id IS NULL.
+CREATE UNIQUE INDEX uniq_users_null_tenant_email ON users (email) WHERE tenant_id IS NULL;
 CREATE INDEX users_by_tenant ON users (tenant_id);
 
 -- ---------------------------------------------------------------------------
