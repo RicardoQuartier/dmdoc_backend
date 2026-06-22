@@ -302,47 +302,27 @@ export async function seed(sql: postgres.Sql): Promise<void> {
   console.log(JSON.stringify({ level: 'info', name: 'seed', msg: 'MULTI_TENANT_ADMIN garantido', email: mtaEmail, allowedTenantIds: [tenantId, tenantId2] }));
 
   // --- Tipos globais (tenant_id NULL, is_global TRUE) ---
+  // index_fields é JSONB embutido no registro; o índice parcial uniq_doc_type_global_name
+  // protege unicidade por nome quando tenant_id IS NULL.
   for (const seedType of globalTypeSeeds()) {
-    // Upsert do tipo
+    const indexFieldsJson = seedType.indexFields.map((f, i) => ({
+      id: newId(),
+      name: f.name,
+      fieldType: f.fieldType,
+      required: f.required,
+      aiExtractionHint: f.aiExtractionHint,
+      order: i + 1,
+      showOnSearch: true,
+      deleted: false,
+    }));
+
     await sql`
-      INSERT INTO document_types (id, tenant_id, name, description, is_global, deleted, created_at)
-      VALUES (gen_random_uuid(), NULL, ${seedType.name}, ${seedType.description}, true, false, NOW())
-      ON CONFLICT (tenant_id, name) DO UPDATE
-        SET description = EXCLUDED.description
+      INSERT INTO document_types (id, tenant_id, name, description, is_global, index_fields, deleted, created_at)
+      VALUES (gen_random_uuid(), NULL, ${seedType.name}, ${seedType.description}, true, ${sql.json(indexFieldsJson)}, false, NOW())
+      ON CONFLICT (name) WHERE tenant_id IS NULL DO UPDATE
+        SET description  = EXCLUDED.description,
+            index_fields = EXCLUDED.index_fields
     `;
-
-    const typeRows = await sql<Array<{ id: string }>>`
-      SELECT id FROM document_types
-      WHERE tenant_id IS NULL AND name = ${seedType.name}
-      LIMIT 1
-    `;
-    const typeId = typeRows[0]?.id ?? '';
-
-    // Upsert de cada index field pela chave natural (document_type_id, name)
-    for (const field of seedType.indexFields) {
-      await sql`
-        INSERT INTO document_type_index_fields (
-          id, document_type_id, name, field_type, required,
-          ai_extraction_hint, sort_order, show_on_search, deleted
-        )
-        VALUES (
-          gen_random_uuid(),
-          ${typeId},
-          ${field.name},
-          ${field.fieldType},
-          ${field.required},
-          ${field.aiExtractionHint},
-          ${field.sortOrder},
-          true,
-          false
-        )
-        ON CONFLICT (document_type_id, name) DO UPDATE
-          SET field_type          = EXCLUDED.field_type,
-              required            = EXCLUDED.required,
-              ai_extraction_hint  = EXCLUDED.ai_extraction_hint,
-              sort_order          = EXCLUDED.sort_order
-      `;
-    }
 
     console.log(JSON.stringify({ level: 'info', name: 'seed', msg: 'tipo global garantido', typeName: seedType.name, isGlobal: true }));
   }

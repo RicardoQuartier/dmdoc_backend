@@ -98,16 +98,22 @@ CREATE INDEX dept_perm_by_department ON department_permissions (department_id);
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE document_types (
-    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id   UUID        REFERENCES tenants(id),
-    name        TEXT        NOT NULL,
-    description TEXT,
-    is_global   BOOLEAN     NOT NULL DEFAULT false,
-    deleted     BOOLEAN     NOT NULL DEFAULT false,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id      UUID        REFERENCES tenants(id),
+    name           TEXT        NOT NULL,
+    description    TEXT,
+    is_global      BOOLEAN     NOT NULL DEFAULT false,
+    deleted        BOOLEAN     NOT NULL DEFAULT false,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Campos de índice embutidos como JSONB (array de IndexField)
+    index_fields   JSONB       NOT NULL DEFAULT '[]',
+    -- Departamentos aos quais o tipo pertence (para tipos de tenant; NULL para globais)
+    department_ids UUID[]      DEFAULT NULL
 );
 
-CREATE UNIQUE INDEX uniq_doc_type_tenant_name ON document_types (tenant_id, name);
+CREATE UNIQUE INDEX uniq_doc_type_tenant_name   ON document_types (tenant_id, name);
+-- Tipos globais (tenant_id IS NULL): unicidade só por nome
+CREATE UNIQUE INDEX uniq_doc_type_global_name   ON document_types (name) WHERE tenant_id IS NULL;
 CREATE INDEX doc_types_by_tenant ON document_types (tenant_id);
 
 -- ---------------------------------------------------------------------------
