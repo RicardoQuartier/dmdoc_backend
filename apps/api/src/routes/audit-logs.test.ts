@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
 import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
 import type { S3Service } from '../services/s3.js';
+import { newId } from '@dmdoc/db-pg';
 
 // ---------------------------------------------------------------------------
 // Mock S3
@@ -51,15 +52,19 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  // Limpar coleções
-  await testDb.db.collection('users').deleteMany({});
-  await testDb.db.collection('tenants').deleteMany({});
+  // Limpar tabelas
+  await testDb.db`DELETE FROM audit_logs`;
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','SUPER_ADMIN','USER')`;
+  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
 
   // Inserir tenants
-  await testDb.db.collection('tenants').insertMany([
-    { id: TENANT_A, name: 'Empresa A', diskQuotaBytes: 10 * 1024 * 1024, userQuota: 10, active: true },
-    { id: TENANT_B, name: 'Empresa B', diskQuotaBytes: 10 * 1024 * 1024, userQuota: 10, active: true },
-  ]);
+  await testDb.db`
+    INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+    VALUES
+      (${TENANT_A}, 'Empresa A', ${10 * 1024 * 1024}, 10, true, NOW()),
+      (${TENANT_B}, 'Empresa B', ${10 * 1024 * 1024}, 10, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   // Inserir usuários
   await seedUser(testDb.db, {
@@ -96,7 +101,7 @@ beforeEach(async () => {
 
   // Limpar audit_logs APÓS os logins (os logins geram audit logs de auth.login
   // que não devem interferir nos testes dos endpoints de auditoria)
-  await testDb.db.collection('audit_logs').deleteMany({});
+  await testDb.db`DELETE FROM audit_logs`;
 });
 
 // ---------------------------------------------------------------------------
@@ -108,14 +113,11 @@ async function insertAuditLog(
   userId: string | null = null,
   createdAt: Date = new Date()
 ): Promise<void> {
-  await testDb.db.collection('audit_logs').insertOne({
-    tenantId,
-    userId,
-    action,
-    resource: `test/resource`,
-    metadata: {},
-    createdAt,
-  });
+  const id = newId();
+  await testDb.db`
+    INSERT INTO audit_logs (id, tenant_id, user_id, action, resource, metadata, created_at)
+    VALUES (${id}, ${tenantId}, ${userId}, ${action}, 'test/resource', '{}'::jsonb, ${createdAt})
+  `;
 }
 
 // ---------------------------------------------------------------------------

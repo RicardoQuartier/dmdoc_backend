@@ -1,18 +1,13 @@
-import { MongoMemoryServer, MongoMemoryReplSet } from 'mongodb-memory-server';
-import type { Db } from 'mongodb';
-import { MongoDbClient } from '@dmdoc/db-mongo';
+import { createPgClient, type Sql } from '@dmdoc/db-pg';
 import { loadConfig, type Config } from '../config.js';
 import { hashPassword } from '../auth/password.js';
-import {
-  USERS_COLLECTION,
-  type UserDocument,
-} from '../auth/user-store.js';
+import type { UserDocument } from '../auth/user-store.js';
 
 /**
- * Config hermética para testes — injeta segredos JWT e Mongo fixos, sem tocar
- * em `process.env` real. O `MONGO_URI`/`MONGO_DB` aqui são placeholders: os
- * testes injetam um `Db` real (memory-server) em `buildApp`, então a conexão
- * via config nunca é usada.
+ * Config hermética para testes — injeta segredos JWT e DATABASE_URL fixos,
+ * sem tocar em `process.env` real. O `DATABASE_URL` aqui é um placeholder:
+ * os testes que precisam de banco injetam um `Sql` real via `buildApp({ db })`,
+ * então a conexão via config nunca é usada na prática.
  *
  * AWS/S3: placeholders — os testes de upload injetam um mock de S3Service via
  * `buildApp({ s3: mockS3 })`, portanto nunca chamam o SDK real.
@@ -23,8 +18,7 @@ export function testConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): Config {
   return loadConfig({
     NODE_ENV: 'test',
     LOG_LEVEL: 'silent',
-    MONGO_URI: 'mongodb://placeholder:27017',
-    MONGO_DB: 'dmdoc_test',
+    DATABASE_URL: overrides['DATABASE_URL'] ?? 'postgresql://dmdoc:dmdoc@localhost:5432/dmdoc_test',
     JWT_SECRET: 'test-access-secret',
     JWT_REFRESH_SECRET: 'test-refresh-secret',
     JWT_EXPIRES_IN: '15m',
@@ -41,57 +35,44 @@ export function testConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): Config {
 }
 
 export interface TestDb {
-  mongo: MongoMemoryServer;
-  client: MongoDbClient;
-  db: Db;
+  db: Sql;
   stop: () => Promise<void>;
 }
 
 /**
- * Sobe um MongoDB em memória e retorna o `Db` + um teardown.
+ * Cria um cliente postgres.js para testes, conectado ao DATABASE_URL de teste.
+ * Usa a variável de ambiente TEST_DATABASE_URL se disponível, senão o padrão.
+ *
+ * Em ambiente CI, uma instância PostgreSQL deve estar rodando.
  */
 export async function startTestDb(): Promise<TestDb> {
-  const mongo = await MongoMemoryServer.create();
-  const client = await MongoDbClient.connect(mongo.getUri(), 'dmdoc_test');
+  const databaseUrl =
+    process.env['TEST_DATABASE_URL'] ??
+    process.env['DATABASE_URL'] ??
+    'postgresql://dmdoc:dmdoc@localhost:5432/dmdoc_test';
+
+  const db = createPgClient(databaseUrl);
+
   return {
-    mongo,
-    client,
-    db: client.getDb(),
+    db,
     stop: async () => {
-      await client.close();
-      await mongo.stop();
+      await db.end();
     },
   };
-}
-
-export interface TestReplSetDb {
-  replSet: MongoMemoryReplSet;
-  client: MongoDbClient;
-  db: Db;
-  stop: () => Promise<void>;
 }
 
 /**
- * Sobe um MongoDB em memória como replica set de 1 nó.
- *
- * Necessário para testes que usam transações MongoDB (session.withTransaction),
- * pois transações só funcionam com replica sets (não standalone).
- *
- * Use `startTestDb` para testes que não precisam de transações — é mais rápido.
+ * Compatibilidade com testes que usavam startTestReplSetDb (MongoDB replica set).
+ * Agora retorna um cliente PostgreSQL simples (sem necessidade de replica set
+ * para transações — PostgreSQL suporta transações em modo standalone).
  */
+export interface TestReplSetDb {
+  db: Sql;
+  stop: () => Promise<void>;
+}
+
 export async function startTestReplSetDb(): Promise<TestReplSetDb> {
-  const replSet = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
-  const uri = replSet.getUri();
-  const client = await MongoDbClient.connect(uri, 'dmdoc_test');
-  return {
-    replSet,
-    client,
-    db: client.getDb(),
-    stop: async () => {
-      await client.close();
-      await replSet.stop();
-    },
-  };
+  return startTestDb();
 }
 
 export interface SeedUserInput {
@@ -109,22 +90,46 @@ export interface SeedUserInput {
  * Insere um usuário de teste com hash argon2 REAL (não um placeholder), para
  * exercitar o caminho completo de verify no login.
  */
-export async function seedUser(db: Db, input: SeedUserInput): Promise<UserDocument> {
-  const doc: UserDocument & { deleted: boolean } = {
+export async function seedUser(db: Sql, input: SeedUserInput): Promise<UserDocument> {
+  const passwordHash = await hashPassword(input.password);
+  const now = new Date();
+  const role = input.role ?? 'TENANT_ADMIN';
+  const name = input.name ?? 'Usuário de Teste';
+  const active = input.active ?? true;
+  const allowedTenantIds = input.allowedTenantIds ?? null;
+
+  await db`
+    INSERT INTO users (id, tenant_id, email, password_hash, name, role, active, allowed_tenant_ids, created_at, deleted)
+    VALUES (
+      ${input.id},
+      ${input.tenantId},
+      ${input.email},
+      ${passwordHash},
+      ${name},
+      ${role},
+      ${active},
+      ${allowedTenantIds}::uuid[],
+      ${now},
+      false
+    )
+    ON CONFLICT (id) DO UPDATE
+    SET email = EXCLUDED.email,
+        password_hash = EXCLUDED.password_hash,
+        name = EXCLUDED.name,
+        role = EXCLUDED.role,
+        active = EXCLUDED.active,
+        allowed_tenant_ids = EXCLUDED.allowed_tenant_ids
+  `;
+
+  return {
     id: input.id,
     tenantId: input.tenantId,
     email: input.email,
-    passwordHash: await hashPassword(input.password),
-    name: input.name ?? 'Usuário de Teste',
-    role: input.role ?? 'TENANT_ADMIN',
-    active: input.active ?? true,
-    createdAt: new Date(),
-    deleted: false,
-    ...(input.allowedTenantIds !== undefined
-      ? { allowedTenantIds: input.allowedTenantIds }
-      : {}),
+    passwordHash,
+    name,
+    role,
+    active,
+    createdAt: now,
+    ...(allowedTenantIds !== null ? { allowedTenantIds } : {}),
   };
-  await db.collection<UserDocument & { deleted: boolean }>(USERS_COLLECTION).insertOne(doc);
-  const { deleted: _deleted, ...rest } = doc;
-  return rest;
 }

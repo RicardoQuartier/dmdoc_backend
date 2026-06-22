@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
 import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
 import type { S3Service } from '../services/s3.js';
-import { newId } from '@dmdoc/db-mongo';
+import { newId } from '@dmdoc/db-pg';
 
 // ---------------------------------------------------------------------------
 // Mock S3
@@ -23,6 +23,7 @@ const TENANT_A = '11111111-1111-1111-1111-111111111111';
 const TENANT_B = '22222222-2222-2222-2222-222222222222';
 const ADMIN_A_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const SUPER_ADMIN_ID = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+const DEPT_ID = 'e0000000-0000-0000-0000-000000000001';
 const PASSWORD = 'senha-forte-de-teste-789';
 
 const DISK_QUOTA = 100 * 1024 * 1024; // 100 MB
@@ -52,14 +53,25 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db.collection('users').deleteMany({});
-  await testDb.db.collection('tenants').deleteMany({});
-  await testDb.db.collection('documents').deleteMany({});
+  await testDb.db`DELETE FROM documents`;
+  await testDb.db`DELETE FROM departments`;
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','SUPER_ADMIN','USER')`;
+  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
 
-  await testDb.db.collection('tenants').insertMany([
-    { id: TENANT_A, name: 'Empresa A', diskQuotaBytes: DISK_QUOTA, userQuota: USER_QUOTA, active: true },
-    { id: TENANT_B, name: 'Empresa B', diskQuotaBytes: DISK_QUOTA, userQuota: USER_QUOTA, active: true },
-  ]);
+  await testDb.db`
+    INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+    VALUES
+      (${TENANT_A}, 'Empresa A', ${DISK_QUOTA}, ${USER_QUOTA}, true, NOW()),
+      (${TENANT_B}, 'Empresa B', ${DISK_QUOTA}, ${USER_QUOTA}, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
+
+  // Departamento padrão para seeds de documentos
+  await testDb.db`
+    INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+    VALUES (${DEPT_ID}, ${TENANT_A}, NULL, 'Dept Principal', 0, '{}'::text[], false, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   await seedUser(testDb.db, {
     id: ADMIN_A_ID, tenantId: TENANT_A, email: 'admin-a@test.com',
@@ -93,28 +105,29 @@ async function insertDocument(
   deleted = false,
   status: 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED' = 'READY'
 ): Promise<void> {
-  await testDb.db.collection('documents').insertOne({
-    id: newId(),
-    tenantId,
-    departmentId: newId(),
-    documentTypeId: null,
-    filename: 'test.pdf',
-    originalFilename: 'test.pdf',
-    contentHash: newId(),
-    sizeBytes,
-    mimeType: 'application/pdf',
-    s3Key: `tenants/${tenantId}/test.pdf`,
-    status,
-    failureReason: null,
-    tags: [],
-    mongoContentId: null,
-    indexValues: {},
-    uploadedById: ADMIN_A_ID,
-    uploadedAt: new Date(),
-    processedAt: status === 'READY' ? new Date() : null,
-    costUsdCents,
-    deleted,
-  });
+  const id = newId();
+  const deptId = tenantId === TENANT_A ? DEPT_ID : newId();
+  if (tenantId !== TENANT_A) {
+    // Cria departamento para o outro tenant on-the-fly
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (${deptId}, ${tenantId}, NULL, 'Dept', 0, '{}'::text[], false, NOW())
+      ON CONFLICT (id) DO NOTHING
+    `;
+  }
+  await testDb.db`
+    INSERT INTO documents (
+      id, tenant_id, department_id, document_type_id,
+      original_filename, content_hash, size_bytes, mime_type,
+      s3_key, status, failure_reason, tags, index_values,
+      uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+    ) VALUES (
+      ${id}, ${tenantId}, ${deptId}, NULL,
+      'test.pdf', ${newId()}, ${sizeBytes}, 'application/pdf',
+      ${`tenants/${tenantId}/test.pdf`}, ${status}, NULL, '{}'::text[], '{}'::jsonb,
+      ${ADMIN_A_ID}, NOW(), ${status === 'READY' ? new Date() : null}, ${costUsdCents}, ${deleted}
+    )
+  `;
 }
 
 // ---------------------------------------------------------------------------

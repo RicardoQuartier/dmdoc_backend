@@ -47,6 +47,9 @@ importers:
       '@dmdoc/db-mongo':
         specifier: workspace:*
         version: link:../../packages/db-mongo
+      '@dmdoc/db-pg':
+        specifier: workspace:*
+        version: link:../../packages/db-pg
       '@dmdoc/llm-provider':
         specifier: workspace:*
         version: link:../../packages/llm-provider
@@ -206,6 +209,9 @@ importers:
 
   packages/db-pg:
     dependencies:
+      '@dmdoc/shared-types':
+        specifier: workspace:*
+        version: link:../shared-types
       drizzle-orm:
         specifier: ^0.44.2
         version: 0.44.7(@types/pg@8.20.0)(postgres@3.4.9)
@@ -215,6 +221,9 @@ importers:
       postgres:
         specifier: ^3.4.5
         version: 3.4.9
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

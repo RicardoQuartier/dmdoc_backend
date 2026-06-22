@@ -19,9 +19,11 @@
     "generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@dmdoc/shared-types": "workspace:*",
     "drizzle-orm": "^0.44.2",
     "pgvector": "^0.2.0",
-    "postgres": "^3.4.5"
+    "postgres": "^3.4.5",
+    "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

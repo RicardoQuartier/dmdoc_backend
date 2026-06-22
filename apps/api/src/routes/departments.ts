@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { TenantRepository } from '@dmdoc/db-mongo';
-import type { TenantDocument } from '@dmdoc/db-mongo';
+import { TenantRepository } from '@dmdoc/db-pg';
+import type { TenantDocument } from '@dmdoc/db-pg';
 import { ConflictError, NotFoundError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantId, resolveTenantContext } from '../auth/resolve-tenant.js';
@@ -17,9 +17,6 @@ interface DepartmentDoc extends TenantDocument {
 
 const ListDepartmentsQuerySchema = z.object({
   tenantId: z.string().uuid().optional(),
-  // Querystrings chegam como string. `writable=true` ativa o filtro de escrita
-  // (seletor de upload); qualquer outro valor (ou ausência) mantém o
-  // comportamento de gestão (lista todos os departamentos do escopo).
   writable: z
     .enum(['true', 'false'])
     .optional()
@@ -30,7 +27,7 @@ const CreateDepartmentBodySchema = z.object({
   name: z.string().min(1).max(200),
   parentId: z.string().uuid().nullable().default(null),
   tags: z.array(z.string()).default([]),
-  tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas
+  tenantId: z.string().uuid().optional(),
 });
 
 const PatchDepartmentBodySchema = z.object({
@@ -39,112 +36,117 @@ const PatchDepartmentBodySchema = z.object({
 });
 
 const TenantIdQuerySchema = z.object({
-  tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas
+  tenantId: z.string().uuid().optional(),
 });
 
 /**
- * Rotas de CRUD de departamentos.
- *
- * GET retorna array plano ordenado (raízes primeiro, filhos depois).
- * DELETE exclui logicamente apenas o departamento; documentos e permissões
- * vinculados são preservados.
- *
- * SUPER_ADMIN: informa tenantId via body (POST) ou ?tenantId (PATCH, DELETE).
+ * Rotas de CRUD de departamentos — PostgreSQL.
  */
 export const departmentsRoutes: FastifyPluginAsync = async (app) => {
   /**
    * GET /departments — retorna departamentos em array plano ordenado.
-   *
-   * SUPER_ADMIN: vê todos os tenants. `?tenantId=xxx` filtra por empresa.
-   * Demais roles: sempre escopadas ao próprio tenant.
    */
   app.get('/departments', { preHandler: app.authenticate }, async (request, reply) => {
     const { tenantId: tenantIdParam, writable } = ListDepartmentsQuerySchema.parse(request.query);
-    const db = app.db;
+    const sql = app.db;
     const role = request.user?.role;
 
-    let items: DepartmentDoc[];
+    type DeptRow = {
+      id: string;
+      tenant_id: string;
+      parent_id: string | null;
+      name: string;
+      level: number;
+      tags: string[];
+      created_at: Date;
+      deleted: boolean;
+    };
 
-    // Tenant efetivo para resolução de ACL no modo writable. Para SUPER_ADMIN/MTA
-    // o tenant vem do `?tenantId` (quando informado); para roles normais vem do
-    // contexto da request (JWT). Para roles admin a ACL não restringe (resolver
-    // retorna null), então o valor abaixo só importa para UPLOADER/USER, onde
-    // request.tenantId é sempre uma string.
     const aclTenantId =
       role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN'
         ? tenantIdParam ?? null
-        : request.tenantId ?? null;
+        : (request.tenantId as string | null) ?? null;
+
+    let rows: DeptRow[];
 
     if (role === 'SUPER_ADMIN') {
-      const filter: Record<string, unknown> = { deleted: false };
-      if (tenantIdParam !== undefined) filter['tenantId'] = tenantIdParam;
-
-      items = (await db
-        .collection('departments')
-        .find(filter)
-        .sort({ level: 1, name: 1 })
-        .limit(1000)
-        .toArray()) as unknown as DepartmentDoc[];
+      if (tenantIdParam !== undefined) {
+        rows = await sql<DeptRow[]>`
+          SELECT id, tenant_id, parent_id, name, level, tags, created_at, deleted
+          FROM departments
+          WHERE tenant_id = ${tenantIdParam}
+            AND deleted = false
+          ORDER BY level ASC, name ASC
+          LIMIT 1000
+        `;
+      } else {
+        rows = await sql<DeptRow[]>`
+          SELECT id, tenant_id, parent_id, name, level, tags, created_at, deleted
+          FROM departments
+          WHERE deleted = false
+          ORDER BY level ASC, name ASC
+          LIMIT 1000
+        `;
+      }
     } else if (role === 'MULTI_TENANT_ADMIN') {
-      // MTA sem tenantId explícito: retorna departamentos de todos os tenants
-      // da lista allowedTenantIds. Com tenantId explícito: resolveTenantContext
-      // valida que está na lista e retorna mode:'single'.
       const context = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: false });
-      const filter: Record<string, unknown> = { deleted: false };
 
       if (context.mode === 'single') {
-        filter['tenantId'] = context.tenantId;
+        rows = await sql<DeptRow[]>`
+          SELECT id, tenant_id, parent_id, name, level, tags, created_at, deleted
+          FROM departments
+          WHERE tenant_id = ${context.tenantId}
+            AND deleted = false
+          ORDER BY level ASC, name ASC
+          LIMIT 1000
+        `;
       } else {
-        // mode: 'allowed' — filtra por $in sobre os tenants permitidos
         const allowedTenantIds = request.user?.allowedTenantIds ?? [];
-        filter['tenantId'] = { $in: allowedTenantIds };
+        rows = await sql<DeptRow[]>`
+          SELECT id, tenant_id, parent_id, name, level, tags, created_at, deleted
+          FROM departments
+          WHERE tenant_id = ANY(${allowedTenantIds}::uuid[])
+            AND deleted = false
+          ORDER BY level ASC, name ASC
+          LIMIT 1000
+        `;
       }
-
-      items = (await db
-        .collection('departments')
-        .find(filter)
-        .sort({ level: 1, name: 1 })
-        .limit(1000)
-        .toArray()) as unknown as DepartmentDoc[];
     } else {
       const tenantId = request.tenantId;
-      // tenantId deve ser sempre uma string UUID para roles não-SUPER_ADMIN/MTA.
-      // A checagem explícita protege contra execuções fora do fluxo normal de
-      // autenticação e evita que uma query sem tenantId vaze dados de todos os
-      // tenants (BSON serializa `undefined` descartando a chave do filtro).
       if (typeof tenantId !== 'string') {
         throw new Error('tenantId ausente no contexto da request');
       }
-
-      items = (await db
-        .collection('departments')
-        .find({ tenantId, deleted: false })
-        .sort({ level: 1, name: 1 })
-        .limit(1000)
-        .toArray()) as unknown as DepartmentDoc[];
+      rows = await sql<DeptRow[]>`
+        SELECT id, tenant_id, parent_id, name, level, tags, created_at, deleted
+        FROM departments
+        WHERE tenant_id = ${tenantId}
+          AND deleted = false
+        ORDER BY level ASC, name ASC
+        LIMIT 1000
+      `;
     }
 
-    // Filtro de ESCRITA (?writable=true) — superfície do seletor de upload.
-    // Retorna apenas departamentos em que o ator pode escrever (wiki "Permissões
-    // por departamento (ACL)" → seção "Seletor de departamento no upload"):
-    //   - Admin (TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN): sem restrição
-    //     de ACL — `resolveAccessibleDepartmentIds` retorna `null` e mantemos
-    //     todos os departamentos ATIVOS do escopo já carregados em `items`.
-    //   - UPLOADER / USER: subárvore expandida das raízes concedidas; sem raiz
-    //     concedida → conjunto vazio → resposta `[]` (200, não erro).
-    // `items` já está restrito a `deleted: false`, então a interseção com o
-    // conjunto acessível resulta apenas em departamentos ATIVOS — destino válido
-    // de upload (um soft-deletado dentro da subárvore concedida não aparece).
-    // Sem `writable`, o endpoint mantém o comportamento de gestão (lista tudo).
+    let items = rows.map((r) => ({
+      id: r.id,
+      tenantId: r.tenant_id,
+      parentId: r.parent_id,
+      name: r.name,
+      level: r.level,
+      tags: r.tags,
+      createdAt: r.created_at,
+      deleted: r.deleted,
+    })) as (DepartmentDoc & { documentCount?: number })[];
+
+    // Filtro de ESCRITA
     if (writable) {
       const userId = request.user?.sub;
       if (typeof userId !== 'string') {
         throw new Error('userId ausente no contexto da request');
       }
       const accessible = await resolveAccessibleDepartmentIds(
-        db,
+        sql,
         userId,
-        request.tenantId ?? null,
+        aclTenantId,
         role ?? ''
       );
       if (accessible !== null) {
@@ -153,24 +155,20 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
       }
     }
 
-    // Contagem direta de documentos por departamento. Os departmentIds já estão
-    // escopados ao(s) tenant(s) permitido(s) acima, então o $in sobre eles é
-    // intrinsecamente multi-tenant safe. Não é recursivo: conta apenas
-    // documentos diretamente vinculados ao nó (departmentId == dept.id).
+    // Contagem de documentos por departamento
     const departmentIds = items.map((d) => d.id);
     const countMap = new Map<string, number>();
 
     if (departmentIds.length > 0) {
-      const counts = (await db
-        .collection('documents')
-        .aggregate([
-          { $match: { departmentId: { $in: departmentIds }, deleted: false } },
-          { $group: { _id: '$departmentId', count: { $sum: 1 } } },
-        ])
-        .toArray()) as Array<{ _id: string; count: number }>;
-
-      for (const { _id, count } of counts) {
-        countMap.set(_id, count);
+      const counts = await sql<Array<{ department_id: string; count: string }>>`
+        SELECT department_id, COUNT(*) AS count
+        FROM documents
+        WHERE department_id = ANY(${departmentIds}::uuid[])
+          AND deleted = false
+        GROUP BY department_id
+      `;
+      for (const { department_id, count } of counts) {
+        countMap.set(department_id, parseInt(count, 10));
       }
     }
 
@@ -184,8 +182,6 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * POST /departments — cria departamento.
-   * SUPER_ADMIN: informar `tenantId` no body (obrigatório).
-   * Valida hierarquia (profundidade ilimitada).
    */
   app.post('/departments', { preHandler: app.authenticate }, async (request, reply) => {
     requireRole(request, 'TENANT_ADMIN', 'MULTI_TENANT_ADMIN');
@@ -195,9 +191,9 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
     const tenantId = effectiveTenantId as string;
 
     const { name, parentId, tags } = body;
-    const db = app.db;
+    const sql = app.db;
 
-    const repo = new TenantRepository<DepartmentDoc>(db.collection('departments'), { tenantId });
+    const repo = new TenantRepository<DepartmentDoc>(sql, 'departments', { tenantId });
 
     let level = 0;
 
@@ -221,7 +217,6 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * PATCH /departments/:id — atualiza nome ou tags do departamento.
-   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
    */
   app.patch('/departments/:id', { preHandler: app.authenticate }, async (request, reply) => {
     requireRole(request, 'TENANT_ADMIN', 'MULTI_TENANT_ADMIN');
@@ -232,9 +227,9 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
 
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const updates = PatchDepartmentBodySchema.parse(request.body);
-    const db = app.db;
+    const sql = app.db;
 
-    const repo = new TenantRepository<DepartmentDoc>(db.collection('departments'), { tenantId });
+    const repo = new TenantRepository<DepartmentDoc>(sql, 'departments', { tenantId });
     const updated = await repo.updateById(
       id,
       removeUndefined(updates) as Parameters<typeof repo.updateById>[1]
@@ -247,15 +242,6 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * DELETE /departments/:id — exclusão lógica somente do departamento.
-   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
-   *
-   * Marca apenas o departamento como `deleted: true`. Documentos e permissões
-   * vinculados são PRESERVADOS (continuam `deleted: false`) para que documentos
-   * já carregados não sumam e continuem encontráveis na busca e nas listagens
-   * por quem tem `canRead`.
-   *
-   * Proíbe a deleção se houver sub-departamentos ativos (filhos diretos com
-   * `deleted: false`) → ConflictError 409.
    */
   app.delete('/departments/:id', { preHandler: app.authenticate }, async (request, reply) => {
     requireRole(request, 'TENANT_ADMIN', 'MULTI_TENANT_ADMIN');
@@ -265,22 +251,18 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
     const tenantId = effectiveTenantId as string;
 
     const { id } = z.object({ id: z.string() }).parse(request.params);
-    const db = app.db;
+    const sql = app.db;
 
-    const repo = new TenantRepository<DepartmentDoc>(db.collection('departments'), { tenantId });
+    const repo = new TenantRepository<DepartmentDoc>(sql, 'departments', { tenantId });
 
-    // Verificar se o departamento existe no tenant
     const dept = await repo.findById(id);
     if (!dept) throw new NotFoundError();
 
-    // Verificar sub-departamentos ativos
-    const childCount = await repo.count({ parentId: id } as Parameters<typeof repo.count>[0]);
+    const childCount = await repo.count({ parentId: id } as Partial<DepartmentDoc>);
     if (childCount > 0) {
       throw new ConflictError('Departamento possui sub-departamentos ativos');
     }
 
-    // Soft-delete apenas do departamento. Documentos e permissões vinculados
-    // são intencionalmente preservados (continuam deleted: false).
     await repo.softDelete(id);
 
     request.log.info(
@@ -291,13 +273,8 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
   });
 };
 
-// Exportação de tipo para uso em outros módulos (ex: permissions)
 export type { DepartmentDoc };
 
-/**
- * Remove propriedades com valor `undefined` do objeto, para compatibilidade
- * com `exactOptionalPropertyTypes`.
- */
 function removeUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> {
   const result: Partial<T> = {};
   for (const key of Object.keys(obj) as (keyof T)[]) {
@@ -307,4 +284,3 @@ function removeUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> 
   }
   return result;
 }
-

@@ -172,11 +172,12 @@ async function fetchAllowedTenants(
   app: FastifyInstance,
   tenantIds: string[],
 ): Promise<AllowedTenantSummary[]> {
-  const docs = await app.db
-    .collection<{ id: string; name: string }>('tenants')
-    .find({ id: { $in: tenantIds }, active: true })
-    .project({ id: 1, name: 1, _id: 0 })
-    .toArray();
+  const docs = await app.db<Array<{ id: string; name: string }>>`
+    SELECT id, name
+    FROM tenants
+    WHERE id = ANY(${tenantIds}::uuid[])
+      AND active = true
+  `;
   return docs.map((d) => ({ id: d.id, name: d.name }));
 }
 

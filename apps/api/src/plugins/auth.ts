@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import fp from 'fastify-plugin';
-import type { Db } from 'mongodb';
+import type { Sql } from '@dmdoc/db-pg';
 import type { Config } from '../config.js';
 import { UnauthorizedError } from '../errors/index.js';
 import { AuditLogger } from '../auth/audit.js';
@@ -55,7 +55,7 @@ declare module 'fastify' {
 
 export interface AuthPluginOptions {
   config: Config;
-  db: Db;
+  sql: Sql;
 }
 
 /**
@@ -66,11 +66,11 @@ export interface AuthPluginOptions {
  * em TODA a árvore de rotas, não apenas no encapsulamento local.
  */
 const authPluginImpl: FastifyPluginAsync<AuthPluginOptions> = async (app, options) => {
-  const { config, db } = options;
+  const { config, sql } = options;
 
   app.decorate('tokens', new TokenService(config));
-  app.decorate('users', new UserStore(db));
-  app.decorate('audit', new AuditLogger(db));
+  app.decorate('users', new UserStore(sql));
+  app.decorate('audit', new AuditLogger(sql));
 
   app.decorate(
     'authenticate',

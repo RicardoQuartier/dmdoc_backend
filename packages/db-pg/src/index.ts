@@ -5,3 +5,7 @@ export * from './helpers.js';
 export * from './tenant-repository.js';
 export * from './document-events-repository.js';
 export * from './search.js';
+export * from './user-write-validation.js';
+
+/** Constante para compatibilidade com código que usava DOCUMENT_EVENTS_COLLECTION do db-mongo. */
+export const DOCUMENT_EVENTS_COLLECTION = 'document_events';

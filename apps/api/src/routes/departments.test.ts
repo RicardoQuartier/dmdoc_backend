@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
 import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
-import { newId } from '@dmdoc/db-mongo';
+import { newId } from '@dmdoc/db-pg';
 
 /**
  * Testes E2E de exclusão de departamento.
@@ -36,20 +36,17 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db.collection('users').deleteMany({});
-  await testDb.db.collection('tenants').deleteMany({});
-  await testDb.db.collection('departments').deleteMany({});
-  await testDb.db.collection('documents').deleteMany({});
-  await testDb.db.collection('department_permissions').deleteMany({});
+  await testDb.db`DELETE FROM department_permissions`;
+  await testDb.db`DELETE FROM documents`;
+  await testDb.db`DELETE FROM departments`;
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','UPLOADER','USER')`;
+  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
 
-  await testDb.db.collection('tenants').insertOne({
-    id: TENANT_A,
-    name: 'Empresa A',
-    diskQuotaBytes: 10 * 1024 ** 3,
-    userQuota: 20,
-    active: true,
-    createdAt: new Date(),
-  });
+  await testDb.db`
+    INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+    VALUES (${TENANT_A}, 'Empresa A', ${10 * 1024 ** 3}, 20, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   await seedUser(testDb.db, {
     id: ADMIN_A_ID,
@@ -78,33 +75,29 @@ describe('DELETE /departments/:id — preserva documentos e permissões', () => 
     const docId = newId();
     const permUserId = newId();
 
-    await testDb.db.collection('departments').insertOne({
-      id: deptId,
-      tenantId: TENANT_A,
-      parentId: null,
-      name: 'Financeiro',
-      level: 0,
-      tags: [],
-      deleted: false,
-      createdAt: new Date(),
-    });
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (${deptId}, ${TENANT_A}, NULL, 'Financeiro', 0, '{}'::text[], false, NOW())
+    `;
 
-    await testDb.db.collection('documents').insertOne({
-      id: docId,
-      tenantId: TENANT_A,
-      departmentId: deptId,
-      filename: 'nota-fiscal.pdf',
-      deleted: false,
-      createdAt: new Date(),
-    });
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, tags, index_values, uploaded_by_id, uploaded_at, deleted
+      ) VALUES (
+        ${docId}, ${TENANT_A}, ${deptId}, NULL,
+        'nota-fiscal.pdf', ${newId()}, 1024, 'application/pdf',
+        ${`tenants/${TENANT_A}/${docId}.pdf`}, 'READY', '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), false
+      )
+    `;
 
-    await testDb.db.collection('department_permissions').insertOne({
-      userId: permUserId,
-      departmentId: deptId,
-      tenantId: TENANT_A,
-      canRead: true,
-      canWrite: false,
-    });
+    await testDb.db`
+      INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
+      VALUES (${permUserId}, ${deptId}, ${TENANT_A}, true, false)
+      ON CONFLICT (user_id, department_id) DO NOTHING
+    `;
 
     const res = await app.inject({
       method: 'DELETE',
@@ -115,49 +108,34 @@ describe('DELETE /departments/:id — preserva documentos e permissões', () => 
     expect(res.statusCode).toBe(204);
 
     // (a) o departamento está logicamente excluído
-    const dept = await testDb.db.collection('departments').findOne({ id: deptId });
-    expect(dept?.deleted).toBe(true);
+    const deptRows = await testDb.db<Array<{ deleted: boolean }>>`SELECT deleted FROM departments WHERE id = ${deptId}`;
+    expect(deptRows[0]?.deleted).toBe(true);
 
-    // (b) o documento foi PRESERVADO — continua deleted:false e com o departmentId
-    const doc = await testDb.db.collection('documents').findOne({ id: docId });
-    expect(doc?.deleted).toBe(false);
-    expect(doc?.departmentId).toBe(deptId);
+    // (b) o documento foi PRESERVADO — continua deleted:false e com o department_id
+    const docRows = await testDb.db<Array<{ deleted: boolean; department_id: string }>>`
+      SELECT deleted, department_id FROM documents WHERE id = ${docId}
+    `;
+    expect(docRows[0]?.deleted).toBe(false);
+    expect(docRows[0]?.department_id).toBe(deptId);
 
     // (c) a permissão foi PRESERVADA — continua presente
-    const perm = await testDb.db
-      .collection('department_permissions')
-      .findOne({ departmentId: deptId, userId: permUserId });
-    expect(perm).not.toBeNull();
-    expect(perm?.deleted).not.toBe(true);
-    expect(perm?.canRead).toBe(true);
+    const permRows = await testDb.db<Array<{ can_read: boolean }>>`
+      SELECT can_read FROM department_permissions WHERE department_id = ${deptId} AND user_id = ${permUserId}
+    `;
+    expect(permRows).toHaveLength(1);
+    expect(permRows[0]?.can_read).toBe(true);
   });
 
   it('bloqueia exclusão (409) quando há sub-departamentos ativos', async () => {
     const parentId = newId();
     const childId = newId();
 
-    await testDb.db.collection('departments').insertMany([
-      {
-        id: parentId,
-        tenantId: TENANT_A,
-        parentId: null,
-        name: 'Jurídico',
-        level: 0,
-        tags: [],
-        deleted: false,
-        createdAt: new Date(),
-      },
-      {
-        id: childId,
-        tenantId: TENANT_A,
-        parentId,
-        name: 'Contratos',
-        level: 1,
-        tags: [],
-        deleted: false,
-        createdAt: new Date(),
-      },
-    ]);
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES
+        (${parentId}, ${TENANT_A}, NULL, 'Jurídico', 0, '{}'::text[], false, NOW()),
+        (${childId}, ${TENANT_A}, ${parentId}, 'Contratos', 1, '{}'::text[], false, NOW())
+    `;
 
     const res = await app.inject({
       method: 'DELETE',
@@ -169,8 +147,8 @@ describe('DELETE /departments/:id — preserva documentos e permissões', () => 
     expect(res.json().error.code).toBe('CONFLICT');
 
     // O pai NÃO foi excluído
-    const parent = await testDb.db.collection('departments').findOne({ id: parentId });
-    expect(parent?.deleted).toBe(false);
+    const rows = await testDb.db<Array<{ deleted: boolean }>>`SELECT deleted FROM departments WHERE id = ${parentId}`;
+    expect(rows[0]?.deleted).toBe(false);
   });
 
   it('departamento inexistente → 404', async () => {
@@ -190,35 +168,21 @@ describe('GET /departments — documentCount', () => {
     const deptComDocs = newId();
     const deptVazio = newId();
 
-    await testDb.db.collection('departments').insertMany([
-      {
-        id: deptComDocs,
-        tenantId: TENANT_A,
-        parentId: null,
-        name: 'Financeiro',
-        level: 0,
-        tags: [],
-        deleted: false,
-        createdAt: new Date(),
-      },
-      {
-        id: deptVazio,
-        tenantId: TENANT_A,
-        parentId: null,
-        name: 'RH',
-        level: 0,
-        tags: [],
-        deleted: false,
-        createdAt: new Date(),
-      },
-    ]);
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES
+        (${deptComDocs}, ${TENANT_A}, NULL, 'Financeiro', 0, '{}'::text[], false, NOW()),
+        (${deptVazio}, ${TENANT_A}, NULL, 'RH', 0, '{}'::text[], false, NOW())
+    `;
 
-    await testDb.db.collection('documents').insertMany([
-      { id: newId(), tenantId: TENANT_A, departmentId: deptComDocs, deleted: false, createdAt: new Date() },
-      { id: newId(), tenantId: TENANT_A, departmentId: deptComDocs, deleted: false, createdAt: new Date() },
-      // documento excluído logicamente não deve ser contado
-      { id: newId(), tenantId: TENANT_A, departmentId: deptComDocs, deleted: true, createdAt: new Date() },
-    ]);
+    // 2 documentos ativos + 1 deletado
+    await testDb.db`
+      INSERT INTO documents (id, tenant_id, department_id, document_type_id, original_filename, content_hash, size_bytes, mime_type, s3_key, status, tags, index_values, uploaded_by_id, uploaded_at, deleted)
+      VALUES
+        (${newId()}, ${TENANT_A}, ${deptComDocs}, NULL, 'f1.pdf', ${newId()}, 100, 'application/pdf', 'k1', 'READY', '{}'::text[], '{}'::jsonb, ${ADMIN_A_ID}, NOW(), false),
+        (${newId()}, ${TENANT_A}, ${deptComDocs}, NULL, 'f2.pdf', ${newId()}, 100, 'application/pdf', 'k2', 'READY', '{}'::text[], '{}'::jsonb, ${ADMIN_A_ID}, NOW(), false),
+        (${newId()}, ${TENANT_A}, ${deptComDocs}, NULL, 'f3.pdf', ${newId()}, 100, 'application/pdf', 'k3', 'READY', '{}'::text[], '{}'::jsonb, ${ADMIN_A_ID}, NOW(), true)
+    `;
 
     const res = await app.inject({
       method: 'GET',
@@ -261,57 +225,21 @@ describe('GET /departments?writable=true — filtro de escrita (seletor de uploa
   const DEPT_TENANT_B = '44444444-4444-4444-4444-444444444444';
 
   async function seedTreeAndActors(): Promise<void> {
-    await testDb.db.collection('tenants').insertOne({
-      id: TENANT_B,
-      name: 'Empresa B',
-      diskQuotaBytes: 10 * 1024 ** 3,
-      userQuota: 20,
-      active: true,
-      createdAt: new Date(),
-    });
+    await testDb.db`
+      INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+      VALUES (${TENANT_B}, 'Empresa B', ${10 * 1024 ** 3}, 20, true, NOW())
+      ON CONFLICT (id) DO NOTHING
+    `;
 
-    await testDb.db.collection('departments').insertMany([
-      {
-        id: FINANCEIRO,
-        tenantId: TENANT_A,
-        parentId: null,
-        name: 'Financeiro',
-        level: 0,
-        tags: [],
-        deleted: false,
-        createdAt: new Date(),
-      },
-      {
-        id: CONTAS_A_PAGAR,
-        tenantId: TENANT_A,
-        parentId: FINANCEIRO,
-        name: 'Contas a Pagar',
-        level: 1,
-        tags: [],
-        deleted: false,
-        createdAt: new Date(),
-      },
-      {
-        id: RH,
-        tenantId: TENANT_A,
-        parentId: null,
-        name: 'RH',
-        level: 0,
-        tags: [],
-        deleted: false,
-        createdAt: new Date(),
-      },
-      {
-        id: DEPT_TENANT_B,
-        tenantId: TENANT_B,
-        parentId: null,
-        name: 'Financeiro B',
-        level: 0,
-        tags: [],
-        deleted: false,
-        createdAt: new Date(),
-      },
-    ]);
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES
+        (${FINANCEIRO}, ${TENANT_A}, NULL, 'Financeiro', 0, '{}'::text[], false, NOW()),
+        (${CONTAS_A_PAGAR}, ${TENANT_A}, ${FINANCEIRO}, 'Contas a Pagar', 1, '{}'::text[], false, NOW()),
+        (${RH}, ${TENANT_A}, NULL, 'RH', 0, '{}'::text[], false, NOW()),
+        (${DEPT_TENANT_B}, ${TENANT_B}, NULL, 'Financeiro B', 0, '{}'::text[], false, NOW())
+      ON CONFLICT (id) DO NOTHING
+    `;
 
     await seedUser(testDb.db, {
       id: UPLOADER_A_ID,
@@ -331,13 +259,12 @@ describe('GET /departments?writable=true — filtro de escrita (seletor de uploa
   }
 
   async function grantRoot(userId: string, departmentId: string): Promise<void> {
-    await testDb.db.collection('department_permissions').insertOne({
-      userId,
-      departmentId,
-      tenantId: TENANT_A,
-      canRead: true,
-      canWrite: true,
-    });
+    await testDb.db`
+      INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
+      VALUES (${userId}, ${departmentId}, ${TENANT_A}, true, true)
+      ON CONFLICT (user_id, department_id) DO UPDATE
+        SET can_read = true, can_write = true
+    `;
   }
 
   it('USER sem nenhuma raiz concedida → [] (200)', async () => {
@@ -436,9 +363,7 @@ describe('GET /departments?writable=true — filtro de escrita (seletor de uploa
   it('subárvore concedida exclui departamento soft-deletado (destino de upload exige ativo)', async () => {
     await seedTreeAndActors();
     // soft-delete do filho Contas a Pagar
-    await testDb.db
-      .collection('departments')
-      .updateOne({ id: CONTAS_A_PAGAR }, { $set: { deleted: true } });
+    await testDb.db`UPDATE departments SET deleted = true WHERE id = ${CONTAS_A_PAGAR}`;
     await grantRoot(UPLOADER_A_ID, FINANCEIRO);
     const token = await login('uploader-a@empresa.com');
 

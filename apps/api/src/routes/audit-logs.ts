@@ -2,8 +2,6 @@ import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantId } from '../auth/resolve-tenant.js';
-import { AUDIT_LOGS_COLLECTION } from '../auth/audit.js';
-import type { AuditLogDocument } from '../auth/audit.js';
 
 /**
  * Query params do GET /audit-logs.
@@ -33,8 +31,25 @@ const ListAuditLogsQuerySchema = z.object({
     .pipe(z.number().min(1).max(100)),
 });
 
+type AuditLogRow = {
+  id: string;
+  tenant_id: string | null;
+  user_id: string | null;
+  action: string;
+  resource: string | null;
+  metadata: Record<string, unknown>;
+  created_at: Date;
+};
+
 /**
- * Decode de cursor opaco (base64 → ISO date string).
+ * Encode de cursor opaco (Date ISO → base64).
+ */
+function encodeCursor(createdAt: Date): string {
+  return Buffer.from(createdAt.toISOString()).toString('base64');
+}
+
+/**
+ * Decode de cursor opaco (base64 → Date).
  */
 function decodeCursor(cursor: string): Date | null {
   try {
@@ -44,10 +59,6 @@ function decodeCursor(cursor: string): Date | null {
   } catch {
     return null;
   }
-}
-
-function encodeCursor(doc: Pick<AuditLogDocument, 'createdAt'>): string {
-  return Buffer.from((doc.createdAt as Date).toISOString()).toString('base64');
 }
 
 /**
@@ -69,64 +80,87 @@ export const auditLogsRoutes: FastifyPluginAsync = async (app) => {
     const effectiveTenantId = resolveTenantId(request, rawQuery.tenantId, true);
     const tenantId = effectiveTenantId as string;
 
-    const db = app.db;
-    const collection = db.collection<AuditLogDocument>(AUDIT_LOGS_COLLECTION);
+    const sql = app.db;
 
-    // Filtro base — tipado como Record para evitar conflito do driver com
-    // exactOptionalPropertyTypes no tsconfig strict do projeto.
-    const baseFilter: Record<string, unknown> = { tenantId };
+    // Construção dinâmica de WHERE com sql.unsafe + parâmetros
+    const conditions: string[] = ['a.tenant_id = $1'];
+    const params: unknown[] = [tenantId];
+    let paramIdx = 2;
+
+    const addParam = (val: unknown): string => {
+      params.push(val);
+      return `$${paramIdx++}`;
+    };
 
     if (rawQuery.action !== undefined) {
-      baseFilter['action'] = rawQuery.action;
+      conditions.push(`a.action = ${addParam(rawQuery.action)}`);
     }
 
     if (rawQuery.userId !== undefined) {
-      baseFilter['userId'] = rawQuery.userId;
+      conditions.push(`a.user_id = ${addParam(rawQuery.userId)}`);
     }
 
-    // Intervalo de datas
-    if (rawQuery.from !== undefined || rawQuery.to !== undefined) {
-      const dateFilter: Record<string, Date> = {};
-      if (rawQuery.from !== undefined) {
-        dateFilter['$gte'] = new Date(rawQuery.from);
-      }
-      if (rawQuery.to !== undefined) {
-        dateFilter['$lte'] = new Date(rawQuery.to);
-      }
-      baseFilter['createdAt'] = dateFilter;
+    if (rawQuery.from !== undefined) {
+      conditions.push(`a.created_at >= ${addParam(new Date(rawQuery.from))}::timestamptz`);
+    }
+
+    if (rawQuery.to !== undefined) {
+      conditions.push(`a.created_at <= ${addParam(new Date(rawQuery.to))}::timestamptz`);
     }
 
     const limit = rawQuery.limit;
 
-    // Paginação por cursor simples: createdAt < cursor (DESC)
-    const pageFilter: Record<string, unknown> = { ...baseFilter };
+    // Paginação por cursor: created_at < cursor (DESC)
+    const pageConditions = [...conditions];
+    const pageParams = [...params];
+    let pageParamIdx = paramIdx;
+
+    const addPageParam = (val: unknown): string => {
+      pageParams.push(val);
+      return `$${pageParamIdx++}`;
+    };
+
     if (rawQuery.cursor !== undefined) {
       const cursorDate = decodeCursor(rawQuery.cursor);
       if (cursorDate !== null) {
-        pageFilter['createdAt'] = { $lt: cursorDate };
+        pageConditions.push(`a.created_at < ${addPageParam(cursorDate)}::timestamptz`);
       }
     }
 
-    // O driver MongoDB aceita Record<string, unknown> como Filter<T> na prática —
-    // o cast é necessário porque os tipos gerados do @types/mongodb com
-    // exactOptionalPropertyTypes são excessivamente restritivos neste padrão.
-    type DocFilter = Parameters<typeof collection.find>[0];
+    const limitPlaceholder = addPageParam(limit + 1);
+    const pageWhereClause = pageConditions.join(' AND ');
 
-    const docs = await collection
-      .find(pageFilter as DocFilter)
-      .sort({ createdAt: -1 })
-      .limit(limit + 1)
-      .toArray();
+    const pageQuery = `
+      SELECT a.id, a.tenant_id, a.user_id, a.action, a.resource, a.metadata, a.created_at
+      FROM audit_logs a
+      WHERE ${pageWhereClause}
+      ORDER BY a.created_at DESC
+      LIMIT ${limitPlaceholder}
+    `;
+
+    const docs = await sql.unsafe<AuditLogRow[]>(pageQuery, pageParams as Parameters<typeof sql.unsafe>[1]);
 
     const hasMore = docs.length > limit;
     const page = hasMore ? docs.slice(0, limit) : docs;
     const lastDoc = page.at(-1);
-    const nextCursor = hasMore && lastDoc ? encodeCursor(lastDoc) : null;
+    const nextCursor = hasMore && lastDoc ? encodeCursor(lastDoc.created_at) : null;
 
-    // Remove _id antes de serializar
-    const items = page.map(({ _id: _ignored, ...rest }) => rest);
+    // Total (sem cursor)
+    const countWhereClause = conditions.join(' AND ');
+    const countQuery = `SELECT COUNT(*) AS count FROM audit_logs a WHERE ${countWhereClause}`;
+    const countRows = await sql.unsafe<Array<{ count: string }>>(countQuery, params as Parameters<typeof sql.unsafe>[1]);
+    const total = parseInt(countRows[0]?.count ?? '0', 10);
 
-    const total = await collection.countDocuments(baseFilter as DocFilter);
+    // Serializar como camelCase para compatibilidade com respostas anteriores
+    const items = page.map((row) => ({
+      id: row.id,
+      tenantId: row.tenant_id,
+      userId: row.user_id,
+      action: row.action,
+      resource: row.resource,
+      metadata: row.metadata,
+      createdAt: row.created_at,
+    }));
 
     request.log.info(
       { tenantId, returned: items.length, total },
