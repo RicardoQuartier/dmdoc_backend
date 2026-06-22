@@ -445,14 +445,65 @@ def extract_image(data: bytes) -> dict:
     return {"text": ocr_image(img), "pageCount": 1, "ocrPages": [1]}
 
 
+def _extract_docx_text_via_lxml(xml_bytes: bytes) -> list[str]:
+    """Extrai texto de word/document.xml usando lxml.
+
+    O python-docx itera apenas os parágrafos e tabelas que são filhos diretos do
+    body (e recursivos de tabelas), mas não entra em elementos w:sdt (Structured
+    Document Tags / Content Controls). Documentos gerados pelo Word moderno — em
+    especial templates com campos de formulário — armazenam praticamente todo o
+    conteúdo dentro de w:sdt > w:sdtContent > w:p, tornando o resultado do
+    python-docx praticamente vazio.
+
+    Esta função usa lxml para localizar todos os w:p no documento completo (em
+    qualquer profundidade, incluindo dentro de SDT e tabelas), extraindo o texto de
+    cada parágrafo na ordem de documento. Isso garante que SDTs, tabelas e
+    parágrafos normais sejam todos capturados.
+
+    Retorna lista de strings não-vazias (um item por parágrafo com conteúdo).
+    """
+    try:
+        from lxml import etree  # noqa: PLC0415 — import local para isolar dependência
+    except ImportError:
+        return []
+
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    try:
+        tree = etree.fromstring(xml_bytes)
+    except etree.XMLSyntaxError:
+        return []
+
+    parts: list[str] = []
+    for p in tree.findall(f".//{{{W}}}p"):
+        texts = p.findall(f".//{{{W}}}t")
+        text = "".join(t.text or "" for t in texts).strip()
+        if text:
+            parts.append(text)
+    return parts
+
+
 def extract_docx(data: bytes) -> dict:
-    doc = DocxDocument(io.BytesIO(data))
-    parts = [p.text for p in doc.paragraphs if p.text.strip()]
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells if c.text.strip()]
-            if cells:
-                parts.append("\t".join(cells))
+    # Extrair texto via lxml para capturar SDT (Content Controls) além de
+    # parágrafos e tabelas normais. O python-docx.paragraphs ignora w:sdt,
+    # causando saída vazia em templates do Word com campos de formulário.
+    parts: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            if "word/document.xml" in zf.namelist():
+                xml_bytes = zf.read("word/document.xml")
+                parts = _extract_docx_text_via_lxml(xml_bytes)
+    except (zipfile.BadZipFile, KeyError):
+        pass
+
+    # Fallback para python-docx caso lxml não esteja disponível ou falhe
+    if not parts:
+        doc = DocxDocument(io.BytesIO(data))
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    parts.append("\t".join(cells))
 
     # OCR de imagens embutidas (word/media/*) — equivalente ao docx-images do Node.
     ocr_texts: list[str] = []
