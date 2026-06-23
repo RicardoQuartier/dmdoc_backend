@@ -129,8 +129,7 @@ export async function persistProcessingResult(
     UPDATE documents
     SET status         = 'READY',
         processed_at   = now(),
-        cost_usd_cents = ${costUsdCents},
-        updated_at     = now()
+        cost_usd_cents = ${costUsdCents}
     WHERE id        = ${documentId}
       AND tenant_id = ${tenantId}
   `;

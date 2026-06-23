@@ -143,8 +143,7 @@ export async function runPipeline(
     await sql`
       UPDATE documents
       SET status = 'FAILED',
-          failure_reason = ${failureReason},
-          updated_at = now()
+          failure_reason = ${failureReason}
       WHERE id = ${documentId}
         AND tenant_id = ${tenantId}
     `.catch((dbErr: unknown) => {

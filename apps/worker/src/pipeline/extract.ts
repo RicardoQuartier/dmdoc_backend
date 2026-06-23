@@ -69,8 +69,7 @@ export async function extractDocument(
   await sql`
     UPDATE documents
     SET status = 'PROCESSING',
-        failure_reason = null,
-        updated_at = now()
+        failure_reason = null
     WHERE id = ${documentId}
       AND tenant_id = ${tenantId}
   `;
