@@ -42,6 +42,7 @@ interface DocumentTypeRow extends TenantDocument {
 }
 
 interface DocumentRow extends TenantDocument {
+  tenant_id: string; // postgres.js entrega snake_case; TenantDocument.tenantId é undefined em runtime
   department_id: string;
   document_type_id: string | null;
   filename: string;
@@ -324,7 +325,7 @@ async function resolveDocumentTypeName(
 function rowToDocument(r: DocumentRow): Record<string, unknown> {
   return {
     id: r.id,
-    tenantId: r.tenantId,
+    tenantId: r.tenant_id,
     departmentId: r.department_id,
     documentTypeId: r.document_type_id,
     filename: r.filename,
@@ -610,7 +611,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
         uploaded_at: new Date(),
         processed_at: null,
         cost_usd_cents: 0,
-      } as Omit<DocumentRow, 'id' | 'tenantId' | 'deleted'>);
+      } as Omit<DocumentRow, 'id' | 'tenantId' | 'tenant_id' | 'deleted'>);
     } catch (insertError) {
       // Rollback: remove arquivo do S3
       try {
@@ -852,14 +853,14 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    await assertCanReadDepartment(sql, userId, doc.tenantId, doc.department_id, role);
+    await assertCanReadDepartment(sql, userId, doc.tenant_id, doc.department_id, role);
 
     // Enriquece com pageCount de document_content
     const contentRows = await sql<Array<{ extraction: { pageCount?: number } | null }>>`
       SELECT extraction
       FROM document_content
       WHERE document_id = ${doc.id}
-        AND tenant_id = ${doc.tenantId}
+        AND tenant_id = ${doc.tenant_id}
       LIMIT 1
     `;
     const pageCount =
@@ -868,7 +869,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
         : null;
 
     request.log.info(
-      { tenantId: doc.tenantId, userId, documentId: doc.id },
+      { tenantId: doc.tenant_id, userId, documentId: doc.id },
       'detalhe de documento recuperado'
     );
 
@@ -901,7 +902,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    await assertCanReadDepartment(sql, userId, doc.tenantId, doc.department_id, role);
+    await assertCanReadDepartment(sql, userId, doc.tenant_id, doc.department_id, role);
 
     const { open } = DownloadQuerySchema.parse(request.query);
     const expiresInSeconds = 300;
@@ -915,7 +916,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const auditLogger = new AuditLogger(sql);
     try {
       await auditLogger.record({
-        tenantId: doc.tenantId,
+        tenantId: doc.tenant_id,
         userId,
         action: 'document.download',
         resource: `documents/${doc.id}`,
@@ -923,13 +924,13 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       });
     } catch (auditError) {
       request.log.error(
-        { err: auditError, tenantId: doc.tenantId, userId, documentId: doc.id },
+        { err: auditError, tenantId: doc.tenant_id, userId, documentId: doc.id },
         'falha ao registrar audit log de download'
       );
     }
 
     request.log.info(
-      { tenantId: doc.tenantId, userId, documentId: doc.id },
+      { tenantId: doc.tenant_id, userId, documentId: doc.id },
       'URL de download gerada'
     );
 
@@ -962,7 +963,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    await assertCanReadDepartment(sql, userId, doc.tenantId, doc.department_id, role);
+    await assertCanReadDepartment(sql, userId, doc.tenant_id, doc.department_id, role);
 
     const CONVERTIBLE_MIMES = new Set([
       'application/vnd.openxmlformats-officedocument.presentationml.presentation',
@@ -1001,7 +1002,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       if (!extractorResponse.ok) {
         const errText = await extractorResponse.text().catch(() => '');
         request.log.error(
-          { tenantId: doc.tenantId, userId, documentId: doc.id, status: extractorResponse.status, body: errText },
+          { tenantId: doc.tenant_id, userId, documentId: doc.id, status: extractorResponse.status, body: errText },
           'extractor retornou erro na conversão'
         );
         return reply.status(502).send({ error: 'falha na conversão do documento' });
@@ -1020,7 +1021,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const auditLogger = new AuditLogger(sql);
     try {
       await auditLogger.record({
-        tenantId: doc.tenantId,
+        tenantId: doc.tenant_id,
         userId,
         action: 'document.preview',
         resource: `documents/${doc.id}`,
@@ -1028,13 +1029,13 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       });
     } catch (auditError) {
       request.log.error(
-        { err: auditError, tenantId: doc.tenantId, userId, documentId: doc.id },
+        { err: auditError, tenantId: doc.tenant_id, userId, documentId: doc.id },
         'falha ao registrar audit log de preview'
       );
     }
 
     request.log.info(
-      { tenantId: doc.tenantId, userId, documentId: doc.id, mimeType: doc.mime_type },
+      { tenantId: doc.tenant_id, userId, documentId: doc.id, mimeType: doc.mime_type },
       'preview PDF gerado via extractor'
     );
 
@@ -1073,7 +1074,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    const tenantId = doc.tenantId;
+    const tenantId = doc.tenant_id;
     const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
 
     await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
@@ -1202,7 +1203,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    const tenantId = doc.tenantId;
+    const tenantId = doc.tenant_id;
     const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
 
     await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
@@ -1274,7 +1275,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       });
     }
 
-    const tenantId = doc.tenantId;
+    const tenantId = doc.tenant_id;
     const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
 
     await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
@@ -1361,9 +1362,9 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    await assertCanReadDepartment(sql, userId, doc.tenantId, doc.department_id, role);
+    await assertCanReadDepartment(sql, userId, doc.tenant_id, doc.department_id, role);
 
-    const tenantId = doc.tenantId;
+    const tenantId = doc.tenant_id;
 
     reply.hijack();
 

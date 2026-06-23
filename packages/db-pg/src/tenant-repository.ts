@@ -22,14 +22,14 @@ export interface TenantDocument {
  * próprio wrapper gerencia (`id`, `tenantId`, `deleted`). O `id` pode ser
  * fornecido (idempotência/seed); se ausente, é gerado.
  */
-export type CreateInput<T extends TenantDocument> = Omit<T, 'id' | 'tenantId' | 'deleted'> & {
+export type CreateInput<T extends TenantDocument> = Omit<T, 'id' | 'tenantId' | 'tenant_id' | 'deleted'> & {
   id?: string;
 };
 
 /**
  * Campos atualizáveis: tudo exceto os gerenciados pelo wrapper e o `id`.
  */
-export type UpdateInput<T extends TenantDocument> = Partial<Omit<T, 'id' | 'tenantId' | 'deleted'>>;
+export type UpdateInput<T extends TenantDocument> = Partial<Omit<T, 'id' | 'tenantId' | 'tenant_id' | 'deleted'>>;
 
 /**
  * Wrapper central de isolamento multi-tenant + exclusão lógica — PostgreSQL.
