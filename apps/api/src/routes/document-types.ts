@@ -279,14 +279,14 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
     const repo = new TenantRepository<DocumentTypeDoc>(sql, 'document_types', { tenantId });
 
-    const docType = await repo.insertOne({
+    const docType = rowToDocType(await repo.insertOne({
       name,
       description: description ?? null,
       isGlobal: false,
       createdAt: new Date(),
       indexFields: [],
       departmentIds: resolvedDeptIds,
-    });
+    }) as unknown as DocTypeRow);
 
     request.log.info({ tenantId, documentTypeId: docType.id }, 'tipo de documento criado');
     const enrichedDocType = await enrichWithDepartments(docType, sql);

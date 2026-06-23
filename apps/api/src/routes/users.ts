@@ -255,7 +255,7 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
       const usersRepo = new TenantRepository<UserDoc>(sql, 'users', { tenantId });
       const pagination = cursor !== undefined ? { limit, cursor } : { limit };
       const page = await usersRepo.findMany({}, pagination);
-      items = page.items.map(safeUser);
+      items = page.items.map((r) => safeUser(rowToUserDoc(r as unknown as UserRow)));
       nextCursor = page.nextCursor;
     } else {
       let rows: UserRow[];

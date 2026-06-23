@@ -319,6 +319,33 @@ async function resolveDocumentTypeName(
 }
 
 /**
+ * Mapeia uma linha snake_case do PostgreSQL para o formato camelCase da resposta.
+ */
+function rowToDocument(r: DocumentRow): Record<string, unknown> {
+  return {
+    id: r.id,
+    tenantId: r.tenantId,
+    departmentId: r.department_id,
+    documentTypeId: r.document_type_id,
+    filename: r.filename,
+    originalFilename: r.original_filename,
+    contentHash: r.content_hash,
+    sizeBytes: Number(r.size_bytes),
+    mimeType: r.mime_type,
+    s3Key: r.s3_key,
+    status: r.status,
+    failureReason: r.failure_reason,
+    tags: r.tags,
+    indexValues: r.index_values,
+    uploadedById: r.uploaded_by_id,
+    uploadedAt: r.uploaded_at,
+    processedAt: r.processed_at,
+    costUsdCents: r.cost_usd_cents,
+    deleted: r.deleted,
+  };
+}
+
+/**
  * Emite um evento de upload na tabela append-only `document_events`.
  *
  * Falha de emissão NUNCA derruba a operação de upload.
@@ -523,7 +550,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       return reply
         .status(200)
         .header('X-Deduplicated', 'true')
-        .send(existingDoc);
+        .send(rowToDocument(existingDoc));
     }
 
     // ------------------------------------------------------------------
@@ -669,7 +696,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       'documento enviado com sucesso'
     );
 
-    return reply.status(201).send(document);
+    return reply.status(201).send(rowToDocument(document));
   });
 
   // =========================================================================
@@ -796,7 +823,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       'listagem de documentos'
     );
 
-    return reply.status(200).send({ items: page, nextCursor, total });
+    return reply.status(200).send({ items: page.map(rowToDocument), nextCursor, total });
   });
 
   // =========================================================================
@@ -845,7 +872,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       'detalhe de documento recuperado'
     );
 
-    return reply.status(200).send({ ...doc, pageCount });
+    return reply.status(200).send({ ...rowToDocument(doc), pageCount });
   });
 
   // =========================================================================
@@ -1116,7 +1143,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     }
 
     if (Object.keys(updateData).length === 0) {
-      return reply.status(200).send(doc);
+      return reply.status(200).send(rowToDocument(doc));
     }
 
     const updated = await repo.updateById(id, updateData);
@@ -1146,7 +1173,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       'documento atualizado'
     );
 
-    return reply.status(200).send(updated);
+    return reply.status(200).send(rowToDocument(updated as DocumentRow));
   });
 
   // =========================================================================
@@ -1305,7 +1332,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       'documento reenfileirado para reprocessamento'
     );
 
-    return reply.status(202).send(updated);
+    return reply.status(202).send(rowToDocument(updated as DocumentRow));
   });
 
   // =========================================================================
