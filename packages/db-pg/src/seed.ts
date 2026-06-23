@@ -344,7 +344,7 @@ async function seedDepartmentTemplateRic(sql: postgres.Sql): Promise<void> {
   const raw = JSON.parse(readFileSync(dataPath, 'utf-8')) as {
     name: string;
     description: string;
-    nodes: unknown[];
+    nodes: Array<Record<string, unknown>>;
   };
 
   await sql`
@@ -352,7 +352,7 @@ async function seedDepartmentTemplateRic(sql: postgres.Sql): Promise<void> {
     VALUES (
       gen_random_uuid(),
       ${raw.name},
-      ${sql.json(raw.nodes)},
+      ${sql.json(raw.nodes as unknown as postgres.JSONValue)},
       NOW(),
       NOW()
     )
