@@ -118,7 +118,13 @@ services:
       - backend_api_nm:/app/apps/api/node_modules
       - backend_worker_nm:/app/apps/worker/node_modules
       - backend_shared_nm:/app/packages/shared-types/node_modules
-    command: sh -c "corepack enable && pnpm install && pnpm --filter @dmdoc/shared-types build"
+    command: >
+      sh -c "corepack enable && pnpm install &&
+        pnpm --filter @dmdoc/shared-types build &&
+        pnpm --filter @dmdoc/extractor build &&
+        pnpm --filter @dmdoc/llm-provider build &&
+        pnpm --filter @dmdoc/db-pg build &&
+        pnpm --filter @dmdoc/db-mongo build"
 
   # ---------------- API (hot-reload via tsx watch) ----------------
   api:
