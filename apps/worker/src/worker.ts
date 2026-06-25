@@ -84,6 +84,8 @@ async function main(): Promise<void> {
   // OpenAI (embeddings)
   const openai = new OpenAI({
     apiKey: config.OPENAI_API_KEY ?? '',
+    // node-fetch@2 falha ao descomprimir gzip em Docker (MTU mismatch)
+    defaultHeaders: { 'Accept-Encoding': 'identity' },
   });
   logger.info({ model: config.EMBEDDING_MODEL }, 'OpenAI client criado');
 
