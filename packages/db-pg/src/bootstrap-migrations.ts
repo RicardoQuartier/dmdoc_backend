@@ -25,7 +25,7 @@ try {
   console.log('✔ drizzle.__drizzle_migrations ready');
 
   // 2. Mark 0001_initial as already applied (sha256 of the file)
-  const hash0001 = 'b378f143c939b4b277e880cc7565b6dd0f4b67ab18852b1b069fbb7dbdc0a156';
+  const hash0001 = '476966a7083bcea0509dc6fbf5cbbcb8d00b94598d34d33bccc6f221f4104fbd';
   const hash0002 = '032167c206fa0b0e9db055e48f96e0ed3281cb1d20d040edd3640baef19c3e1c';
 
   const existing = await sql<{ hash: string }[]>`
