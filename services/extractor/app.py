@@ -1,8 +1,5 @@
 """Microserviço de extração de texto do DMDoc (Python).
 
-Substitui o Unstructured e o NativeExtractor (Node): um único serviço que extrai
-texto de todos os formatos suportados, com OCR de alta qualidade para scans.
-
 Modos de operação:
   - Fila Redis (primário): consumer loop BRPOP em 'extract:requests'; baixa o
     arquivo do S3 diretamente; publica resultado em 'extract:result:{requestId}'.
@@ -12,14 +9,14 @@ Modos de operação:
 
 Dispatch por formato:
 - PDF   → PyMuPDF (texto nativo); páginas escaneadas (sem texto) caem para OCR
-- JPG/PNG/WebP → OCR (EasyOCR) com remoção de borda branca + auto-rotação
+- JPG/PNG/WebP → OCR (Tesseract) com remoção de borda branca + auto-rotação via OSD
 - DOCX  → python-docx (parágrafos + tabelas) + OCR de imagens embutidas
 - XLSX  → openpyxl (células por planilha)
 - PPTX  → python-pptx (texto dos slides)
 
-OCR: auto-rotação em 2 etapas baratas (detector nas 4 rotações de miniatura →
-reconhecimento só nos 2 candidatos) + OCR full-res 1×. Resolve scans girados
-sem fazer 4 passadas em alta resolução (causa de OOM).
+OCR: Tesseract com LSTM engine (--oem 1). Auto-rotação via Tesseract OSD (--psm 0)
+em vez de EasyOCR/PyTorch — funciona sem AVX2/FMA e processa 1-3s/página em CPUs
+antigas (vs. 20-90s do EasyOCR em Westmere/Ivy Bridge sem AVX2).
 """
 
 import asyncio
@@ -36,27 +33,10 @@ import boto3
 import redis as redis_lib
 
 import cv2
-import torch
-import easyocr
+import pytesseract
 import fitz  # PyMuPDF
 import numpy as np
-
-# Backend quantizado do PyTorch. O modelo de reconhecimento do EasyOCR usa
-# quantização dinâmica (qlinear_dynamic). O backend padrão 'onednn' (e o
-# alternativo 'fbgemm') emitem kernels AVX2/FMA — que QUEBRAM com SIGILL
-# (exit 132) em CPUs antigas como Ivy Bridge (i3 3ª geração: AVX sim,
-# AVX2/FMA não). O 'qnnpack' é o backend portátil (originalmente para ARM)
-# e roda no x86 sem AVX2. Mais lento, porém universal — sem ele a inferência
-# derruba o container assim que recebe a primeira imagem. Complementa o
-# ATEN_CPU_CAPABILITY=default do docker-compose, que só cobre os kernels
-# não-quantizados do ATen.
-if "qnnpack" in torch.backends.quantized.supported_engines:
-    torch.backends.quantized.engine = "qnnpack"
-from docx import Document as DocxDocument
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response
-from openpyxl import load_workbook
-from pptx import Presentation
+from PIL import Image
 
 logger = logging.getLogger("dmdoc.extractor")
 _handler = logging.StreamHandler()
@@ -66,6 +46,10 @@ logger.setLevel(logging.INFO)
 logger.propagate = False
 
 LANGS = os.environ.get("OCR_LANGS", "pt").split(",")
+
+# Mapeia códigos EasyOCR/ISO → Tesseract (mantém compatibilidade com OCR_LANGS existente)
+_LANG_MAP = {"pt": "por", "en": "eng", "es": "spa", "fr": "fra", "de": "deu"}
+OCR_LANG_TESS = "+".join(_LANG_MAP.get(l.strip(), l.strip()) for l in LANGS)
 
 # Timeout máximo (segundos) para o endpoint /extract legado (HTTP direto).
 # O consumer Redis não usa este timeout — processa sem limite de tempo.
@@ -83,12 +67,6 @@ RESULT_KEY_TTL_SECS = 3600
 EXTRACT_REQUEST_QUEUE = "extract:requests"
 EXTRACT_RESULT_PREFIX = "extract:result:"
 
-# Semáforo global que serializa jobs de OCR. OCR em CPU não tem ganho real de
-# paralelismo (afinal é single-threaded no PyTorch), mas consome ~1-2 GiB por job.
-# Limitar a 1 job simultâneo é a forma mais simples de manter o pico de RAM
-# previsível, sem depender de filas externas.
-_ocr_semaphore = asyncio.Semaphore(1)
-
 # Mapeamento content-type → extensão de arquivo para conversão Office→PDF.
 OFFICE_EXTENSIONS: dict[str, str] = {
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
@@ -103,28 +81,8 @@ OFFICE_EXTENSIONS: dict[str, str] = {
     "application/rtf": ".rtf",
 }
 
-# Resolução máxima enviada ao OCR (maior lado, px). Reduzido de 2048 → 1600:
-# em scans de identidade (RG/CNH) 1600px no maior lado preserva os campos-chave
-# (nome, números, órgão) com folga para o OCR, mas corta ~40% do número de pixels
-# vs 2048 (1600²/2048² ≈ 0.61) — alívio direto de memória e tempo no EasyOCR, que
-# é O(pixels). Acurácia nos campos grandes de um documento de identidade é
-# praticamente inalterada nessa faixa.
+# Resolução máxima enviada ao OCR (maior lado, px).
 MAX_DIM = 1600
-# Maior lado (px) da MINIATURA usada na 1ª etapa da detecção de orientação. Nessa
-# etapa rodamos só o DETECTOR do EasyOCR (CRAFT, sem reconhecimento) nas 4 rotações
-# — barato — para contar caixas de texto e escolher os 2 ângulos candidatos.
-ORIENT_DIM = 640
-# Quantas orientações candidatas (as de maior nº de caixas detectadas) passam para a
-# 2ª etapa. O detector não distingue 0°↔180° nem 90°↔270° (caixas idênticas de
-# cabeça pra baixo), então levamos 2 candidatos ao reconhecimento para desambiguar
-# por texto real (len×confiança). Resultado: 4× detect (barato) + 2× reconhecimento
-# numa thumb, em vez de 4× reconhecimento full-res.
-ORIENT_CANDIDATES = 2
-# Teto explícito para o canvas interno do EasyOCR. O default do EasyOCR é
-# canvas_size=2560: se a imagem for menor ele faz UPSCALE até esse tamanho antes da
-# detecção, inflando memória sem ganho. Travamos o canvas no maior lado real (com
-# teto MAX_DIM) e mag_ratio=1.0 para proibir qualquer ampliação interna.
-OCR_CANVAS_CAP = MAX_DIM
 # Limiar de grayscale: pixel < CONTENT_THRESHOLD conta como conteúdo (não-branco).
 CONTENT_THRESHOLD = 220
 # Mínimo de caracteres alfanuméricos numa página de PDF para considerá-la "nativa"
@@ -138,14 +96,11 @@ _IMAGE_MIMES = frozenset({
 })
 _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif")
 
-_ROTATIONS = {
-    0: None,
-    90: cv2.ROTATE_90_CLOCKWISE,
-    180: cv2.ROTATE_180,
-    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
-}
-
-_reader = easyocr.Reader(LANGS, gpu=False)
+from docx import Document as DocxDocument
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
+from openpyxl import load_workbook
+from pptx import Presentation
 
 app = FastAPI(title="DMDoc Extractor", version="1.0.0")
 
@@ -249,7 +204,7 @@ def _start_consumer() -> None:
     logger.info("extraction consumer thread iniciado")
 
 
-# ──────────────────────────── OCR ────────────────────────────
+# ──────────────────────────── OCR (Tesseract) ────────────────────────────
 
 
 def _crop_white(img: np.ndarray) -> np.ndarray:
@@ -287,91 +242,42 @@ def _resize(img: np.ndarray, max_dim: int) -> np.ndarray:
     return img
 
 
-def _ocr_once(img: np.ndarray) -> tuple[list[str], list[float], float]:
-    """Roda o EasyOCR uma vez, com o canvas interno travado no tamanho real da
-    imagem (teto OCR_CANVAS_CAP) e mag_ratio=1.0 para proibir upscaling — o que
-    evita a explosão de memória do default canvas_size=2560."""
-    h, w = img.shape[:2]
-    canvas = min(max(h, w), OCR_CANVAS_CAP)
-    # canvas_size precisa ser >= 32 para o EasyOCR; thumbs pequenas ainda passam.
-    canvas = max(canvas, 32)
-    result = _reader.readtext(
-        img,
-        detail=1,
-        paragraph=False,
-        canvas_size=canvas,
-        mag_ratio=1.0,
-    )
-    lines: list[str] = []
-    confs: list[float] = []
-    score = 0.0
-    for item in result or []:
-        try:
-            text = item[1].strip()
-            conf = float(item[2])
-        except (IndexError, TypeError, ValueError, AttributeError):
-            continue
-        if text:
-            lines.append(text)
-            confs.append(conf)
-            score += len(text) * conf
-    return lines, confs, score
+def _to_pil(img: np.ndarray) -> Image.Image:
+    """Converte imagem BGR (OpenCV) para PIL RGB (Tesseract/Pillow)."""
+    return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
 
-def _best_rotation(img: np.ndarray) -> int | None:
-    """Escolhe a orientação por RECONHECIMENTO numa miniatura (ORIENT_DIM), testando
-    as 4 rotações. O score (len×confiança) separa de forma confiável a orientação
-    correta das erradas — texto de lado ou de cabeça para baixo gera leituras de
-    score baixo. Retorna o código cv2.rotate (ou None para 0°).
-
-    Por que NÃO usar a contagem de caixas do detector (abordagem anterior): em página
-    de texto corrido, girar 90°/270° transforma as linhas em colunas e o CRAFT
-    fragmenta em MAIS caixas — a orientação errada vencia e a imagem já em pé era
-    descartada antes da desambiguação, fazendo o OCR rodar de lado e sair como lixo.
-    Reconhecer as 4 rotações na miniatura é barato: a imagem é pequena, e o OOM que
-    motivou a heurística vinha do reconhecimento em FULL-RES, não da miniatura.
-
-    Viés para o upright: só giramos se outra orientação superar a vertical (0°) por
-    uma margem clara (10%). Um documento já em pé nunca deve ser girado por ruído de
-    reconhecimento na miniatura."""
-    thumb = _resize(img, ORIENT_DIM)
-    _lines, _confs, upright_score = _ocr_once(thumb)
-    best_code: int | None = None
-    best_score = upright_score
-    for code in (
-        cv2.ROTATE_90_CLOCKWISE,
-        cv2.ROTATE_180,
-        cv2.ROTATE_90_COUNTERCLOCKWISE,
-    ):
-        _lines, _confs, score = _ocr_once(cv2.rotate(thumb, code))
-        if score > best_score * 1.10:
-            best_score = score
-            best_code = code
-    return best_code
+def _auto_rotate(pil_img: Image.Image) -> Image.Image:
+    """Detecta orientação via Tesseract OSD (--psm 0) e corrige. Falha silenciosamente."""
+    try:
+        osd = pytesseract.image_to_osd(
+            pil_img, output_type=pytesseract.Output.DICT, config="--psm 0"
+        )
+        angle = osd.get("rotate", 0)
+        if angle:
+            pil_img = pil_img.rotate(angle, expand=True)
+    except Exception:
+        pass
+    return pil_img
 
 
 def ocr_image(img: np.ndarray) -> str:
-    """OCR completo e robusto:
-    1. recorta a borda branca;
-    2. detecta a orientação em 2 etapas baratas (detector nas 4 rotações de uma
-       miniatura → reconhecimento só nos 2 candidatos), preservando a auto-rotação;
-    3. roda o OCR FULL uma única vez na melhor orientação, em MAX_DIM.
+    """OCR via Tesseract LSTM:
+    1. Recorta borda branca;
+    2. Reduz para MAX_DIM;
+    3. Detecta e corrige orientação via Tesseract OSD (barato, sem rede neural pesada);
+    4. Roda reconhecimento com --oem 1 (LSTM) --psm 3 (auto page segmentation).
 
-    Antes o OCR rodava 4× em alta resolução só para achar a orientação — causa do
-    OOM/lentidão. Agora são 4× detect (barato) + 2× reconhecimento em miniatura +
-    1× reconhecimento full-res.
-
-    Toda a etapa de OCR é protegida por try/except: uma imagem patológica retorna
-    texto vazio + log, em vez de derrubar o worker uvicorn (e com ele o serviço)."""
+    Toda a etapa é protegida por try/except: uma imagem patológica retorna
+    texto vazio + log, em vez de derrubar o serviço."""
     try:
         cropped = _crop_white(img)
-        best_code = _best_rotation(cropped)
         full = _resize(cropped, MAX_DIM)
-        if best_code is not None:
-            full = cv2.rotate(full, best_code)
-        lines, _confs, _score = _ocr_once(full)
-        return "\n".join(lines)
-    except Exception:  # noqa: BLE001 — guarda de robustez: nunca derrubar o serviço
+        pil_img = _auto_rotate(_to_pil(full))
+        return pytesseract.image_to_string(
+            pil_img, lang=OCR_LANG_TESS, config="--oem 1 --psm 3"
+        ).strip()
+    except Exception:  # noqa: BLE001
         logger.exception("ocr_image falhou; retornando texto vazio para este item")
         return ""
 
@@ -606,25 +512,19 @@ async def extract(
 ) -> dict:
     """Extrai texto do documento recebido.
 
-    - Corre no ThreadPoolExecutor via asyncio.to_thread() para não bloquear o
-      event loop do uvicorn durante OCR em CPU (30-120s num scan de identidade).
-      Isso garante que GET /health continue respondendo e o healthcheck do Docker
-      não dispare reinícios desnecessários.
-    - O asyncio.Semaphore(1) serializa jobs de OCR: nunca dois OCRs simultâneos,
-      evitando pico duplo de RAM.
-    - REQUEST_TIMEOUT_S: se o processamento ultrapassar o limite, devolve HTTP 503
-      com mensagem descritiva, em vez de prender a conexão indefinidamente.
+    Corre no ThreadPoolExecutor via asyncio.to_thread() para não bloquear o
+    event loop do uvicorn durante OCR (Tesseract é síncrono/bloqueante).
+    REQUEST_TIMEOUT_S: se o processamento ultrapassar o limite, devolve HTTP 503.
     """
     data = await file.read()
     mime = content_type or file.content_type or ""
     name = (file.filename or "").lower()
 
-    async def _run() -> dict:
-        async with _ocr_semaphore:
-            return await asyncio.to_thread(_dispatch_extract, data, mime, name)
-
     try:
-        out = await asyncio.wait_for(_run(), timeout=REQUEST_TIMEOUT_S)
+        out = await asyncio.wait_for(
+            asyncio.to_thread(_dispatch_extract, data, mime, name),
+            timeout=REQUEST_TIMEOUT_S,
+        )
     except asyncio.TimeoutError:
         logger.error(
             "extract timeout após %ds: mime=%s name=%s bytes=%d",

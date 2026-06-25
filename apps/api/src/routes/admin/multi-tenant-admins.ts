@@ -12,24 +12,6 @@ interface TenantSummary {
   active: boolean;
 }
 
-/**
- * Documento de tenant mínimo (campos usados internamente).
- */
-interface TenantDoc {
-  id: string;
-  name: string;
-  active: boolean;
-}
-
-/**
- * Documento de usuário MTA (campos mínimos usados nestas rotas).
- */
-interface MtaUserDoc {
-  id: string;
-  role: string;
-  allowedTenantIds: string[];
-}
-
 const UserIdParamsSchema = z.object({
   userId: z.string().uuid(),
 });
@@ -58,24 +40,35 @@ const PutTenantsBodySchema = z.object({
  *
  * Invariantes:
  *   - Usuário deve existir e ter role MULTI_TENANT_ADMIN (404 caso contrário).
- *   - Todos os tenantIds devem existir na coleção `tenants` (404 com mensagem
+ *   - Todos os tenantIds devem existir na tabela `tenants` (404 com mensagem
  *     indicando qual ID não existe).
  *   - Máximo de 20 tenants por MTA (409 se lista estiver cheia).
  *   - Lista não pode ficar vazia (409 ao tentar remover o último tenant).
- *   - $addToSet evita duplicatas na adição.
- *   - $pull remove sem erro se elemento não existir.
  */
 export const multiTenantAdminsRoutes: FastifyPluginAsync = async (app) => {
-  const db = app.db;
+  const sql = app.db;
 
   /**
    * Busca e valida que o usuário existe e tem role MULTI_TENANT_ADMIN.
    * Lança NotFoundError se não existir, estiver deletado ou tiver outro role.
    */
-  async function getMtaUserOrThrow(userId: string): Promise<MtaUserDoc> {
-    const user = (await db
-      .collection('users')
-      .findOne({ id: userId, deleted: false })) as unknown as MtaUserDoc | null;
+  async function getMtaUserOrThrow(userId: string): Promise<{
+    id: string;
+    role: string;
+    allowedTenantIds: string[];
+  }> {
+    const rows = await sql<Array<{
+      id: string;
+      role: string;
+      allowed_tenant_ids: string[] | null;
+    }>>`
+      SELECT id, role, allowed_tenant_ids
+      FROM users
+      WHERE id = ${userId}
+        AND deleted = false
+      LIMIT 1
+    `;
+    const user = rows[0];
 
     if (!user) {
       throw new NotFoundError('Usuário não encontrado');
@@ -84,18 +77,23 @@ export const multiTenantAdminsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Usuário não é MULTI_TENANT_ADMIN');
     }
 
-    return user;
+    return {
+      id: user.id,
+      role: user.role,
+      allowedTenantIds: user.allowed_tenant_ids ?? [],
+    };
   }
 
   /**
-   * Valida que todos os tenantIds existem na coleção `tenants`.
+   * Valida que todos os tenantIds existem na tabela `tenants`.
    * Lança NotFoundError com o primeiro ID ausente caso algum não exista.
    */
   async function validateAndFetchTenants(tenantIds: string[]): Promise<TenantSummary[]> {
-    const docs = (await db
-      .collection('tenants')
-      .find({ id: { $in: tenantIds } })
-      .toArray()) as unknown as TenantDoc[];
+    const docs = await sql<Array<{ id: string; name: string; active: boolean }>>`
+      SELECT id, name, active
+      FROM tenants
+      WHERE id = ANY(${tenantIds}::uuid[])
+    `;
 
     const foundIds = new Set(docs.map((t) => t.id));
     const missing = tenantIds.find((id) => !foundIds.has(id));
@@ -113,16 +111,16 @@ export const multiTenantAdminsRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * Busca os tenants de um MTA e retorna como TenantSummary[].
-   * Tenants que foram deletados/inexistentes são filtrados silenciosamente
-   * (a lista pode divergir se um tenant for removido da plataforma).
+   * Tenants que foram deletados/inexistentes são filtrados silenciosamente.
    */
   async function fetchAllowedTenants(allowedTenantIds: string[]): Promise<TenantSummary[]> {
     if (allowedTenantIds.length === 0) return [];
 
-    const docs = (await db
-      .collection('tenants')
-      .find({ id: { $in: allowedTenantIds } })
-      .toArray()) as unknown as TenantDoc[];
+    const docs = await sql<Array<{ id: string; name: string; active: boolean }>>`
+      SELECT id, name, active
+      FROM tenants
+      WHERE id = ANY(${allowedTenantIds}::uuid[])
+    `;
 
     const byId = new Map(docs.map((t) => [t.id, t]));
     return allowedTenantIds
@@ -135,9 +133,6 @@ export const multiTenantAdminsRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * GET /admin/multi-tenant-admins/:userId/tenants
-   *
-   * Retorna a lista de tenants atribuídos ao MTA.
-   * Response: { tenants: Array<{ id, name, active }> }
    */
   app.get(
     '/admin/multi-tenant-admins/:userId/tenants',
@@ -156,10 +151,6 @@ export const multiTenantAdminsRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * PUT /admin/multi-tenant-admins/:userId/tenants
-   *
-   * Substitui a lista completa de tenants atribuídos ao MTA.
-   * Body: { tenantIds: string[] } — min 1, max 20, todos UUIDs válidos existentes.
-   * Response: { tenants: Array<{ id, name, active }> }
    */
   app.put(
     '/admin/multi-tenant-admins/:userId/tenants',
@@ -173,9 +164,11 @@ export const multiTenantAdminsRoutes: FastifyPluginAsync = async (app) => {
       await getMtaUserOrThrow(userId);
       const tenants = await validateAndFetchTenants(tenantIds);
 
-      await db
-        .collection('users')
-        .updateOne({ id: userId }, { $set: { allowedTenantIds: tenantIds } });
+      await sql`
+        UPDATE users
+        SET allowed_tenant_ids = ${tenantIds}::uuid[]
+        WHERE id = ${userId}
+      `;
 
       request.log.info({ userId, tenantIds }, 'allowedTenantIds do MTA substituídos');
       return reply.status(200).send({ tenants });
@@ -185,9 +178,7 @@ export const multiTenantAdminsRoutes: FastifyPluginAsync = async (app) => {
   /**
    * POST /admin/multi-tenant-admins/:userId/tenants/:tenantId
    *
-   * Adiciona um tenant à lista do MTA. Usa $addToSet para evitar duplicatas.
-   * Lança 409 se a lista já tem 20 itens (e o tenant não é duplicata).
-   * Response: { tenants: Array<{ id, name, active }> }
+   * Adiciona um tenant à lista do MTA.
    */
   app.post(
     '/admin/multi-tenant-admins/:userId/tenants/:tenantId',
@@ -205,17 +196,24 @@ export const multiTenantAdminsRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
-      // Valida que o tenant existe
       await validateAndFetchTenants([tenantId]);
 
-      await db
-        .collection('users')
-        .updateOne({ id: userId }, { $addToSet: { allowedTenantIds: tenantId } });
+      // Adiciona sem duplicar (array_append + DISTINCT via ARRAY)
+      await sql`
+        UPDATE users
+        SET allowed_tenant_ids = (
+          SELECT ARRAY(
+            SELECT DISTINCT unnest(COALESCE(allowed_tenant_ids, '{}'::uuid[]) || ARRAY[${tenantId}::uuid])
+          )
+        )
+        WHERE id = ${userId}
+      `;
 
-      const updatedUser = (await db
-        .collection('users')
-        .findOne({ id: userId })) as unknown as MtaUserDoc;
-      const tenants = await fetchAllowedTenants(updatedUser.allowedTenantIds);
+      const updatedRows = await sql<Array<{ allowed_tenant_ids: string[] | null }>>`
+        SELECT allowed_tenant_ids FROM users WHERE id = ${userId} LIMIT 1
+      `;
+      const updatedAllowed = updatedRows[0]?.allowed_tenant_ids ?? [];
+      const tenants = await fetchAllowedTenants(updatedAllowed);
 
       request.log.info({ userId, tenantId }, 'tenant adicionado ao MTA');
       return reply.status(200).send({ tenants });
@@ -224,9 +222,6 @@ export const multiTenantAdminsRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * DELETE /admin/multi-tenant-admins/:userId/tenants/:tenantId
-   *
-   * Remove um tenant da lista do MTA. Lança 409 se for o último.
-   * Response: { tenants: Array<{ id, name, active }> }
    */
   app.delete(
     '/admin/multi-tenant-admins/:userId/tenants/:tenantId',
@@ -245,22 +240,23 @@ export const multiTenantAdminsRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
-      // O tipo de PullOperator do driver MongoDB é restritivo para arrays de
-      // primitivos. Usamos cast via unknown para contornar sem perder segurança
-      // operacional — a semântica de $pull com string é bem definida no Mongo.
-      await db
-        .collection('users')
-        .updateOne(
-          { id: userId },
-          { $pull: { allowedTenantIds: tenantId } } as unknown as Parameters<
-            ReturnType<typeof db.collection>['updateOne']
-          >[1],
-        );
+      // Remove o tenantId do array
+      await sql`
+        UPDATE users
+        SET allowed_tenant_ids = (
+          SELECT ARRAY(
+            SELECT unnest(COALESCE(allowed_tenant_ids, '{}'::uuid[]))
+            EXCEPT SELECT ${tenantId}::uuid
+          )
+        )
+        WHERE id = ${userId}
+      `;
 
-      const updatedUser = (await db
-        .collection('users')
-        .findOne({ id: userId })) as unknown as MtaUserDoc;
-      const tenants = await fetchAllowedTenants(updatedUser.allowedTenantIds);
+      const updatedRows = await sql<Array<{ allowed_tenant_ids: string[] | null }>>`
+        SELECT allowed_tenant_ids FROM users WHERE id = ${userId} LIMIT 1
+      `;
+      const updatedAllowed = updatedRows[0]?.allowed_tenant_ids ?? [];
+      const tenants = await fetchAllowedTenants(updatedAllowed);
 
       request.log.info({ userId, tenantId }, 'tenant removido do MTA');
       return reply.status(200).send({ tenants });

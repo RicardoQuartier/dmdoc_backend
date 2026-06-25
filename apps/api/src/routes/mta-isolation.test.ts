@@ -2,17 +2,17 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
 import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
-import { newId } from '@dmdoc/db-mongo';
+import { newId } from '@dmdoc/db-pg';
 
 /**
  * Testes E2E de isolamento do papel MULTI_TENANT_ADMIN (MTA).
  *
- * Reaproveita o mesmo harness do `isolation.test.ts` (buildApp + memory-server,
- * seedUser com hash argon2 real, login via /auth/login). A diferença é o sujeito:
+ * Reaproveita o mesmo harness do `isolation.test.ts` (buildApp, seedUser com
+ * hash argon2 real, login via /auth/login). A diferença é o sujeito:
  * aqui o ator é um MTA com `tenantId: null` no token e uma lista
  * `allowedTenantIds`. As invariantes verificadas (spec §10):
  *
- *  - LEITURA sem `?tenantId` → mode `allowed`: filtro `{ tenantId: { $in } }`
+ *  - LEITURA sem `?tenantId` → mode `allowed`: filtro `tenant_id = ANY(...)` SQL
  *    sempre presente; o MTA enxerga itens de TODOS os tenants da lista e SÓ deles.
  *  - Recurso de tenant fora da lista é tratado como inexistente → 404 (nunca 403).
  *  - ESCRITA sem `?tenantId` → 404; ESCRITA com `?tenantId` ∉ lista → 404.
@@ -56,19 +56,22 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db.collection('users').deleteMany({});
-  await testDb.db.collection('tenants').deleteMany({});
-  await testDb.db.collection('departments').deleteMany({});
-  await testDb.db.collection('document_types').deleteMany({});
-  await testDb.db.collection('documents').deleteMany({});
-  await testDb.db.collection('department_permissions').deleteMany({});
+  await testDb.db`DELETE FROM department_permissions`;
+  await testDb.db`DELETE FROM documents`;
+  await testDb.db`DELETE FROM document_types`;
+  await testDb.db`DELETE FROM departments`;
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('MULTI_TENANT_ADMIN','TENANT_ADMIN','UPLOADER','USER')`;
+  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B}, ${TENANT_C})`;
 
   // Três tenants: A e B atribuídos ao MTA; C é de terceiro.
-  await testDb.db.collection('tenants').insertMany([
-    { id: TENANT_A, name: 'Empresa A', diskQuotaBytes: 10 * 1024 ** 3, userQuota: 20, active: true, createdAt: new Date() },
-    { id: TENANT_B, name: 'Empresa B', diskQuotaBytes: 10 * 1024 ** 3, userQuota: 20, active: true, createdAt: new Date() },
-    { id: TENANT_C, name: 'Empresa C', diskQuotaBytes: 10 * 1024 ** 3, userQuota: 20, active: true, createdAt: new Date() },
-  ]);
+  await testDb.db`
+    INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+    VALUES
+      (${TENANT_A}, 'Empresa A', ${10 * 1024 ** 3}, 20, true, NOW()),
+      (${TENANT_B}, 'Empresa B', ${10 * 1024 ** 3}, 20, true, NOW()),
+      (${TENANT_C}, 'Empresa C', ${10 * 1024 ** 3}, 20, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   // MTA com acesso a A e B (não a C). tenantId é null para papel global.
   await seedUser(testDb.db, {
@@ -90,71 +93,34 @@ beforeEach(async () => {
     allowedTenantIds: [],
   });
 
-  // Departamentos: um por tenant (necessário para a checagem de leitura do
-  // documento singular, que valida que o dept existe no tenant do doc).
-  await testDb.db.collection('departments').insertMany([
-    deptDoc(DEPT_A_ID, TENANT_A, 'Dept A'),
-    deptDoc(DEPT_B_ID, TENANT_B, 'Dept B'),
-    deptDoc(DEPT_C_ID, TENANT_C, 'Dept C'),
-  ]);
+  // Departamentos: um por tenant
+  await testDb.db`
+    INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+    VALUES
+      (${DEPT_A_ID}, ${TENANT_A}, NULL, 'Dept A', 0, '{}'::text[], false, NOW()),
+      (${DEPT_B_ID}, ${TENANT_B}, NULL, 'Dept B', 0, '{}'::text[], false, NOW()),
+      (${DEPT_C_ID}, ${TENANT_C}, NULL, 'Dept C', 0, '{}'::text[], false, NOW())
+  `;
 
   // Documentos: um por tenant. O de C nunca pode aparecer para o MTA.
-  await testDb.db.collection('documents').insertMany([
-    docDoc(DOC_A_ID, TENANT_A, DEPT_A_ID, ['tag-a']),
-    docDoc(DOC_B_ID, TENANT_B, DEPT_B_ID, ['tag-b']),
-    docDoc(DOC_C_ID, TENANT_C, DEPT_C_ID, ['tag-c', 'segredo-c']),
-  ]);
+  const hashA = 'a'.repeat(64);
+  const hashB = 'b'.repeat(64);
+  const hashC = 'c'.repeat(64);
+  await testDb.db`
+    INSERT INTO documents (
+      id, tenant_id, department_id, document_type_id,
+      original_filename, content_hash, size_bytes, mime_type,
+      s3_key, status, failure_reason, tags, index_values,
+      uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+    ) VALUES
+      (${DOC_A_ID}, ${TENANT_A}, ${DEPT_A_ID}, NULL, 'a.pdf', ${hashA}, 1024, 'application/pdf', ${`tenants/${TENANT_A}/${DOC_A_ID}.pdf`}, 'READY', NULL, '{"tag-a"}'::text[], '{}'::jsonb, ${MTA_ID}, NOW(), NOW(), 0, false),
+      (${DOC_B_ID}, ${TENANT_B}, ${DEPT_B_ID}, NULL, 'b.pdf', ${hashB}, 1024, 'application/pdf', ${`tenants/${TENANT_B}/${DOC_B_ID}.pdf`}, 'READY', NULL, '{"tag-b"}'::text[], '{}'::jsonb, ${MTA_ID}, NOW(), NOW(), 0, false),
+      (${DOC_C_ID}, ${TENANT_C}, ${DEPT_C_ID}, NULL, 'c.pdf', ${hashC}, 1024, 'application/pdf', ${`tenants/${TENANT_C}/${DOC_C_ID}.pdf`}, 'READY', NULL, '{"tag-c","segredo-c"}'::text[], '{}'::jsonb, ${MTA_ID}, NOW(), NOW(), 0, false)
+  `;
 
   mtaToken = await login('mta@plataforma.com');
   mtaEmptyToken = await login('mta-vazio@plataforma.com');
 });
-
-// ---------------------------------------------------------------------------
-// Helpers de seed
-// ---------------------------------------------------------------------------
-
-function deptDoc(id: string, tenantId: string, name: string): Record<string, unknown> {
-  return {
-    id,
-    tenantId,
-    parentId: null,
-    name,
-    level: 0,
-    tags: [],
-    deleted: false,
-    createdAt: new Date(),
-  };
-}
-
-function docDoc(
-  id: string,
-  tenantId: string,
-  departmentId: string,
-  tags: string[],
-): Record<string, unknown> {
-  return {
-    id,
-    tenantId,
-    departmentId,
-    documentTypeId: null,
-    filename: `${id}.pdf`,
-    originalFilename: `${id}.pdf`,
-    contentHash: id.replace(/-/g, '').padEnd(64, '0'),
-    sizeBytes: 1024,
-    mimeType: 'application/pdf',
-    s3Key: `tenants/${tenantId}/documents/${id}/file.pdf`,
-    status: 'READY',
-    failureReason: null,
-    tags,
-    mongoContentId: null,
-    indexValues: {},
-    uploadedById: MTA_ID,
-    uploadedAt: new Date(),
-    processedAt: new Date(),
-    costUsdCents: 0,
-    deleted: false,
-  };
-}
 
 async function login(email: string): Promise<string> {
   const res = await app.inject({
@@ -192,7 +158,7 @@ describe('MTA — GET /documents (mode allowed)', () => {
     // NUNCA vê C (tenant fora da lista)
     expect(ids).not.toContain(DOC_C_ID);
 
-    // Invariante: o filtro $in nunca é omitido — todo item pertence à lista.
+    // Invariante: todo item pertence à lista.
     expect(body.items.every((d) => d.tenantId === TENANT_A || d.tenantId === TENANT_B)).toBe(true);
     expect(body.items.some((d) => d.tenantId === TENANT_C)).toBe(false);
     expect(body.total).toBe(2);
@@ -237,17 +203,6 @@ describe('MTA — GET /documents/:id (singular, findDocumentInTenants)', () => {
 
 // ===========================================================================
 // Caso 3 — Busca (POST /search) não vaza documentos de terceiros
-//
-// O pipeline de conteúdo (lexical/vector/hybrid) depende de índices Atlas Search
-// (`$search`/`$vectorSearch`) que NÃO existem no mongodb-memory-server. Portanto
-// não é possível exercitar a agregação de chunks de forma determinística aqui.
-//
-// O que É determinístico e testável: a etapa de FILTROS ESTRUTURADOS
-// (`resolveFilteredDocumentIds`), que roda um `find` comum na coleção `documents`
-// aplicando `{ tenantId: { $in: allowedTenantIds } }`. Quando os filtros casam
-// SOMENTE documentos de um tenant fora da lista, a rota faz curto-circuito e
-// retorna vazio ANTES de tocar no `$search` — provando que o `$in` exclui o
-// terceiro tenant. Esse é o ponto de isolamento crítico da busca.
 // ===========================================================================
 
 describe('MTA — POST /search (isolamento via filtros estruturados)', () => {
@@ -264,8 +219,8 @@ describe('MTA — POST /search (isolamento via filtros estruturados)', () => {
       },
     });
 
-    // O doc com 'segredo-c' pertence ao tenant C (fora da lista). O $in de
-    // allowedTenantIds o exclui → filterDocumentIds === [] → curto-circuito.
+    // O doc com 'segredo-c' pertence ao tenant C (fora da lista). O ANY(...)
+    // SQL o exclui → filterDocumentIds === [] → curto-circuito.
     expect(res.statusCode).toBe(200);
     const body = res.json() as { answer: unknown; chunks: unknown[] };
     expect(body.answer).toBeNull();
@@ -440,10 +395,6 @@ describe('MTA — GET /departments (mode allowed)', () => {
 
 // ===========================================================================
 // Extra — MTA não acessa gestão de empresas (/admin/tenants, SUPER_ADMIN-only)
-//
-// A tarefa menciona "/admin/companies"; o path real no código é "/admin/tenants"
-// (a entidade empresa é `tenant`). O guard `requireRole(request, 'SUPER_ADMIN')`
-// NÃO concede passe-livre ao MTA → ForbiddenError 403.
 // ===========================================================================
 
 describe('MTA — gestão de empresas é vedada', () => {
@@ -468,3 +419,6 @@ describe('MTA — gestão de empresas é vedada', () => {
     expect(res.json().error.code).toBe('FORBIDDEN');
   });
 });
+
+// Suppress unused import warning - newId used for hash generation
+void newId;

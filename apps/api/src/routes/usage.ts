@@ -4,14 +4,6 @@ import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
 import { NotFoundError } from '../errors/index.js';
 
-interface TenantDoc {
-  id: string;
-  name: string;
-  diskQuotaBytes: number;
-  userQuota: number;
-  active: boolean;
-}
-
 const TenantIdQuerySchema = z.object({
   tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas
 });
@@ -28,7 +20,6 @@ const TenantIdQuerySchema = z.object({
  *   - TENANT_ADMIN: usa o tenantId do JWT
  *   - SUPER_ADMIN: exige ?tenantId explícito
  *   - MULTI_TENANT_ADMIN: exige ?tenantId explícito, validado contra allowedTenantIds
- *     (404 se não constar). Não há acesso a métricas agregadas de todos os tenants.
  *
  * Spec §7 (Admin), entregável 37 da Fase 5.
  */
@@ -38,68 +29,73 @@ export const usageRoutes: FastifyPluginAsync = async (app) => {
 
     const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
 
-    // resolveTenantContext em modo write=true força tenantId explícito para SA e MTA.
-    // Para TENANT_ADMIN retorna mode:'single' com o tenantId do token.
-    // Nos demais casos (SA/MTA sem explicitTenantId) lança ConflictError/NotFoundError
-    // antes de chegar aqui — portanto ctx.mode é sempre 'single' após esta linha.
     const ctx = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: true });
     if (ctx.mode !== 'single') {
-      // Ramo defensivo: write:true garante que never chegamos aqui, mas o
-      // TypeScript não infere o narrowing via throw do resolveTenantContext.
       throw new NotFoundError('tenantId é obrigatório para esta operação');
     }
     const tenantId = ctx.tenantId;
 
-    const db = app.db;
+    const sql = app.db;
 
     // Buscar tenant para obter as cotas configuradas
-    const tenant = await db.collection<TenantDoc>('tenants').findOne({ id: tenantId });
+    const tenantRows = await sql<Array<{
+      id: string;
+      name: string;
+      disk_quota_bytes: bigint;
+      user_quota: number;
+    }>>`
+      SELECT id, name, disk_quota_bytes, user_quota
+      FROM tenants
+      WHERE id = ${tenantId}
+      LIMIT 1
+    `;
+    const tenant = tenantRows[0];
     if (!tenant) {
       throw new NotFoundError('Tenant não encontrado');
     }
 
-    // 1. Uso de disco: soma de sizeBytes de documentos não deletados
-    const diskAgg = await db
-      .collection('documents')
-      .aggregate<{ diskUsedBytes: number }>([
-        { $match: { tenantId, deleted: false } },
-        { $group: { _id: null, diskUsedBytes: { $sum: '$sizeBytes' } } },
-      ])
-      .toArray();
-
-    const diskUsedBytes = diskAgg[0]?.diskUsedBytes ?? 0;
+    // 1. Uso de disco: soma de size_bytes de documentos não deletados
+    const diskRows = await sql<Array<{ disk_used_bytes: string }>>`
+      SELECT COALESCE(SUM(size_bytes), 0)::text AS disk_used_bytes
+      FROM documents
+      WHERE tenant_id = ${tenantId}
+        AND deleted = false
+    `;
+    const diskUsedBytes = Number(diskRows[0]?.disk_used_bytes ?? '0');
+    const diskQuotaBytes = Number(tenant.disk_quota_bytes);
 
     // 2. Usuários ativos: contagem de usuários não deletados e ativos
-    const activeUserCount = await db
-      .collection('users')
-      .countDocuments({ tenantId, deleted: false, active: true });
+    const userCountRows = await sql<Array<{ count: string }>>`
+      SELECT COUNT(*)::text AS count
+      FROM users
+      WHERE tenant_id = ${tenantId}
+        AND deleted = false
+        AND active = true
+    `;
+    const activeUserCount = parseInt(userCountRows[0]?.count ?? '0', 10);
 
-    // 3. Custo IA: soma de costUsdCents em todos os documentos do tenant
+    // 3. Custo IA: soma de cost_usd_cents em todos os documentos do tenant
     //    Inclui documentos deletados (custo já foi incorrido)
-    const costAgg = await db
-      .collection('documents')
-      .aggregate<{ totalCostUsdCents: number }>([
-        { $match: { tenantId } },
-        { $group: { _id: null, totalCostUsdCents: { $sum: '$costUsdCents' } } },
-      ])
-      .toArray();
-
-    const totalAiCostUsdCents = costAgg[0]?.totalCostUsdCents ?? 0;
+    const costRows = await sql<Array<{ total_cost: string }>>`
+      SELECT COALESCE(SUM(cost_usd_cents), 0)::text AS total_cost
+      FROM documents
+      WHERE tenant_id = ${tenantId}
+    `;
+    const totalAiCostUsdCents = parseInt(costRows[0]?.total_cost ?? '0', 10);
 
     // 4. Métricas de documentos por status
-    const docStatusAgg = await db
-      .collection('documents')
-      .aggregate<{ status: string; count: number }>([
-        { $match: { tenantId, deleted: false } },
-        { $group: { _id: '$status', count: { $sum: 1 } } },
-        { $project: { status: '$_id', count: 1, _id: 0 } },
-      ])
-      .toArray();
+    const statusRows = await sql<Array<{ status: string; count: string }>>`
+      SELECT status, COUNT(*)::text AS count
+      FROM documents
+      WHERE tenant_id = ${tenantId}
+        AND deleted = false
+      GROUP BY status
+    `;
 
-    const documentsByStatus = docStatusAgg.reduce<Record<string, number>>((acc, row) => {
-      acc[row.status] = row.count;
-      return acc;
-    }, {});
+    const documentsByStatus: Record<string, number> = {};
+    for (const row of statusRows) {
+      documentsByStatus[row.status] = parseInt(row.count, 10);
+    }
 
     const totalDocuments = Object.values(documentsByStatus).reduce((a, b) => a + b, 0);
 
@@ -112,18 +108,18 @@ export const usageRoutes: FastifyPluginAsync = async (app) => {
       tenantId,
       disk: {
         usedBytes: diskUsedBytes,
-        quotaBytes: tenant.diskQuotaBytes,
+        quotaBytes: diskQuotaBytes,
         usedPercent:
-          tenant.diskQuotaBytes > 0
-            ? Math.round((diskUsedBytes / tenant.diskQuotaBytes) * 10000) / 100
+          diskQuotaBytes > 0
+            ? Math.round((diskUsedBytes / diskQuotaBytes) * 10000) / 100
             : 0,
       },
       users: {
         active: activeUserCount,
-        quota: tenant.userQuota,
+        quota: tenant.user_quota,
         usedPercent:
-          tenant.userQuota > 0
-            ? Math.round((activeUserCount / tenant.userQuota) * 10000) / 100
+          tenant.user_quota > 0
+            ? Math.round((activeUserCount / tenant.user_quota) * 10000) / 100
             : 0,
       },
       ai: {

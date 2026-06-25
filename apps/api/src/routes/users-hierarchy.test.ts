@@ -49,27 +49,16 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db.collection('users').deleteMany({});
-  await testDb.db.collection('tenants').deleteMany({});
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('SUPER_ADMIN','MULTI_TENANT_ADMIN','TENANT_ADMIN','UPLOADER','USER')`;
+  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
 
-  await testDb.db.collection('tenants').insertMany([
-    {
-      id: TENANT_A,
-      name: 'Empresa A',
-      diskQuotaBytes: 10 * 1024 ** 3,
-      userQuota: 50,
-      active: true,
-      createdAt: new Date(),
-    },
-    {
-      id: TENANT_B,
-      name: 'Empresa B',
-      diskQuotaBytes: 10 * 1024 ** 3,
-      userQuota: 50,
-      active: true,
-      createdAt: new Date(),
-    },
-  ]);
+  await testDb.db`
+    INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+    VALUES
+      (${TENANT_A}, 'Empresa A', ${10 * 1024 ** 3}, 50, true, NOW()),
+      (${TENANT_B}, 'Empresa B', ${10 * 1024 ** 3}, 50, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   await seedUser(testDb.db, {
     id: SUPER_ADMIN_ID,

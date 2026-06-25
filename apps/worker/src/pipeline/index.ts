@@ -1,5 +1,5 @@
 import type { Job } from 'bullmq';
-import type { Db } from 'mongodb';
+import type { Sql } from 'postgres';
 import type { Logger } from 'pino';
 import OpenAI from 'openai';
 import type { ExtractorProvider } from '@dmdoc/extractor';
@@ -14,7 +14,7 @@ export interface PipelineDeps {
   extractor: ExtractorProvider;
   openai: OpenAI;
   embeddingModel: string;
-  db: Db;
+  sql: Sql;
   logger: Logger;
   chunkTargetTokens?: number;
   chunkOverlapTokens?: number;
@@ -46,7 +46,7 @@ export async function runPipeline(
     extractor,
     openai,
     embeddingModel,
-    db,
+    sql,
     logger: baseLogger,
     chunkTargetTokens,
     chunkOverlapTokens,
@@ -63,28 +63,32 @@ export async function runPipeline(
     const extractResult = await extractDocument(job.data, {
       s3Bucket,
       extractor,
-      db,
+      sql,
       logger: log,
     });
 
     // Buscar metadados do documento para montar ChunkDocumentMeta
-    const docRecord = await db
-      .collection('documents')
-      .findOne(
-        { id: documentId, tenantId },
-        { projection: { departmentId: 1, documentTypeId: 1 } }
-      );
+    const docRows = await sql<Array<{ department_id: string; document_type_id: string | null }>>`
+      SELECT department_id, document_type_id
+      FROM documents
+      WHERE id = ${documentId}
+        AND tenant_id = ${tenantId}
+        AND deleted = false
+    `;
 
-    const departmentId = (docRecord?.['departmentId'] as string | undefined) ?? '';
-    const documentTypeId = docRecord?.['documentTypeId'] as string | null | undefined;
+    const docRecord = docRows[0];
+    const departmentId = docRecord?.department_id ?? '';
+    const documentTypeId = docRecord?.document_type_id ?? null;
 
     // Buscar nome do tipo de documento (desnormalizado nos chunks para evitar lookup na busca)
     let documentTypeName: string | null = null;
     if (documentTypeId) {
-      const docType = await db
-        .collection('document_types')
-        .findOne({ id: documentTypeId }, { projection: { name: 1 } });
-      documentTypeName = (docType?.['name'] as string | undefined) ?? null;
+      const typeRows = await sql<Array<{ name: string }>>`
+        SELECT name
+        FROM document_types
+        WHERE id = ${documentTypeId}
+      `;
+      documentTypeName = typeRows[0]?.name ?? null;
     }
 
     const chunkMeta: ChunkDocumentMeta = {
@@ -124,7 +128,7 @@ export async function runPipeline(
         totalEmbeddingsUsd,
         pipelineStartedAt,
       },
-      { db, logger: log }
+      { sql, logger: log }
     );
 
     log.info({ jobId: job.id }, 'pipeline concluído com sucesso');
@@ -136,16 +140,13 @@ export async function runPipeline(
     log.error({ err, jobId: job.id }, 'pipeline falhou — marcando documento como FAILED');
 
     // Falha permanente: atualizar status mesmo se for o último retry
-    await db.collection('documents').updateOne(
-      { id: documentId, tenantId },
-      {
-        $set: {
-          status: 'FAILED',
-          failureReason,
-          updatedAt: new Date(),
-        },
-      }
-    ).catch((dbErr: unknown) => {
+    await sql`
+      UPDATE documents
+      SET status = 'FAILED',
+          failure_reason = ${failureReason}
+      WHERE id = ${documentId}
+        AND tenant_id = ${tenantId}
+    `.catch((dbErr: unknown) => {
       log.error({ dbErr }, 'falha ao atualizar status FAILED no banco');
     });
 

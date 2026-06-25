@@ -3,8 +3,7 @@ import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import { ZodError } from 'zod';
 import type { Queue } from 'bullmq';
-import { MongoDbClient } from '@dmdoc/db-mongo';
-import type { Db } from 'mongodb';
+import { createPgClient, type Sql } from '@dmdoc/db-pg';
 import { getConfig, type Config } from './config.js';
 import { AppError } from './errors/index.js';
 import { authPlugin } from './plugins/auth.js';
@@ -26,7 +25,7 @@ import { createS3Service, type S3Service, type S3Config } from './services/s3.js
 
 declare module 'fastify' {
   interface FastifyInstance {
-    db: Db;
+    db: Sql;
     /**
      * Serviço S3. Null em testes que injetam um mock ou desabilitam o S3.
      * As rotas que usam S3 verificam a presença antes de operar.
@@ -49,11 +48,11 @@ export interface BuildAppOptions {
   /** Permite injetar uma config alternativa (útil em testes). */
   config?: Config;
   /**
-   * Permite injetar um `Db` já conectado (ex.: mongodb-memory-server nos
-   * testes). Quando ausente, `buildApp` conecta ao Mongo usando a config e
+   * Permite injetar um cliente postgres.js já conectado (útil em testes).
+   * Quando ausente, `buildApp` cria um cliente usando DATABASE_URL da config e
    * registra o fechamento da conexão no `onClose` da app.
    */
-  db?: Db;
+  db?: Sql;
   /**
    * Fila BullMQ de processamento de documentos.
    * Em testes, passe `null` para desabilitar o enfileiramento.
@@ -116,7 +115,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     },
   });
 
-  await app.register(authPlugin, { config, db });
+  await app.register(authPlugin, { config, sql: db });
 
   // Rate limiting por tenant — Fase 5, entregável 39.
   // Registrado após o authPlugin para que o keyGenerator tenha acesso ao tenantId
@@ -155,24 +154,24 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 }
 
 /**
- * Resolve o `Db`: usa o injetado (testes) ou conecta no boot real. Em conexão
- * própria, fecha o cliente quando a app fecha — evita vazar conexões em testes
- * e no shutdown.
+ * Resolve o cliente postgres.js: usa o injetado (testes) ou cria um novo no
+ * boot real. Em conexão própria, fecha o pool quando a app fecha — evita vazar
+ * conexões em testes e no shutdown.
  */
 async function resolveDb(
   app: FastifyInstance,
   options: BuildAppOptions,
   config: Config
-): Promise<Db> {
+): Promise<Sql> {
   if (options.db) {
     return options.db;
   }
 
-  const client = await MongoDbClient.connect(config.MONGO_URI, config.MONGO_DB);
+  const sql = createPgClient(config.DATABASE_URL);
   app.addHook('onClose', async () => {
-    await client.close();
+    await sql.end();
   });
-  return client.getDb();
+  return sql;
 }
 
 /**

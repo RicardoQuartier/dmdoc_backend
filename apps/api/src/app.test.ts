@@ -41,14 +41,11 @@ describe('Error handler central — corpo JSON inválido', () => {
     testDb = await startTestDb();
     app = await buildApp({ config: testConfig(), db: testDb.db });
 
-    await testDb.db.collection('tenants').insertOne({
-      id: TENANT,
-      name: 'Empresa A',
-      diskQuotaBytes: 10 * 1024 ** 3,
-      userQuota: 20,
-      active: true,
-      createdAt: new Date(),
-    });
+    await testDb.db`
+      INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+      VALUES (${TENANT}, 'Empresa A', ${10 * 1024 ** 3}, 20, true, NOW())
+      ON CONFLICT (id) DO NOTHING
+    `;
     await seedUser(testDb.db, {
       id: ADMIN_ID,
       tenantId: TENANT,

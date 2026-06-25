@@ -46,7 +46,11 @@ export const REGULAR_INDEXES: Readonly<Record<string, readonly RegularIndex[]>> 
   documents: [
     {
       keys: { tenantId: 1, contentHash: 1 },
-      options: { name: 'uniq_tenant_content_hash', unique: true },
+      options: {
+        name: 'uniq_tenant_content_hash',
+        unique: true,
+        partialFilterExpression: { deleted: { $eq: false } },
+      },
     },
     { keys: { tenantId: 1, status: 1 }, options: { name: 'by_tenant_status' } },
     { keys: { tenantId: 1, departmentId: 1 }, options: { name: 'by_tenant_department' } },

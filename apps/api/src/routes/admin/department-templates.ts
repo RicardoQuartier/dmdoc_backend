@@ -1,7 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { MongoServerError } from 'mongodb';
-import { newId } from '@dmdoc/db-mongo';
+import { newId } from '@dmdoc/db-pg';
 import {
   CreateDepartmentTemplateBodySchema,
   UpdateDepartmentTemplateBodySchema,
@@ -13,30 +12,17 @@ import { requireRole } from '../../auth/role-guard.js';
 const IdParamsSchema = z.object({ id: z.string().uuid() });
 
 /**
- * Remove `_id` interno do Mongo antes de enviar ao cliente.
- */
-function stripMongoId(doc: unknown): Record<string, unknown> {
-  const record = doc as Record<string, unknown>;
-  const { _id: _ignored, ...rest } = record;
-  return rest;
-}
-
-/**
  * Rotas CRUD de templates de departamentos. Acesso exclusivo: SUPER_ADMIN.
  *
- * A coleção `department_templates` é global — sem `tenantId`, sem soft-delete.
+ * A tabela `department_templates` é global — sem `tenantId`, sem soft-delete.
  * Templates são configuração de plataforma gerenciada pelo SUPER_ADMIN e usados
  * na criação de novos tenants para pré-popular a árvore de departamentos.
  *
- * Spec §5.3 (extensão — coleção `department_templates`).
+ * Spec §5.3 (extensão — tabela `department_templates`).
  */
 export const adminDepartmentTemplatesRoutes: FastifyPluginAsync = async (app) => {
   /**
    * POST /admin/department-templates — cria template.
-   *
-   * Body: { name, description?, nodes[] }
-   * Nodes: array plano de até 200 nós com refId/parentRefId para montar a árvore.
-   * Validação de parentRefs feita pelo schema Zod (refine).
    */
   app.post(
     '/admin/department-templates',
@@ -45,39 +31,33 @@ export const adminDepartmentTemplatesRoutes: FastifyPluginAsync = async (app) =>
       requireRole(request, 'SUPER_ADMIN');
 
       const body = CreateDepartmentTemplateBodySchema.parse(request.body);
-      const db = app.db;
-      // requireRole garante que request.user está presente antes deste ponto.
+      const sql = app.db;
       const userId = request.user?.sub;
 
-      const doc = {
-        id: newId(),
-        name: body.name,
-        ...(body.description !== undefined ? { description: body.description } : {}),
-        nodes: body.nodes,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
+      const id = newId();
+      const now = new Date();
+      const description = body.description ?? null;
 
       try {
-        await db.collection('department_templates').insertOne(doc);
-      } catch (err) {
-        if (err instanceof MongoServerError && err.code === 11000) {
+        await sql`
+          INSERT INTO department_templates (id, name, description, nodes, created_at, updated_at)
+          VALUES (${id}, ${body.name}, ${description}, ${JSON.stringify(body.nodes)}, ${now}, ${now})
+        `;
+      } catch (err: unknown) {
+        const pgErr = err as { code?: string };
+        if (pgErr.code === '23505') {
           throw new ConflictError('Nome de template já em uso');
         }
         throw err;
       }
 
-      request.log.info({ templateId: doc.id, userId }, 'template de departamentos criado');
-      return reply.status(201).send(doc);
+      request.log.info({ templateId: id, userId }, 'template de departamentos criado');
+      return reply.status(201).send({ id, name: body.name, description, nodes: body.nodes, createdAt: now, updatedAt: now });
     },
   );
 
   /**
    * GET /admin/department-templates — lista todos os templates.
-   *
-   * Paginação por cursor estável (`id` uuid ordenado lexicograficamente).
-   * Query: { limit?, cursor? }
-   * Response: { items: DepartmentTemplate[], nextCursor: string | null }
    */
   app.get(
     '/admin/department-templates',
@@ -86,23 +66,34 @@ export const adminDepartmentTemplatesRoutes: FastifyPluginAsync = async (app) =>
       requireRole(request, 'SUPER_ADMIN');
 
       const { limit, cursor } = ListDepartmentTemplatesQuerySchema.parse(request.query);
-      const db = app.db;
+      const sql = app.db;
 
-      const filter = cursor !== undefined ? { id: { $gt: cursor } } : {};
+      type TemplateRow = { id: string; name: string; description: string | null; nodes: unknown; created_at: Date; updated_at: Date };
 
-      const docs = await db
-        .collection('department_templates')
-        .find(filter)
-        .sort({ id: 1 })
-        .limit(limit + 1)
-        .toArray();
+      let rows: TemplateRow[];
+      if (cursor !== undefined) {
+        rows = await sql<TemplateRow[]>`
+          SELECT id, name, description, nodes, created_at, updated_at
+          FROM department_templates
+          WHERE id > ${cursor}
+          ORDER BY id ASC
+          LIMIT ${limit + 1}
+        `;
+      } else {
+        rows = await sql<TemplateRow[]>`
+          SELECT id, name, description, nodes, created_at, updated_at
+          FROM department_templates
+          ORDER BY id ASC
+          LIMIT ${limit + 1}
+        `;
+      }
 
-      const hasMore = docs.length > limit;
-      const page = hasMore ? docs.slice(0, limit) : docs;
+      const hasMore = rows.length > limit;
+      const page = hasMore ? rows.slice(0, limit) : rows;
       const last = page.at(-1);
-      const nextCursor = hasMore && last ? (last as unknown as { id: string }).id : null;
+      const nextCursor = hasMore && last ? last.id : null;
 
-      const items = page.map(stripMongoId);
+      const items = page.map((r) => ({ id: r.id, name: r.name, description: r.description, nodes: r.nodes, createdAt: r.created_at, updatedAt: r.updated_at }));
 
       return reply.status(200).send({ items, nextCursor });
     },
@@ -110,8 +101,6 @@ export const adminDepartmentTemplatesRoutes: FastifyPluginAsync = async (app) =>
 
   /**
    * GET /admin/department-templates/:id — detalhe de um template.
-   *
-   * Retorna 404 se o id não existir.
    */
   app.get(
     '/admin/department-templates/:id',
@@ -120,21 +109,24 @@ export const adminDepartmentTemplatesRoutes: FastifyPluginAsync = async (app) =>
       requireRole(request, 'SUPER_ADMIN');
 
       const { id } = IdParamsSchema.parse(request.params);
-      const db = app.db;
+      const sql = app.db;
 
-      const doc = await db.collection('department_templates').findOne({ id });
-      if (!doc) throw new NotFoundError();
+      type TemplateRow = { id: string; name: string; description: string | null; nodes: unknown; created_at: Date; updated_at: Date };
+      const rows = await sql<TemplateRow[]>`
+        SELECT id, name, description, nodes, created_at, updated_at
+        FROM department_templates
+        WHERE id = ${id}
+        LIMIT 1
+      `;
+      if (rows.length === 0) throw new NotFoundError();
+      const r = rows[0]!;
 
-      return reply.status(200).send(stripMongoId(doc));
+      return reply.status(200).send({ id: r.id, name: r.name, description: r.description, nodes: r.nodes, createdAt: r.created_at, updatedAt: r.updated_at });
     },
   );
 
   /**
    * PATCH /admin/department-templates/:id — atualiza campos do template.
-   *
-   * Body: { name?, description?, nodes? } — pelo menos um campo obrigatório.
-   * Quando `nodes` é enviado, valida referências internas (refine no schema).
-   * Atualiza `updatedAt` automaticamente.
    */
   app.patch(
     '/admin/department-templates/:id',
@@ -144,38 +136,70 @@ export const adminDepartmentTemplatesRoutes: FastifyPluginAsync = async (app) =>
 
       const { id } = IdParamsSchema.parse(request.params);
       const updates = UpdateDepartmentTemplateBodySchema.parse(request.body);
-      const db = app.db;
+      const sql = app.db;
       const userId = request.user?.sub;
 
-      let updated;
+      const setParts: string[] = [];
+      const values: unknown[] = [id, new Date()];
+      let paramIdx = 3;
+
+      if (updates.name !== undefined) {
+        setParts.push(`name = $${paramIdx++}`);
+        values.push(updates.name);
+      }
+      if ('description' in updates && updates.description !== undefined) {
+        setParts.push(`description = $${paramIdx++}`);
+        values.push(updates.description);
+      }
+      if (updates.nodes !== undefined) {
+        setParts.push(`nodes = $${paramIdx++}`);
+        values.push(JSON.stringify(updates.nodes));
+      }
+
+      if (setParts.length === 0) {
+        // Nada para atualizar — retorna o registro atual
+        type TemplateRow = { id: string; name: string; description: string | null; nodes: unknown; created_at: Date; updated_at: Date };
+        const rows = await sql<TemplateRow[]>`
+          SELECT id, name, description, nodes, created_at, updated_at
+          FROM department_templates
+          WHERE id = ${id}
+          LIMIT 1
+        `;
+        if (rows.length === 0) throw new NotFoundError();
+        const r = rows[0]!;
+        return reply.status(200).send({ id: r.id, name: r.name, description: r.description, nodes: r.nodes, createdAt: r.created_at, updatedAt: r.updated_at });
+      }
+
+      const query = `
+        UPDATE department_templates
+        SET ${setParts.join(', ')}, updated_at = $2
+        WHERE id = $1
+        RETURNING id, name, description, nodes, created_at, updated_at
+      `;
+
+      type TemplateRow = { id: string; name: string; description: string | null; nodes: unknown; created_at: Date; updated_at: Date };
+
+      let rows: TemplateRow[];
       try {
-        updated = await db
-          .collection('department_templates')
-          .findOneAndUpdate(
-            { id },
-            { $set: { ...updates, updatedAt: new Date() } },
-            { returnDocument: 'after' },
-          );
-      } catch (err) {
-        if (err instanceof MongoServerError && err.code === 11000) {
+        rows = await sql.unsafe<TemplateRow[]>(query, values as Parameters<typeof sql.unsafe>[1]);
+      } catch (err: unknown) {
+        const pgErr = err as { code?: string };
+        if (pgErr.code === '23505') {
           throw new ConflictError('Nome de template já em uso');
         }
         throw err;
       }
 
-      if (!updated) throw new NotFoundError();
+      if (rows.length === 0) throw new NotFoundError();
+      const r = rows[0]!;
 
       request.log.info({ templateId: id, userId }, 'template de departamentos atualizado');
-      return reply.status(200).send(stripMongoId(updated));
+      return reply.status(200).send({ id: r.id, name: r.name, description: r.description, nodes: r.nodes, createdAt: r.created_at, updatedAt: r.updated_at });
     },
   );
 
   /**
    * DELETE /admin/department-templates/:id — exclui template (hard delete).
-   *
-   * Templates são configuração de plataforma sem histórico de auditoria próprio.
-   * Hard delete: o documento é removido fisicamente da coleção.
-   * Retorna 404 se o id não existir.
    */
   app.delete(
     '/admin/department-templates/:id',
@@ -184,11 +208,15 @@ export const adminDepartmentTemplatesRoutes: FastifyPluginAsync = async (app) =>
       requireRole(request, 'SUPER_ADMIN');
 
       const { id } = IdParamsSchema.parse(request.params);
-      const db = app.db;
+      const sql = app.db;
       const userId = request.user?.sub;
 
-      const result = await db.collection('department_templates').deleteOne({ id });
-      if (result.deletedCount === 0) throw new NotFoundError();
+      const result = await sql`
+        DELETE FROM department_templates
+        WHERE id = ${id}
+      `;
+
+      if (result.count === 0) throw new NotFoundError();
 
       request.log.info({ templateId: id, userId }, 'template de departamentos excluído');
       return reply.status(204).send();

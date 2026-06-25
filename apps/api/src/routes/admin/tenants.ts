@@ -1,7 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { MongoServerError } from 'mongodb';
-import { newId } from '@dmdoc/db-mongo';
+import { newId } from '@dmdoc/db-pg';
 import { ConflictError, NotFoundError } from '../../errors/index.js';
 import { requireRole } from '../../auth/role-guard.js';
 import { applyTemplateToTenant } from '../../lib/apply-template-to-tenant.js';
@@ -29,70 +28,52 @@ const ListTenantsQuerySchema = z.object({
 /**
  * Rotas de administração de tenants. Apenas SUPER_ADMIN acessa.
  *
- * A coleção `tenants` não usa TenantRepository (não tem tenantId próprio nem
- * soft-delete). Operações via driver direto.
+ * A tabela `tenants` não usa TenantRepository (não tem tenantId próprio nem
+ * soft-delete). Operações via SQL direto.
  */
 export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
   /**
    * POST /admin/tenants — cria nova empresa.
    *
    * `templateId` opcional: quando informado, os nós do template são inseridos
-   * como departamentos reais do novo tenant dentro da mesma transação MongoDB.
-   * Se o templateId não existir, a transação inteira é revertida (nenhum tenant
-   * nem departamento é persistido).
+   * como departamentos reais do novo tenant dentro da mesma transação.
+   * Se o templateId não existir, a transação inteira é revertida.
    */
   app.post('/admin/tenants', { preHandler: app.authenticate }, async (request, reply) => {
     requireRole(request, 'SUPER_ADMIN');
 
     const { name, diskQuotaBytes, userQuota, templateId } = CreateTenantBodySchema.parse(request.body);
-    const db = app.db;
+    const sql = app.db;
 
-    const doc = {
-      id: newId(),
-      name,
-      diskQuotaBytes,
-      userQuota,
-      active: true,
-      createdAt: new Date(),
-    };
+    const tenantId = newId();
+    const createdAt = new Date();
 
-    // Obtém o MongoClient a partir do Db (driver Node.js expõe via db.client).
-    // Necessário para criar a session e usar transações multi-operação.
-    const mongoClient = db.client;
-    const session = mongoClient.startSession();
-
-    try {
-      await session.withTransaction(async () => {
-        try {
-          await db.collection('tenants').insertOne(doc, { session });
-        } catch (err) {
-          if (err instanceof MongoServerError && err.code === 11000) {
-            throw new ConflictError('Nome de empresa já em uso');
-          }
-          throw err;
+    await sql.begin(async (tx) => {
+      try {
+        await tx`
+          INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+          VALUES (${tenantId}, ${name}, ${diskQuotaBytes}, ${userQuota}, true, ${createdAt})
+        `;
+      } catch (err: unknown) {
+        const pgErr = err as { code?: string };
+        if (pgErr.code === '23505') {
+          throw new ConflictError('Nome de empresa já em uso');
         }
+        throw err;
+      }
 
-        if (templateId !== undefined) {
-          await applyTemplateToTenant(
-            db,
-            doc.id,
-            templateId,
-            session,
-            request.log,
-          );
-        }
-      });
-    } finally {
-      await session.endSession();
-    }
+      if (templateId !== undefined) {
+        await applyTemplateToTenant(tx as unknown as typeof sql, tenantId, templateId, request.log);
+      }
+    });
 
     if (templateId !== undefined) {
-      request.log.info({ tenantId: doc.id, templateId }, 'tenant criado com template');
+      request.log.info({ tenantId, templateId }, 'tenant criado com template');
     } else {
-      request.log.info({ tenantId: doc.id }, 'tenant criado');
+      request.log.info({ tenantId }, 'tenant criado');
     }
 
-    return reply.status(201).send(doc);
+    return reply.status(201).send({ id: tenantId, name, diskQuotaBytes, userQuota, active: true, createdAt });
   });
 
   /**
@@ -102,23 +83,41 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
     requireRole(request, 'SUPER_ADMIN');
 
     const { limit, cursor } = ListTenantsQuerySchema.parse(request.query);
-    const db = app.db;
+    const sql = app.db;
 
-    const filter = cursor !== undefined ? { id: { $gt: cursor } } : {};
+    type TenantRow = { id: string; name: string; disk_quota_bytes: string; user_quota: number; active: boolean; created_at: Date };
 
-    const docs = await db
-      .collection('tenants')
-      .find(filter)
-      .sort({ id: 1 })
-      .limit(limit + 1)
-      .toArray();
+    let rows: TenantRow[];
+    if (cursor !== undefined) {
+      rows = await sql<TenantRow[]>`
+        SELECT id, name, disk_quota_bytes, user_quota, active, created_at
+        FROM tenants
+        WHERE id > ${cursor}
+        ORDER BY id ASC
+        LIMIT ${limit + 1}
+      `;
+    } else {
+      rows = await sql<TenantRow[]>`
+        SELECT id, name, disk_quota_bytes, user_quota, active, created_at
+        FROM tenants
+        ORDER BY id ASC
+        LIMIT ${limit + 1}
+      `;
+    }
 
-    const hasMore = docs.length > limit;
-    const page = hasMore ? docs.slice(0, limit) : docs;
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
     const last = page.at(-1);
-    const nextCursor = hasMore && last ? (last as unknown as { id: string }).id : null;
+    const nextCursor = hasMore && last ? last.id : null;
 
-    const items = page.map(stripMongoId);
+    const items = page.map((r) => ({
+      id: r.id,
+      name: r.name,
+      diskQuotaBytes: Number(r.disk_quota_bytes),
+      userQuota: r.user_quota,
+      active: r.active,
+      createdAt: r.created_at,
+    }));
 
     return reply.status(200).send({ items, nextCursor });
   });
@@ -131,35 +130,66 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
 
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const updates = PatchTenantBodySchema.parse(request.body);
-    const db = app.db;
+    const sql = app.db;
 
     if (Object.keys(updates).length === 0) {
-      const existing = await db.collection('tenants').findOne({ id });
-      if (!existing) throw new NotFoundError();
-      return reply.status(200).send(stripMongoId(existing));
+      const rows = await sql<Array<{ id: string; name: string; disk_quota_bytes: string; user_quota: number; active: boolean; created_at: Date }>>`
+        SELECT id, name, disk_quota_bytes, user_quota, active, created_at
+        FROM tenants
+        WHERE id = ${id}
+        LIMIT 1
+      `;
+      if (rows.length === 0) throw new NotFoundError();
+      const r = rows[0]!;
+      return reply.status(200).send({ id: r.id, name: r.name, diskQuotaBytes: Number(r.disk_quota_bytes), userQuota: r.user_quota, active: r.active, createdAt: r.created_at });
     }
 
-    let updated;
+    // Monta SET dinâmico apenas com os campos fornecidos
+    const setParts: string[] = [];
+    const values: unknown[] = [id];
+    let paramIdx = 2;
+
+    if (updates.name !== undefined) {
+      setParts.push(`name = $${paramIdx++}`);
+      values.push(updates.name);
+    }
+    if (updates.diskQuotaBytes !== undefined) {
+      setParts.push(`disk_quota_bytes = $${paramIdx++}`);
+      values.push(updates.diskQuotaBytes);
+    }
+    if (updates.userQuota !== undefined) {
+      setParts.push(`user_quota = $${paramIdx++}`);
+      values.push(updates.userQuota);
+    }
+    if (updates.active !== undefined) {
+      setParts.push(`active = $${paramIdx++}`);
+      values.push(updates.active);
+    }
+
+    const query = `
+      UPDATE tenants
+      SET ${setParts.join(', ')}
+      WHERE id = $1
+      RETURNING id, name, disk_quota_bytes, user_quota, active, created_at
+    `;
+
+    type TenantRow = { id: string; name: string; disk_quota_bytes: string; user_quota: number; active: boolean; created_at: Date };
+
+    let rows: TenantRow[];
     try {
-      updated = await db
-        .collection('tenants')
-        .findOneAndUpdate({ id }, { $set: updates }, { returnDocument: 'after' });
-    } catch (err) {
-      if (err instanceof MongoServerError && err.code === 11000) {
+      rows = await sql.unsafe<TenantRow[]>(query, values as Parameters<typeof sql.unsafe>[1]);
+    } catch (err: unknown) {
+      const pgErr = err as { code?: string };
+      if (pgErr.code === '23505') {
         throw new ConflictError('Nome de empresa já em uso');
       }
       throw err;
     }
 
-    if (!updated) throw new NotFoundError();
+    if (rows.length === 0) throw new NotFoundError();
+    const r = rows[0]!;
 
     request.log.info({ tenantId: id }, 'tenant atualizado');
-    return reply.status(200).send(stripMongoId(updated));
+    return reply.status(200).send({ id: r.id, name: r.name, diskQuotaBytes: Number(r.disk_quota_bytes), userQuota: r.user_quota, active: r.active, createdAt: r.created_at });
   });
 };
-
-function stripMongoId(doc: unknown): Record<string, unknown> {
-  const record = doc as Record<string, unknown>;
-  const { _id: _ignored, ...rest } = record;
-  return rest;
-}

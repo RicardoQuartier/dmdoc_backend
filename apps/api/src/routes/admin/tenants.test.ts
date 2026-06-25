@@ -2,13 +2,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../app.js';
 import { startTestReplSetDb, seedUser, testConfig, type TestReplSetDb } from '../../test/helpers.js';
-import { newId } from '@dmdoc/db-mongo';
+import { newId } from '@dmdoc/db-pg';
 
 /**
  * Testes E2E de POST /admin/tenants com suporte a templateId.
  *
- * Usa MongoMemoryReplSet (replica set de 1 nó) porque a criação de tenant
- * com template usa session.withTransaction, que exige replica set.
+ * Usa startTestReplSetDb (que agora é um alias para startTestDb — PostgreSQL).
+ * A criação de tenant com template usa sql.begin (transação PostgreSQL nativa).
  *
  * Casos de teste:
  * 1. Criação sem templateId — backward compat (nenhum departamento criado).
@@ -52,9 +52,9 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db.collection('tenants').deleteMany({});
-  await testDb.db.collection('departments').deleteMany({});
-  await testDb.db.collection('department_templates').deleteMany({});
+  await testDb.db`DELETE FROM departments`;
+  await testDb.db`DELETE FROM department_templates`;
+  await testDb.db`DELETE FROM tenants`;
 });
 
 // ---------------------------------------------------------------------------
@@ -64,13 +64,16 @@ async function seedTemplate(
   templateId: string,
   nodes: Array<{ refId: string; parentRefId: string | null; name: string; tags?: string[] }>,
 ) {
-  await testDb.db.collection('department_templates').insertOne({
-    id: templateId,
-    name: 'Template de Teste',
-    nodes: nodes.map((n) => ({ ...n, tags: n.tags ?? [] })),
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  });
+  await testDb.db`
+    INSERT INTO department_templates (id, name, nodes, created_at, updated_at)
+    VALUES (
+      ${templateId},
+      'Template de Teste',
+      ${JSON.stringify(nodes.map((n) => ({ ...n, tags: n.tags ?? [] })))}::jsonb,
+      NOW(),
+      NOW()
+    )
+  `;
 }
 
 // ---------------------------------------------------------------------------
@@ -93,10 +96,9 @@ describe('POST /admin/tenants sem templateId', () => {
     });
     expect(typeof body['id']).toBe('string');
 
-    const deptCount = await testDb.db
-      .collection('departments')
-      .countDocuments({ tenantId: body['id'] });
-    expect(deptCount).toBe(0);
+    const tenantId = body['id'] as string;
+    const rows = await testDb.db`SELECT COUNT(*)::int AS cnt FROM departments WHERE tenant_id = ${tenantId}`;
+    expect(rows[0]?.['cnt']).toBe(0);
   });
 });
 
@@ -129,10 +131,11 @@ describe('POST /admin/tenants com templateId válido', () => {
     expect(typeof tenantId).toBe('string');
 
     // Verifica que os departamentos foram criados para este tenant
-    const depts = await testDb.db
-      .collection('departments')
-      .find({ tenantId, deleted: false })
-      .toArray();
+    const depts = await testDb.db<Array<Record<string, unknown>>>`
+      SELECT id, tenant_id, parent_id, name, level, tags, deleted
+      FROM departments
+      WHERE tenant_id = ${tenantId} AND deleted = false
+    `;
 
     expect(depts).toHaveLength(3);
 
@@ -140,8 +143,8 @@ describe('POST /admin/tenants com templateId válido', () => {
     const raiz = depts.find((d) => d['name'] === 'Departamento A');
     expect(raiz).toBeDefined();
     expect(raiz!['level']).toBe(0);
-    expect(raiz!['parentId']).toBeNull();
-    expect(raiz!['tenantId']).toBe(tenantId);
+    expect(raiz!['parent_id']).toBeNull();
+    expect(raiz!['tenant_id']).toBe(tenantId);
     expect(raiz!['deleted']).toBe(false);
     expect(raiz!['tags']).toEqual(['tag1']);
 
@@ -149,12 +152,12 @@ describe('POST /admin/tenants com templateId válido', () => {
     const filhoB = depts.find((d) => d['name'] === 'Departamento B');
     expect(filhoB).toBeDefined();
     expect(filhoB!['level']).toBe(1);
-    expect(filhoB!['parentId']).toBe(raiz!['id']);
+    expect(filhoB!['parent_id']).toBe(raiz!['id']);
 
     const filhoC = depts.find((d) => d['name'] === 'Departamento C');
     expect(filhoC).toBeDefined();
     expect(filhoC!['level']).toBe(1);
-    expect(filhoC!['parentId']).toBe(raiz!['id']);
+    expect(filhoC!['parent_id']).toBe(raiz!['id']);
     expect(filhoC!['tags']).toEqual(['tag2']);
   });
 
@@ -187,20 +190,18 @@ describe('POST /admin/tenants com templateId válido', () => {
     const tenantBeta = (res2.json() as Record<string, unknown>)['id'] as string;
 
     // Cada tenant deve ter apenas seus próprios departamentos
-    const deptsAlpha = await testDb.db
-      .collection('departments')
-      .find({ tenantId: tenantAlpha })
-      .toArray();
-    const deptsBeta = await testDb.db
-      .collection('departments')
-      .find({ tenantId: tenantBeta })
-      .toArray();
+    const deptsAlpha = await testDb.db<Array<Record<string, unknown>>>`
+      SELECT id, tenant_id FROM departments WHERE tenant_id = ${tenantAlpha}
+    `;
+    const deptsBeta = await testDb.db<Array<Record<string, unknown>>>`
+      SELECT id, tenant_id FROM departments WHERE tenant_id = ${tenantBeta}
+    `;
 
     expect(deptsAlpha).toHaveLength(1);
     expect(deptsBeta).toHaveLength(1);
     expect(deptsAlpha[0]!['id']).not.toBe(deptsBeta[0]!['id']);
-    expect(deptsAlpha[0]!['tenantId']).toBe(tenantAlpha);
-    expect(deptsBeta[0]!['tenantId']).toBe(tenantBeta);
+    expect(deptsAlpha[0]!['tenant_id']).toBe(tenantAlpha);
+    expect(deptsBeta[0]!['tenant_id']).toBe(tenantBeta);
   });
 
   it('calcula corretamente level em árvore de 3 níveis', async () => {
@@ -224,11 +225,9 @@ describe('POST /admin/tenants com templateId válido', () => {
     expect(res.statusCode).toBe(201);
     const tenantId = (res.json() as Record<string, unknown>)['id'] as string;
 
-    const depts = await testDb.db
-      .collection('departments')
-      .find({ tenantId })
-      .sort({ level: 1 })
-      .toArray();
+    const depts = await testDb.db<Array<Record<string, unknown>>>`
+      SELECT id, parent_id, level FROM departments WHERE tenant_id = ${tenantId} ORDER BY level ASC
+    `;
 
     expect(depts).toHaveLength(3);
     expect(depts[0]!['level']).toBe(0);
@@ -236,9 +235,9 @@ describe('POST /admin/tenants com templateId válido', () => {
     expect(depts[2]!['level']).toBe(2);
 
     // Verifica cadeia de parentIds
-    expect(depts[0]!['parentId']).toBeNull();
-    expect(depts[1]!['parentId']).toBe(depts[0]!['id']);
-    expect(depts[2]!['parentId']).toBe(depts[1]!['id']);
+    expect(depts[0]!['parent_id']).toBeNull();
+    expect(depts[1]!['parent_id']).toBe(depts[0]!['id']);
+    expect(depts[2]!['parent_id']).toBe(depts[1]!['id']);
   });
 });
 
@@ -262,14 +261,12 @@ describe('POST /admin/tenants com templateId inexistente', () => {
     });
 
     // O tenant NÃO deve ter sido persistido (rollback da transação)
-    const tenant = await testDb.db
-      .collection('tenants')
-      .findOne({ name: 'Empresa Fantasma' });
-    expect(tenant).toBeNull();
+    const rows = await testDb.db`SELECT id FROM tenants WHERE name = 'Empresa Fantasma'`;
+    expect(rows).toHaveLength(0);
 
     // Nenhum departamento deve ter sido criado
-    const deptCount = await testDb.db.collection('departments').countDocuments({});
-    expect(deptCount).toBe(0);
+    const deptRows = await testDb.db`SELECT COUNT(*)::int AS cnt FROM departments`;
+    expect(deptRows[0]?.['cnt']).toBe(0);
   });
 });
 
@@ -291,9 +288,7 @@ describe('POST /admin/tenants com templateId inválido', () => {
     });
 
     // Nenhum tenant criado
-    const tenant = await testDb.db
-      .collection('tenants')
-      .findOne({ name: 'Empresa Inválida' });
-    expect(tenant).toBeNull();
+    const rows = await testDb.db`SELECT id FROM tenants WHERE name = 'Empresa Inválida'`;
+    expect(rows).toHaveLength(0);
   });
 });

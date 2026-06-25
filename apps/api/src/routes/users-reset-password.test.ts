@@ -3,7 +3,6 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
 import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
 import { verifyPassword } from '../auth/password.js';
-import { AUDIT_LOGS_COLLECTION } from '../auth/audit.js';
 
 /**
  * Testes E2E do reset de senha POR ADMIN (POST /users/:id/reset-password).
@@ -45,28 +44,17 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db.collection('users').deleteMany({});
-  await testDb.db.collection('tenants').deleteMany({});
-  await testDb.db.collection(AUDIT_LOGS_COLLECTION).deleteMany({});
+  await testDb.db`DELETE FROM audit_logs`;
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('SUPER_ADMIN','TENANT_ADMIN','UPLOADER','USER')`;
+  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
 
-  await testDb.db.collection('tenants').insertMany([
-    {
-      id: TENANT_A,
-      name: 'Empresa A',
-      diskQuotaBytes: 10 * 1024 ** 3,
-      userQuota: 50,
-      active: true,
-      createdAt: new Date(),
-    },
-    {
-      id: TENANT_B,
-      name: 'Empresa B',
-      diskQuotaBytes: 10 * 1024 ** 3,
-      userQuota: 50,
-      active: true,
-      createdAt: new Date(),
-    },
-  ]);
+  await testDb.db`
+    INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+    VALUES
+      (${TENANT_A}, 'Empresa A', ${10 * 1024 ** 3}, 50, true, NOW()),
+      (${TENANT_B}, 'Empresa B', ${10 * 1024 ** 3}, 50, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   await seedUser(testDb.db, {
     id: SUPER_ADMIN_ID,
@@ -106,6 +94,9 @@ beforeEach(async () => {
 
   tadminAToken = await login('tadmin-a@empresa.com');
   uploaderAToken = await login('uploader-a@empresa.com');
+
+  // Limpar audit logs gerados pelos logins
+  await testDb.db`DELETE FROM audit_logs`;
 });
 
 async function login(email: string): Promise<string> {
@@ -139,38 +130,37 @@ describe('POST /users/:id/reset-password — sucesso', () => {
     const res = await resetPassword({ token: tadminAToken, targetId: UPLOADER_A_ID });
     expect(res.statusCode).toBe(204);
 
-    const doc = (await testDb.db
-      .collection('users')
-      .findOne({ id: UPLOADER_A_ID })) as unknown as { passwordHash: string } | null;
-    expect(doc).not.toBeNull();
+    const rows = await testDb.db<Array<{ password_hash: string }>>`
+      SELECT password_hash FROM users WHERE id = ${UPLOADER_A_ID}
+    `;
+    expect(rows).toHaveLength(1);
     // Senha antiga não vale mais; a nova vale.
-    expect(await verifyPassword(doc!.passwordHash, NEW_PASSWORD)).toBe(true);
-    expect(await verifyPassword(doc!.passwordHash, PASSWORD)).toBe(false);
+    expect(await verifyPassword(rows[0]!.password_hash, NEW_PASSWORD)).toBe(true);
+    expect(await verifyPassword(rows[0]!.password_hash, PASSWORD)).toBe(false);
   });
 
   it('reset registra um audit log da ação (ator, alvo, tenant)', async () => {
     await resetPassword({ token: tadminAToken, targetId: USER_A_ID });
 
-    const logs = await testDb.db
-      .collection(AUDIT_LOGS_COLLECTION)
-      .find({ action: 'user.reset_password' })
-      .toArray();
-    expect(logs).toHaveLength(1);
-    const log = logs[0] as unknown as {
-      tenantId: string;
-      userId: string;
+    const logs = await testDb.db<Array<{
+      tenant_id: string;
+      user_id: string;
+      action: string;
       resource: string;
-      metadata: { targetUserId: string };
-    };
-    expect(log.tenantId).toBe(TENANT_A);
-    expect(log.userId).toBe(TADMIN_A_ID);
+      metadata: Record<string, unknown>;
+    }>>`SELECT * FROM audit_logs WHERE action = 'user.reset_password'`;
+
+    expect(logs).toHaveLength(1);
+    const log = logs[0]!;
+    expect(log.tenant_id).toBe(TENANT_A);
+    expect(log.user_id).toBe(TADMIN_A_ID);
     expect(log.resource).toBe(`users/${USER_A_ID}`);
-    expect(log.metadata.targetUserId).toBe(USER_A_ID);
+    expect((log.metadata as { targetUserId?: string })['targetUserId']).toBe(USER_A_ID);
   });
 
   it('a nova senha em claro nunca aparece no audit log', async () => {
     await resetPassword({ token: tadminAToken, targetId: USER_A_ID });
-    const logs = await testDb.db.collection(AUDIT_LOGS_COLLECTION).find({}).toArray();
+    const logs = await testDb.db`SELECT * FROM audit_logs`;
     expect(JSON.stringify(logs)).not.toContain(NEW_PASSWORD);
   });
 });
@@ -186,10 +176,10 @@ describe('POST /users/:id/reset-password — validação', () => {
     expect(res.json().error.code).toBe('VALIDATION_ERROR');
 
     // Senha original permanece intacta.
-    const doc = (await testDb.db
-      .collection('users')
-      .findOne({ id: UPLOADER_A_ID })) as unknown as { passwordHash: string } | null;
-    expect(await verifyPassword(doc!.passwordHash, PASSWORD)).toBe(true);
+    const rows = await testDb.db<Array<{ password_hash: string }>>`
+      SELECT password_hash FROM users WHERE id = ${UPLOADER_A_ID}
+    `;
+    expect(await verifyPassword(rows[0]!.password_hash, PASSWORD)).toBe(true);
   });
 });
 
@@ -200,10 +190,10 @@ describe('POST /users/:id/reset-password — isolamento multi-tenant', () => {
     expect(res.json().error.code).toBe('NOT_FOUND');
 
     // Alvo de outro tenant permanece com a senha original.
-    const doc = (await testDb.db
-      .collection('users')
-      .findOne({ id: TADMIN_B_ID })) as unknown as { passwordHash: string } | null;
-    expect(await verifyPassword(doc!.passwordHash, PASSWORD)).toBe(true);
+    const rows = await testDb.db<Array<{ password_hash: string }>>`
+      SELECT password_hash FROM users WHERE id = ${TADMIN_B_ID}
+    `;
+    expect(await verifyPassword(rows[0]!.password_hash, PASSWORD)).toBe(true);
   });
 });
 
@@ -226,9 +216,9 @@ describe('POST /users/:id/reset-password — hierarquia', () => {
     });
     expect(res.statusCode).toBe(204);
 
-    const doc = (await testDb.db
-      .collection('users')
-      .findOne({ id: TADMIN_B_ID })) as unknown as { passwordHash: string } | null;
-    expect(await verifyPassword(doc!.passwordHash, NEW_PASSWORD)).toBe(true);
+    const rows = await testDb.db<Array<{ password_hash: string }>>`
+      SELECT password_hash FROM users WHERE id = ${TADMIN_B_ID}
+    `;
+    expect(await verifyPassword(rows[0]!.password_hash, NEW_PASSWORD)).toBe(true);
   });
 });

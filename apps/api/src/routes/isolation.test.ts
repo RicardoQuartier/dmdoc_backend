@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
 import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
-import { newId } from '@dmdoc/db-mongo';
+import { newId } from '@dmdoc/db-pg';
 
 /**
  * Testes E2E de isolamento multi-tenant.
@@ -37,18 +37,21 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  // Limpa todas as coleções relevantes
-  await testDb.db.collection('users').deleteMany({});
-  await testDb.db.collection('tenants').deleteMany({});
-  await testDb.db.collection('departments').deleteMany({});
-  await testDb.db.collection('document_types').deleteMany({});
-  await testDb.db.collection('department_permissions').deleteMany({});
+  // Limpa todas as tabelas relevantes
+  await testDb.db`DELETE FROM department_permissions`;
+  await testDb.db`DELETE FROM departments`;
+  await testDb.db`DELETE FROM document_types`;
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL`;
+  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
 
   // Cria dois tenants
-  await testDb.db.collection('tenants').insertMany([
-    { id: TENANT_A, name: 'Empresa A', diskQuotaBytes: 10 * 1024 ** 3, userQuota: 20, active: true, createdAt: new Date() },
-    { id: TENANT_B, name: 'Empresa B', diskQuotaBytes: 10 * 1024 ** 3, userQuota: 20, active: true, createdAt: new Date() },
-  ]);
+  await testDb.db`
+    INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+    VALUES
+      (${TENANT_A}, 'Empresa A', ${10 * 1024 ** 3}, 20, true, NOW()),
+      (${TENANT_B}, 'Empresa B', ${10 * 1024 ** 3}, 20, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   // Cria admin e usuário em cada tenant
   await seedUser(testDb.db, {
@@ -136,28 +139,12 @@ describe('Isolamento multi-tenant — GET /departments', () => {
     const deptIdA = newId();
     const deptIdB = newId();
 
-    await testDb.db.collection('departments').insertMany([
-      {
-        id: deptIdA,
-        tenantId: TENANT_A,
-        parentId: null,
-        name: 'Dept do Tenant A',
-        level: 0,
-        tags: [],
-        deleted: false,
-        createdAt: new Date(),
-      },
-      {
-        id: deptIdB,
-        tenantId: TENANT_B,
-        parentId: null,
-        name: 'Dept do Tenant B',
-        level: 0,
-        tags: [],
-        deleted: false,
-        createdAt: new Date(),
-      },
-    ]);
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES
+        (${deptIdA}, ${TENANT_A}, NULL, 'Dept do Tenant A', 0, '{}'::text[], false, NOW()),
+        (${deptIdB}, ${TENANT_B}, NULL, 'Dept do Tenant B', 0, '{}'::text[], false, NOW())
+    `;
 
     const res = await app.inject({
       method: 'GET',
@@ -181,16 +168,10 @@ describe('Isolamento multi-tenant — DELETE /departments/:id', () => {
   it('tenant A tentando deletar departamento do tenant B → 404', async () => {
     // Cria departamento no tenant B
     const deptId = newId();
-    await testDb.db.collection('departments').insertOne({
-      id: deptId,
-      tenantId: TENANT_B,
-      parentId: null,
-      name: 'Dept do Tenant B',
-      level: 0,
-      tags: [],
-      deleted: false,
-      createdAt: new Date(),
-    });
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (${deptId}, ${TENANT_B}, NULL, 'Dept do Tenant B', 0, '{}'::text[], false, NOW())
+    `;
 
     const res = await app.inject({
       method: 'DELETE',
@@ -207,16 +188,10 @@ describe('Isolamento multi-tenant — PATCH /document-types/:id', () => {
   it('tenant A tentando atualizar tipo de documento do tenant B → 404', async () => {
     // Cria tipo no tenant B
     const docTypeId = newId();
-    await testDb.db.collection('document_types').insertOne({
-      id: docTypeId,
-      tenantId: TENANT_B,
-      name: 'Tipo do Tenant B',
-      description: null,
-      isGlobal: false,
-      deleted: false,
-      createdAt: new Date(),
-      indexFields: [],
-    });
+    await testDb.db`
+      INSERT INTO document_types (id, tenant_id, name, description, is_global, deleted, created_at, index_fields)
+      VALUES (${docTypeId}, ${TENANT_B}, 'Tipo do Tenant B', NULL, false, false, NOW(), '[]'::jsonb)
+    `;
 
     const res = await app.inject({
       method: 'PATCH',
@@ -234,16 +209,10 @@ describe('Isolamento multi-tenant — PUT /users/:id/permissions', () => {
   it('tenant A tentando atribuir permissão com departmentId de outro tenant → 404', async () => {
     // Cria departamento no tenant B
     const deptId = newId();
-    await testDb.db.collection('departments').insertOne({
-      id: deptId,
-      tenantId: TENANT_B,
-      parentId: null,
-      name: 'Dept do Tenant B',
-      level: 0,
-      tags: [],
-      deleted: false,
-      createdAt: new Date(),
-    });
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (${deptId}, ${TENANT_B}, NULL, 'Dept do Tenant B', 0, '{}'::text[], false, NOW())
+    `;
 
     // Admin A tenta dar permissão ao usuário A numa raiz de B
     const res = await app.inject({

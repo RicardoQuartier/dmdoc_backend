@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
 import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
 import type { S3Service } from '../services/s3.js';
-import { newId } from '@dmdoc/db-mongo';
+import { newId } from '@dmdoc/db-pg';
 
 // ---------------------------------------------------------------------------
 // Mock S3 — nunca toca AWS real
@@ -58,14 +58,17 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db.collection('users').deleteMany({});
-  await testDb.db.collection('tenants').deleteMany({});
-  await testDb.db.collection('document_events').deleteMany({});
+  await testDb.db`DELETE FROM document_events`;
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','SUPER_ADMIN','UPLOADER','USER')`;
+  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
 
-  await testDb.db.collection('tenants').insertMany([
-    { id: TENANT_A, name: 'Empresa A', diskQuotaBytes: DISK_QUOTA, userQuota: USER_QUOTA, active: true },
-    { id: TENANT_B, name: 'Empresa B', diskQuotaBytes: DISK_QUOTA, userQuota: USER_QUOTA, active: true },
-  ]);
+  await testDb.db`
+    INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+    VALUES
+      (${TENANT_A}, 'Empresa A', ${DISK_QUOTA}, ${USER_QUOTA}, true, NOW()),
+      (${TENANT_B}, 'Empresa B', ${DISK_QUOTA}, ${USER_QUOTA}, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   await seedUser(testDb.db, {
     id: ADMIN_A_ID, tenantId: TENANT_A, email: 'admin-a@test.com',
@@ -102,7 +105,7 @@ async function login(email: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: insere um evento de upload direto na coleção append-only
+// Helper: insere um evento de upload direto na tabela append-only
 // ---------------------------------------------------------------------------
 interface EventInput {
   tenantId: string;
@@ -118,20 +121,28 @@ interface EventInput {
 }
 
 async function insertEvent(input: EventInput): Promise<void> {
-  await testDb.db.collection('document_events').insertOne({
-    id: newId(),
-    tenantId: input.tenantId,
-    documentId: input.documentId ?? newId(),
-    uploadedById: input.uploadedById,
-    eventType: 'upload',
-    mimeType: input.mimeType,
-    documentTypeId: input.documentTypeId,
-    documentTypeName: input.documentTypeName,
-    sizeBytes: input.sizeBytes,
-    pageCount: input.pageCount,
-    deduplicated: input.deduplicated ?? false,
-    createdAt: input.createdAt,
-  });
+  const id = newId();
+  const documentId = input.documentId !== undefined ? input.documentId : newId();
+  await testDb.db`
+    INSERT INTO document_events (
+      id, tenant_id, document_id, uploaded_by_id, event_type,
+      mime_type, document_type_id, document_type_name,
+      size_bytes, page_count, deduplicated, created_at
+    ) VALUES (
+      ${id},
+      ${input.tenantId},
+      ${documentId},
+      ${input.uploadedById},
+      'upload',
+      ${input.mimeType},
+      ${input.documentTypeId},
+      ${input.documentTypeName},
+      ${input.sizeBytes},
+      ${input.pageCount},
+      ${input.deduplicated ?? false},
+      ${input.createdAt}
+    )
+  `;
 }
 
 const PDF = 'application/pdf';

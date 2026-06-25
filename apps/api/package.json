@@ -16,6 +16,7 @@
     "@aws-sdk/client-s3": "^3.1064.0",
     "@aws-sdk/s3-request-presigner": "^3.1064.0",
     "@dmdoc/db-mongo": "workspace:*",
+    "@dmdoc/db-pg": "workspace:*",
     "@dmdoc/llm-provider": "workspace:*",
     "@dmdoc/shared-types": "workspace:*",
     "@fastify/cors": "^11.2.0",

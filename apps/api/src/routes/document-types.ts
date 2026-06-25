@@ -1,9 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify';
-import type { Db } from 'mongodb';
+import type { Sql } from '@dmdoc/db-pg';
 import { z } from 'zod';
-import { TenantRepository, newId } from '@dmdoc/db-mongo';
+import { TenantRepository, newId } from '@dmdoc/db-pg';
 import type { IndexField } from '@dmdoc/shared-types';
-import type { TenantDocument } from '@dmdoc/db-mongo';
+import type { TenantDocument } from '@dmdoc/db-pg';
 import { ForbiddenError, NotFoundError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantContext, resolveTenantId } from '../auth/resolve-tenant.js';
@@ -25,15 +25,15 @@ interface DepartmentNameDoc {
 }
 
 const ListDocumentTypesQuerySchema = z.object({
-  tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas
+  tenantId: z.string().uuid().optional(),
 });
 
 const CreateDocumentTypeBodySchema = z
   .object({
     name: z.string().min(1).max(200),
     description: z.string().nullable().default(null),
-    tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas
-    isGlobal: z.boolean().default(false),   // SUPER_ADMIN apenas
+    tenantId: z.string().uuid().optional(),
+    isGlobal: z.boolean().default(false),
     departmentIds: z.array(z.string().uuid()).min(1).optional(),
   })
   .superRefine((val, ctx) => {
@@ -71,150 +71,162 @@ const PatchIndexFieldBodySchema = z.object({
 });
 
 const TenantIdQuerySchema = z.object({
-  tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas
+  tenantId: z.string().uuid().optional(),
 });
 
 const SetGlobalTypeDeptConfigBodySchema = z.object({
   departmentIds: z.array(z.string().uuid()).min(1),
-  tenantId: z.string().uuid().optional(), // SUPER_ADMIN / MTA apenas
+  tenantId: z.string().uuid().optional(),
 });
 
+type DocTypeRow = {
+  id: string;
+  tenant_id: string | null;
+  name: string;
+  description: string | null;
+  is_global: boolean;
+  created_at: Date;
+  index_fields: IndexField[];
+  department_ids: string[] | null;
+  deleted: boolean;
+};
+
+function rowToDocType(r: DocTypeRow): DocumentTypeDoc {
+  const base: DocumentTypeDoc = {
+    id: r.id,
+    tenantId: r.tenant_id ?? '',
+    name: r.name,
+    description: r.description,
+    isGlobal: r.is_global,
+    createdAt: r.created_at,
+    indexFields: r.index_fields ?? [],
+    deleted: r.deleted,
+  };
+  if (r.department_ids !== null && r.department_ids !== undefined) {
+    base.departmentIds = r.department_ids;
+  }
+  return base;
+}
+
 /**
- * Rotas de CRUD de tipos de documento e seus campos de índice.
- *
- * GET lista tipos do tenant + tipos globais (isGlobal: true).
- * Mutations operam apenas sobre tipos do tenant (não globais).
- *
- * SUPER_ADMIN: informa tenantId via body (POST) ou ?tenantId (PATCH, DELETE,
- * POST index-fields, PATCH index-fields, DELETE index-fields).
+ * Rotas de CRUD de tipos de documento e seus campos de índice — PostgreSQL.
  */
 export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
   /**
    * GET /document-types — lista tipos de documento.
-   *
-   * - SA sem ?tenantId: todos os tipos de todos os tenants (incluindo globais)
-   * - SA/MTA com ?tenantId: tipos do tenant específico + tipos globais
-   * - MTA sem ?tenantId: tipos de todos os seus tenants + globais
-   * - TENANT_ADMIN: tipos do próprio tenant + globais (sem restrição de ACL)
-   * - UPLOADER/USER: tipos globais + tipos de empresa cujos departmentIds
-   *   tenham interseção com os departamentos acessíveis ao usuário
-   *
-   * A resposta inclui o campo `departments: [{id, name}]` para cada tipo,
-   * resolvido via lookup na coleção `departments`.
    */
   app.get('/document-types', { preHandler: app.authenticate }, async (request, reply) => {
     const { tenantId: tenantIdParam } = ListDocumentTypesQuerySchema.parse(request.query);
-    const db = app.db;
+    const sql = app.db;
 
     const ctx = resolveTenantContext(request, { explicitTenantId: tenantIdParam });
     const role = request.user?.role ?? '';
     const userId = request.user?.sub ?? '';
 
-    let items: Record<string, unknown>[];
+    let rows: DocTypeRow[];
 
     if (ctx.mode === 'all') {
-      items = await db
-        .collection('document_types')
-        .find({ deleted: false })
-        .sort({ name: 1 })
-        .toArray() as unknown as Record<string, unknown>[];
+      rows = await sql<DocTypeRow[]>`
+        SELECT id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+        FROM document_types
+        WHERE deleted = false
+        ORDER BY name ASC
+      `;
     } else if (ctx.mode === 'allowed') {
-      items = await db
-        .collection('document_types')
-        .find({
-          deleted: false,
-          $or: [
-            { tenantId: { $in: ctx.tenantIds } },
-            { isGlobal: true, tenantId: null },
-          ],
-        })
-        .sort({ name: 1 })
-        .toArray() as unknown as Record<string, unknown>[];
+      rows = await sql<DocTypeRow[]>`
+        SELECT id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+        FROM document_types
+        WHERE deleted = false
+          AND (
+            tenant_id = ANY(${ctx.tenantIds}::uuid[])
+            OR (is_global = true AND tenant_id IS NULL)
+          )
+        ORDER BY name ASC
+      `;
     } else {
-      // mode === 'single'
-      const baseTenantId = ctx.tenantId as string;
+      const baseTenantId = ctx.tenantId;
 
-      // Para UPLOADER e USER, aplica filtro de visibilidade por departamento.
-      const accessibleDeptIds = await resolveAccessibleDepartmentIds(
-        db,
-        userId,
-        baseTenantId,
-        role
-      );
+      const accessibleDeptIds = await resolveAccessibleDepartmentIds(sql, userId, baseTenantId, role);
 
-      let tenantFilter: Record<string, unknown>;
       if (accessibleDeptIds !== null) {
-        // Carrega configurações de visibilidade de tipos globais para este tenant.
-        const globalConfigs = await db
-          .collection('global_type_tenant_depts')
-          .find({ tenantId: baseTenantId, deleted: false })
-          .project<{ globalTypeId: string; departmentIds: string[] }>({ _id: 0, globalTypeId: 1, departmentIds: 1 })
-          .toArray();
+        // UPLOADER/USER: filtra por departamentos acessíveis
+        // Tipos globais visíveis = aqueles com config cujos depts intersectem com os acessíveis
+        const globalConfigs = await sql<Array<{ global_type_id: string; department_ids: string[] }>>`
+          SELECT global_type_id, department_ids
+          FROM global_type_tenant_depts
+          WHERE tenant_id = ${baseTenantId}
+            AND deleted = false
+        `;
 
-        // Tipos globais visíveis = aqueles com config cujos depts intersectem com os acessíveis.
         const visibleGlobalIds = globalConfigs
-          .filter((c) => c.departmentIds.some((id) => accessibleDeptIds.includes(id)))
-          .map((c) => c.globalTypeId);
+          .filter((c) => c.department_ids.some((id) => accessibleDeptIds.includes(id)))
+          .map((c) => c.global_type_id);
 
-        const globalCondition =
-          visibleGlobalIds.length > 0
-            ? [{ isGlobal: true, tenantId: null, id: { $in: visibleGlobalIds } }]
-            : [];
-
-        tenantFilter = {
-          deleted: false,
-          $or: [
-            ...globalCondition,
-            {
-              tenantId: baseTenantId,
-              departmentIds: { $in: accessibleDeptIds },
-            },
-          ],
-        };
+        if (visibleGlobalIds.length > 0) {
+          rows = await sql<DocTypeRow[]>`
+            SELECT id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+            FROM document_types
+            WHERE deleted = false
+              AND (
+                (is_global = true AND tenant_id IS NULL AND id = ANY(${visibleGlobalIds}::uuid[]))
+                OR (tenant_id = ${baseTenantId} AND department_ids && ${accessibleDeptIds}::uuid[])
+              )
+            ORDER BY name ASC
+          `;
+        } else {
+          rows = await sql<DocTypeRow[]>`
+            SELECT id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+            FROM document_types
+            WHERE deleted = false
+              AND tenant_id = ${baseTenantId}
+              AND department_ids && ${accessibleDeptIds}::uuid[]
+            ORDER BY name ASC
+          `;
+        }
       } else {
-        // Admins: veem todos os tipos do tenant + globais.
-        tenantFilter = {
-          deleted: false,
-          $or: [{ tenantId: baseTenantId }, { isGlobal: true, tenantId: null }],
-        };
+        // Admins: veem todos os tipos do tenant + globais
+        rows = await sql<DocTypeRow[]>`
+          SELECT id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+          FROM document_types
+          WHERE deleted = false
+            AND (
+              tenant_id = ${baseTenantId}
+              OR (is_global = true AND tenant_id IS NULL)
+            )
+          ORDER BY name ASC
+        `;
       }
-
-      items = await db
-        .collection('document_types')
-        .find(tenantFilter)
-        .sort({ name: 1 })
-        .toArray() as unknown as Record<string, unknown>[];
     }
 
-    // Resolve nomes dos departamentos: coleta todos os departmentIds únicos
-    // de todos os tipos retornados e faz um único lookup em batch.
+    const items = rows.map(rowToDocType);
+
+    // Resolve nomes dos departamentos em batch
     const allDeptIds = new Set<string>();
     for (const item of items) {
-      const deptIds = item['departmentIds'] as string[] | undefined;
-      if (Array.isArray(deptIds)) {
-        for (const deptId of deptIds) allDeptIds.add(deptId);
+      if (Array.isArray(item.departmentIds)) {
+        for (const deptId of item.departmentIds) allDeptIds.add(deptId);
       }
     }
 
     const deptNameMap = new Map<string, string>();
     if (allDeptIds.size > 0) {
-      const deptDocs = await db
-        .collection('departments')
-        .find({ id: { $in: [...allDeptIds] }, deleted: false })
-        .project<DepartmentNameDoc>({ _id: 0, id: 1, name: 1 })
-        .toArray();
+      const deptDocs = await sql<DepartmentNameDoc[]>`
+        SELECT id, name
+        FROM departments
+        WHERE id = ANY(${[...allDeptIds]}::uuid[])
+          AND deleted = false
+      `;
       for (const dept of deptDocs) {
         deptNameMap.set(dept.id, dept.name);
       }
     }
 
     const enriched = items.map((item) => {
-      const stripped = stripMongoId(item);
-      const deptIds = stripped['departmentIds'] as string[] | undefined;
+      const deptIds = item.departmentIds;
       const departments = Array.isArray(deptIds)
         ? deptIds.map((deptId) => ({ id: deptId, name: deptNameMap.get(deptId) ?? '' }))
         : [];
-      return { ...stripped, departments };
+      return { ...item, departments };
     });
 
     return reply.status(200).send(enriched);
@@ -222,12 +234,6 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * POST /document-types — cria tipo de documento para o tenant.
-   * SUPER_ADMIN: informar `tenantId` no body (obrigatório).
-   * isGlobal sempre false; tenantId do request (ou body para SA).
-   *
-   * Para tipos de empresa (isGlobal: false), `departmentIds` é obrigatório
-   * (min 1) e todos os IDs devem existir no tenant (→ 404 caso contrário).
-   * Para tipos globais (isGlobal: true), `departmentIds` é ignorado.
    */
   app.post('/document-types', { preHandler: app.authenticate }, async (request, reply) => {
     requireRole(request, ...ADMIN_ROLES);
@@ -235,27 +241,19 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     const body = CreateDocumentTypeBodySchema.parse(request.body);
     const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
     const { name, description, departmentIds } = body;
-    const db = app.db;
+    const sql = app.db;
 
     if (isSuperAdmin && body.isGlobal) {
-      // Tipo global — sem escopo de tenant; departmentIds é ignorado.
       const id = newId();
-      const docType = {
-        id,
-        tenantId: null,
-        name,
-        description: description ?? null,
-        isGlobal: true,
-        createdAt: new Date(),
-        indexFields: [],
-        deleted: false,
-      };
-      await db.collection('document_types').insertOne(docType);
+      const now = new Date();
+      await sql`
+        INSERT INTO document_types (id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted)
+        VALUES (${id}, NULL, ${name}, ${description ?? null}, true, ${now}, ${JSON.stringify([])}, NULL, false)
+      `;
       request.log.info({ documentTypeId: id }, 'tipo de documento global criado');
-      // Tipos globais não têm departamentos — enrichWithDepartments retorna departments: [].
       const enrichedGlobal = await enrichWithDepartments(
-        docType as unknown as Record<string, unknown>,
-        db as Db
+        { id, tenantId: null as unknown as string, name, description: description ?? null, isGlobal: true, createdAt: now, indexFields: [], deleted: false },
+        sql
       );
       return reply.status(201).send(enrichedGlobal);
     }
@@ -263,82 +261,82 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     const effectiveTenantId = resolveTenantId(request, body.tenantId, true);
     const tenantId = effectiveTenantId as string;
 
-    // departmentIds é obrigatório para tipos de empresa (garantido pelo superRefine,
-    // mas verificado aqui também para garantir o tipo).
     const resolvedDeptIds = departmentIds as string[];
 
-    // Valida que todos os departmentIds existem e pertencem ao tenant.
-    const foundCount = await db
-      .collection('departments')
-      .countDocuments({ id: { $in: resolvedDeptIds }, tenantId, deleted: false });
+    // Valida que todos os departmentIds existem e pertencem ao tenant
+    const foundDepts = await sql<Array<{ count: string }>>`
+      SELECT COUNT(*) AS count
+      FROM departments
+      WHERE id = ANY(${resolvedDeptIds}::uuid[])
+        AND tenant_id = ${tenantId}
+        AND deleted = false
+    `;
+    const foundCount = parseInt(foundDepts[0]?.count ?? '0', 10);
     if (foundCount !== resolvedDeptIds.length) {
-      request.log.warn(
-        { tenantId, departmentIds: resolvedDeptIds },
-        'um ou mais departmentIds não encontrados no tenant'
-      );
+      request.log.warn({ tenantId, departmentIds: resolvedDeptIds }, 'um ou mais departmentIds não encontrados no tenant');
       throw new NotFoundError();
     }
 
-    const repo = new TenantRepository<DocumentTypeDoc>(
-      db.collection('document_types'),
-      { tenantId }
-    );
+    const repo = new TenantRepository<DocumentTypeDoc>(sql, 'document_types', { tenantId });
 
-    const docType = await repo.insertOne({
+    const docType = rowToDocType(await repo.insertOne({
       name,
-      description,
+      description: description ?? null,
       isGlobal: false,
       createdAt: new Date(),
       indexFields: [],
       departmentIds: resolvedDeptIds,
-    });
+    }) as unknown as DocTypeRow);
 
     request.log.info({ tenantId, documentTypeId: docType.id }, 'tipo de documento criado');
-    const enrichedDocType = await enrichWithDepartments(
-      docType as unknown as Record<string, unknown>,
-      db as Db
-    );
+    const enrichedDocType = await enrichWithDepartments(docType, sql);
     return reply.status(201).send(enrichedDocType);
   });
 
   /**
    * PATCH /document-types/:id — atualiza tipo de documento.
-   * SUPER_ADMIN em tipo global: sem tenantId necessário.
-   * SUPER_ADMIN em tipo de tenant: informar `?tenantId=xxx`.
-   *
-   * Para tipos de empresa, se `departmentIds` for informado, todos os IDs
-   * devem existir no tenant (→ 404 caso contrário).
-   * Tipos globais não aceitam `departmentIds`.
    */
   app.patch('/document-types/:id', { preHandler: app.authenticate }, async (request, reply) => {
     requireRole(request, ...ADMIN_ROLES);
 
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const updates = PatchDocumentTypeBodySchema.parse(request.body);
-    const db = app.db;
+    const sql = app.db;
     const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
 
-    const existing = await db.collection('document_types').findOne({ id, deleted: false });
-    if (!existing) throw new NotFoundError();
-    const doc = existing as unknown as DocumentTypeDoc;
+    const existingRows = await sql<DocTypeRow[]>`
+      SELECT id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+      FROM document_types
+      WHERE id = ${id}
+        AND deleted = false
+      LIMIT 1
+    `;
+    if (existingRows.length === 0) throw new NotFoundError();
+    const doc = rowToDocType(existingRows[0]!);
 
     if (doc.isGlobal) {
       if (!isSuperAdmin) throw new ForbiddenError('Tipos globais só podem ser editados por SUPER_ADMIN');
-      // Tipos globais não têm departmentIds — ignorar o campo mesmo que enviado.
       const { departmentIds: _ignored, ...globalUpdates } = updates;
       const clean = removeUndefined(globalUpdates);
-      const result = await db.collection('document_types').findOneAndUpdate(
-        { id, deleted: false },
-        { $set: clean },
-        { returnDocument: 'after' }
-      );
-      if (!result) throw new NotFoundError();
+
+      const setParts: string[] = [];
+      const values: unknown[] = [id];
+      let paramIdx = 2;
+
+      if (clean.name !== undefined) { setParts.push(`name = $${paramIdx++}`); values.push(clean.name); }
+      if ('description' in clean && clean.description !== undefined) { setParts.push(`description = $${paramIdx++}`); values.push(clean.description); }
+
+      if (setParts.length === 0) {
+        const enrichedNoOp = await enrichWithDepartments(doc, sql);
+        return reply.status(200).send(enrichedNoOp);
+      }
+
+      const query = `UPDATE document_types SET ${setParts.join(', ')} WHERE id = $1 AND deleted = false RETURNING id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted`;
+      const updRows = await sql.unsafe<DocTypeRow[]>(query, values as Parameters<typeof sql.unsafe>[1]);
+      if (updRows.length === 0) throw new NotFoundError();
+
       request.log.info({ documentTypeId: id }, 'tipo de documento global atualizado');
-      // Tipos globais não têm departamentos — enrichWithDepartments retorna departments: [].
-      const enrichedGlobalPatch = await enrichWithDepartments(
-        result as Record<string, unknown>,
-        db as Db
-      );
+      const enrichedGlobalPatch = await enrichWithDepartments(rowToDocType(updRows[0]!), sql);
       return reply.status(200).send(enrichedGlobalPatch);
     }
 
@@ -346,52 +344,54 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
     const tenantId = effectiveTenantId as string;
 
-    // Se departmentIds foi fornecido, valida existência no tenant.
     if (updates.departmentIds !== undefined) {
       const deptIds = updates.departmentIds;
-      const foundCount = await db
-        .collection('departments')
-        .countDocuments({ id: { $in: deptIds }, tenantId, deleted: false });
+      const foundDepts = await sql<Array<{ count: string }>>`
+        SELECT COUNT(*) AS count
+        FROM departments
+        WHERE id = ANY(${deptIds}::uuid[])
+          AND tenant_id = ${tenantId}
+          AND deleted = false
+      `;
+      const foundCount = parseInt(foundDepts[0]?.count ?? '0', 10);
       if (foundCount !== deptIds.length) {
-        request.log.warn(
-          { tenantId, documentTypeId: id, departmentIds: deptIds },
-          'um ou mais departmentIds não encontrados no tenant'
-        );
+        request.log.warn({ tenantId, documentTypeId: id, departmentIds: deptIds }, 'um ou mais departmentIds não encontrados no tenant');
         throw new NotFoundError();
       }
     }
 
-    const repo = new TenantRepository<DocumentTypeDoc>(db.collection('document_types'), { tenantId });
+    const repo = new TenantRepository<DocumentTypeDoc>(sql, 'document_types', { tenantId });
     const updated = await repo.updateById(id, removeUndefined(updates) as Parameters<typeof repo.updateById>[1]);
     if (!updated) throw new NotFoundError();
 
     request.log.info({ tenantId, documentTypeId: id }, 'tipo de documento atualizado');
-    const enrichedUpdated = await enrichWithDepartments(
-      updated as unknown as Record<string, unknown>,
-      db as Db
-    );
+    const enrichedUpdated = await enrichWithDepartments(rowToDocType(updated as unknown as DocTypeRow), sql);
     return reply.status(200).send(enrichedUpdated);
   });
 
   /**
    * DELETE /document-types/:id — soft-delete de tipo do tenant.
-   * SUPER_ADMIN pode deletar tipos globais sem tenantId.
-   * Tenants não podem deletar tipos globais.
    */
   app.delete('/document-types/:id', { preHandler: app.authenticate }, async (request, reply) => {
     requireRole(request, ...ADMIN_ROLES);
 
     const { id } = z.object({ id: z.string() }).parse(request.params);
-    const db = app.db;
+    const sql = app.db;
     const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
 
-    const existing = await db.collection('document_types').findOne({ id, deleted: false });
-    if (!existing) throw new NotFoundError();
-    const doc = existing as unknown as DocumentTypeDoc;
+    const existingRows = await sql<DocTypeRow[]>`
+      SELECT id, tenant_id, is_global, deleted
+      FROM document_types
+      WHERE id = ${id}
+        AND deleted = false
+      LIMIT 1
+    `;
+    if (existingRows.length === 0) throw new NotFoundError();
+    const doc = existingRows[0]!;
 
-    if (doc.isGlobal) {
+    if (doc.is_global) {
       if (!isSuperAdmin) throw new ForbiddenError('Tipos globais não podem ser excluídos por tenants');
-      await db.collection('document_types').updateOne({ id }, { $set: { deleted: true } });
+      await sql`UPDATE document_types SET deleted = true WHERE id = ${id}`;
       request.log.info({ documentTypeId: id }, 'tipo de documento global removido');
       return reply.status(204).send();
     }
@@ -400,7 +400,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
     const tenantId = effectiveTenantId as string;
 
-    const repo = new TenantRepository<DocumentTypeDoc>(db.collection('document_types'), { tenantId });
+    const repo = new TenantRepository<DocumentTypeDoc>(sql, 'document_types', { tenantId });
     const deleted = await repo.softDelete(id);
     if (!deleted) throw new NotFoundError();
 
@@ -410,7 +410,6 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * POST /document-types/:id/index-fields — adiciona campo ao tipo.
-   * SUPER_ADMIN: informar `?tenantId=xxx` (obrigatório).
    */
   app.post(
     '/document-types/:id/index-fields',
@@ -420,20 +419,25 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
       const { id } = z.object({ id: z.string() }).parse(request.params);
       const fieldInput = CreateIndexFieldBodySchema.parse(request.body);
-      const db = app.db;
+      const sql = app.db;
       const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
 
-      const existing = await db.collection('document_types').findOne({ id, deleted: false });
-      if (!existing) throw new NotFoundError();
-      const docType = existing as unknown as DocumentTypeDoc;
+      const existingRows = await sql<DocTypeRow[]>`
+        SELECT id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+        FROM document_types
+        WHERE id = ${id}
+          AND deleted = false
+        LIMIT 1
+      `;
+      if (existingRows.length === 0) throw new NotFoundError();
+      const docType = rowToDocType(existingRows[0]!);
       if (docType.isGlobal && !isSuperAdmin) throw new ForbiddenError('Tipos globais só podem ser editados por SUPER_ADMIN');
 
-      const typeFilter = docType.isGlobal
-        ? { id, deleted: false }
+      const tenantIdFilter = docType.isGlobal
+        ? null
         : (() => {
             const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
-            const tenantId = resolveTenantId(request, tenantIdParam, true) as string;
-            return { id, tenantId, deleted: false };
+            return resolveTenantId(request, tenantIdParam, true) as string;
           })();
 
       const newField: IndexField = {
@@ -447,27 +451,38 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
         deleted: false,
       };
 
-      const updated = await db
-        .collection('document_types')
-        .findOneAndUpdate(
-          typeFilter,
-          { $push: { indexFields: newField } } as Record<string, unknown>,
-          { returnDocument: 'after' }
-        );
+      const currentFields = docType.indexFields ?? [];
+      const newFields = [...currentFields, newField];
 
-      if (!updated) throw new NotFoundError();
+      let updRows: DocTypeRow[];
+      if (docType.isGlobal) {
+        updRows = await sql<DocTypeRow[]>`
+          UPDATE document_types
+          SET index_fields = ${JSON.stringify(newFields)}
+          WHERE id = ${id}
+            AND deleted = false
+          RETURNING id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+        `;
+      } else {
+        updRows = await sql<DocTypeRow[]>`
+          UPDATE document_types
+          SET index_fields = ${JSON.stringify(newFields)}
+          WHERE id = ${id}
+            AND tenant_id = ${tenantIdFilter}
+            AND deleted = false
+          RETURNING id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+        `;
+      }
 
-      request.log.info(
-        { documentTypeId: id, fieldId: newField.id },
-        'campo de índice adicionado'
-      );
-      return reply.status(200).send(stripMongoId(updated as Record<string, unknown>));
+      if (updRows.length === 0) throw new NotFoundError();
+
+      request.log.info({ documentTypeId: id, fieldId: newField.id }, 'campo de índice adicionado');
+      return reply.status(200).send(rowToDocType(updRows[0]!));
     }
   );
 
   /**
    * PATCH /document-types/:id/index-fields/:fieldId — atualiza campo.
-   * SUPER_ADMIN em tipo global: sem tenantId necessário.
    */
   app.patch(
     '/document-types/:id/index-fields/:fieldId',
@@ -479,60 +494,64 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
         .object({ id: z.string(), fieldId: z.string() })
         .parse(request.params);
       const fieldUpdates = PatchIndexFieldBodySchema.parse(request.body);
-      const db = app.db;
+      const sql = app.db;
       const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
 
-      const existing = await db.collection('document_types').findOne({ id, deleted: false });
-      if (!existing) throw new NotFoundError();
-      const docType = existing as unknown as DocumentTypeDoc;
+      const existingRows = await sql<DocTypeRow[]>`
+        SELECT id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+        FROM document_types
+        WHERE id = ${id}
+          AND deleted = false
+        LIMIT 1
+      `;
+      if (existingRows.length === 0) throw new NotFoundError();
+      const docType = rowToDocType(existingRows[0]!);
       if (docType.isGlobal && !isSuperAdmin) throw new ForbiddenError('Tipos globais só podem ser editados por SUPER_ADMIN');
 
-      const typeFilter = docType.isGlobal
-        ? { id, deleted: false }
+      const tenantIdFilter = docType.isGlobal
+        ? null
         : (() => {
             const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
-            const tenantId = resolveTenantId(request, tenantIdParam, true) as string;
-            return { id, tenantId, deleted: false };
+            return resolveTenantId(request, tenantIdParam, true) as string;
           })();
 
-      // Monta o $set para o subdocumento usando arrayFilters
-      const setOps: Record<string, unknown> = {};
-      for (const [key, value] of Object.entries(fieldUpdates)) {
-        if (value !== undefined) {
-          setOps[`indexFields.$[elem].${key}`] = value;
-        }
-      }
+      const currentFields: IndexField[] = docType.indexFields ?? [];
+      const fieldIdx = currentFields.findIndex((f) => f.id === fieldId && !f.deleted);
+      if (fieldIdx === -1) throw new NotFoundError();
 
-      if (Object.keys(setOps).length === 0) {
-        const noopExisting = await db.collection('document_types').findOne(typeFilter);
-        if (!noopExisting) throw new NotFoundError();
-        return reply.status(200).send(stripMongoId(noopExisting as Record<string, unknown>));
-      }
-
-      const updated = await db
-        .collection('document_types')
-        .findOneAndUpdate(
-          { ...typeFilter, 'indexFields.id': fieldId },
-          { $set: setOps },
-          {
-            returnDocument: 'after',
-            arrayFilters: [{ 'elem.id': fieldId, 'elem.deleted': false }],
-          }
-        );
-
-      if (!updated) throw new NotFoundError();
-
-      request.log.info(
-        { documentTypeId: id, fieldId },
-        'campo de índice atualizado'
+      const updatedFields = currentFields.map((f, i) =>
+        i === fieldIdx ? { ...f, ...removeUndefined(fieldUpdates as Record<string, unknown>) } : f
       );
-      return reply.status(200).send(stripMongoId(updated as Record<string, unknown>));
+
+      let updRows: DocTypeRow[];
+      if (docType.isGlobal) {
+        updRows = await sql<DocTypeRow[]>`
+          UPDATE document_types
+          SET index_fields = ${JSON.stringify(updatedFields)}
+          WHERE id = ${id}
+            AND deleted = false
+          RETURNING id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+        `;
+      } else {
+        updRows = await sql<DocTypeRow[]>`
+          UPDATE document_types
+          SET index_fields = ${JSON.stringify(updatedFields)}
+          WHERE id = ${id}
+            AND tenant_id = ${tenantIdFilter}
+            AND deleted = false
+          RETURNING id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+        `;
+      }
+
+      if (updRows.length === 0) throw new NotFoundError();
+
+      request.log.info({ documentTypeId: id, fieldId }, 'campo de índice atualizado');
+      return reply.status(200).send(rowToDocType(updRows[0]!));
     }
   );
 
   /**
-   * GET /document-types/:id/dept-config — retorna config de departamentos do tenant
-   * para um tipo global. Apenas ADMIN_ROLES.
+   * GET /document-types/:id/dept-config
    */
   app.get(
     '/document-types/:id/dept-config',
@@ -542,29 +561,36 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
       const { id } = z.object({ id: z.string() }).parse(request.params);
       const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
-      const db = app.db;
+      const sql = app.db;
 
-      const existing = await db.collection('document_types').findOne({ id, deleted: false });
-      if (!existing) throw new NotFoundError();
-      const doc = existing as unknown as DocumentTypeDoc;
-      if (!doc.isGlobal) throw new NotFoundError();
+      const existingRows = await sql<Array<{ id: string; is_global: boolean }>>`
+        SELECT id, is_global FROM document_types WHERE id = ${id} AND deleted = false LIMIT 1
+      `;
+      if (existingRows.length === 0) throw new NotFoundError();
+      if (!existingRows[0]!.is_global) throw new NotFoundError();
 
       const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
       const tenantId = effectiveTenantId as string;
 
-      const config = await db
-        .collection('global_type_tenant_depts')
-        .findOne({ globalTypeId: id, tenantId, deleted: false });
+      type ConfigRow = { id: string; global_type_id: string; tenant_id: string; department_ids: string[]; deleted: boolean; created_at: Date; updated_at: Date };
+      const configRows = await sql<ConfigRow[]>`
+        SELECT id, global_type_id, tenant_id, department_ids, deleted, created_at, updated_at
+        FROM global_type_tenant_depts
+        WHERE global_type_id = ${id}
+          AND tenant_id = ${tenantId}
+          AND deleted = false
+        LIMIT 1
+      `;
 
-      if (!config) return reply.status(200).send(null);
+      if (configRows.length === 0) return reply.status(200).send(null);
 
-      return reply.status(200).send(stripMongoId(config as unknown as Record<string, unknown>));
+      const r = configRows[0]!;
+      return reply.status(200).send({ id: r.id, globalTypeId: r.global_type_id, tenantId: r.tenant_id, departmentIds: r.department_ids, createdAt: r.created_at, updatedAt: r.updated_at });
     }
   );
 
   /**
-   * PUT /document-types/:id/dept-config — cria ou atualiza config de departamentos
-   * do tenant para um tipo global. Apenas ADMIN_ROLES.
+   * PUT /document-types/:id/dept-config
    */
   app.put(
     '/document-types/:id/dept-config',
@@ -574,52 +600,52 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
       const { id } = z.object({ id: z.string() }).parse(request.params);
       const body = SetGlobalTypeDeptConfigBodySchema.parse(request.body);
-      const db = app.db;
+      const sql = app.db;
 
-      const existing = await db.collection('document_types').findOne({ id, deleted: false });
-      if (!existing) throw new NotFoundError();
-      const doc = existing as unknown as DocumentTypeDoc;
-      if (!doc.isGlobal) throw new NotFoundError();
+      const existingRows = await sql<Array<{ id: string; is_global: boolean }>>`
+        SELECT id, is_global FROM document_types WHERE id = ${id} AND deleted = false LIMIT 1
+      `;
+      if (existingRows.length === 0) throw new NotFoundError();
+      if (!existingRows[0]!.is_global) throw new NotFoundError();
 
       const effectiveTenantId = resolveTenantId(request, body.tenantId, true);
       const tenantId = effectiveTenantId as string;
 
-      // Valida que todos os departmentIds existem e pertencem ao tenant.
       const { departmentIds } = body;
-      const foundCount = await db
-        .collection('departments')
-        .countDocuments({ id: { $in: departmentIds }, tenantId, deleted: false });
+      const foundDepts = await sql<Array<{ count: string }>>`
+        SELECT COUNT(*) AS count
+        FROM departments
+        WHERE id = ANY(${departmentIds}::uuid[])
+          AND tenant_id = ${tenantId}
+          AND deleted = false
+      `;
+      const foundCount = parseInt(foundDepts[0]?.count ?? '0', 10);
       if (foundCount !== departmentIds.length) {
-        request.log.warn(
-          { tenantId, globalTypeId: id, departmentIds },
-          'um ou mais departmentIds não encontrados no tenant'
-        );
+        request.log.warn({ tenantId, globalTypeId: id, departmentIds }, 'um ou mais departmentIds não encontrados no tenant');
         throw new NotFoundError();
       }
 
       const now = new Date();
-      const configResult = await db
-        .collection('global_type_tenant_depts')
-        .findOneAndUpdate(
-          { globalTypeId: id, tenantId, deleted: false },
-          {
-            $set: { departmentIds, updatedAt: now },
-            $setOnInsert: { id: newId(), globalTypeId: id, tenantId, createdAt: now, deleted: false },
-          },
-          { upsert: true, returnDocument: 'after' }
-        );
+      const configId = newId();
 
-      request.log.info(
-        { tenantId, globalTypeId: id, departmentIds },
-        'config de departamentos para tipo global atualizada'
-      );
-      return reply.status(200).send(stripMongoId(configResult as unknown as Record<string, unknown>));
+      // UPSERT
+      type ConfigRow = { id: string; global_type_id: string; tenant_id: string; department_ids: string[]; deleted: boolean; created_at: Date; updated_at: Date };
+      const upsertRows = await sql<ConfigRow[]>`
+        INSERT INTO global_type_tenant_depts (id, global_type_id, tenant_id, department_ids, deleted, created_at, updated_at)
+        VALUES (${configId}, ${id}, ${tenantId}, ${departmentIds}, false, ${now}, ${now})
+        ON CONFLICT (global_type_id, tenant_id)
+        DO UPDATE SET department_ids = EXCLUDED.department_ids, updated_at = EXCLUDED.updated_at, deleted = false
+        RETURNING id, global_type_id, tenant_id, department_ids, deleted, created_at, updated_at
+      `;
+
+      const r = upsertRows[0]!;
+      request.log.info({ tenantId, globalTypeId: id, departmentIds }, 'config de departamentos para tipo global atualizada');
+      return reply.status(200).send({ id: r.id, globalTypeId: r.global_type_id, tenantId: r.tenant_id, departmentIds: r.department_ids, createdAt: r.created_at, updatedAt: r.updated_at });
     }
   );
 
   /**
-   * DELETE /document-types/:id/dept-config — remove config de departamentos
-   * do tenant para um tipo global (tipo fica invisível para todos no tenant).
+   * DELETE /document-types/:id/dept-config
    */
   app.delete(
     '/document-types/:id/dept-config',
@@ -629,33 +655,34 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
       const { id } = z.object({ id: z.string() }).parse(request.params);
       const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
-      const db = app.db;
+      const sql = app.db;
 
-      const existing = await db.collection('document_types').findOne({ id, deleted: false });
-      if (!existing) throw new NotFoundError();
-      const doc = existing as unknown as DocumentTypeDoc;
-      if (!doc.isGlobal) throw new NotFoundError();
+      const existingRows = await sql<Array<{ id: string; is_global: boolean }>>`
+        SELECT id, is_global FROM document_types WHERE id = ${id} AND deleted = false LIMIT 1
+      `;
+      if (existingRows.length === 0) throw new NotFoundError();
+      if (!existingRows[0]!.is_global) throw new NotFoundError();
 
       const effectiveTenantId = resolveTenantId(request, tenantIdParam, true);
       const tenantId = effectiveTenantId as string;
 
-      const result = await db
-        .collection('global_type_tenant_depts')
-        .updateOne({ globalTypeId: id, tenantId, deleted: false }, { $set: { deleted: true, updatedAt: new Date() } });
+      const result = await sql`
+        UPDATE global_type_tenant_depts
+        SET deleted = true, updated_at = NOW()
+        WHERE global_type_id = ${id}
+          AND tenant_id = ${tenantId}
+          AND deleted = false
+      `;
 
-      if (result.matchedCount === 0) throw new NotFoundError();
+      if (result.count === 0) throw new NotFoundError();
 
-      request.log.info(
-        { tenantId, globalTypeId: id },
-        'config de departamentos para tipo global removida'
-      );
+      request.log.info({ tenantId, globalTypeId: id }, 'config de departamentos para tipo global removida');
       return reply.status(204).send();
     }
   );
 
   /**
    * DELETE /document-types/:id/index-fields/:fieldId — soft-delete do campo.
-   * SUPER_ADMIN em tipo global: sem tenantId necessário.
    */
   app.delete(
     '/document-types/:id/index-fields/:fieldId',
@@ -666,53 +693,63 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       const { id, fieldId } = z
         .object({ id: z.string(), fieldId: z.string() })
         .parse(request.params);
-      const db = app.db;
+      const sql = app.db;
       const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
 
-      const existing = await db.collection('document_types').findOne({ id, deleted: false });
-      if (!existing) throw new NotFoundError();
-      const docType = existing as unknown as DocumentTypeDoc;
+      const existingRows = await sql<DocTypeRow[]>`
+        SELECT id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+        FROM document_types
+        WHERE id = ${id}
+          AND deleted = false
+        LIMIT 1
+      `;
+      if (existingRows.length === 0) throw new NotFoundError();
+      const docType = rowToDocType(existingRows[0]!);
       if (docType.isGlobal && !isSuperAdmin) throw new ForbiddenError('Tipos globais só podem ser editados por SUPER_ADMIN');
 
-      const typeFilter = docType.isGlobal
-        ? { id, deleted: false }
+      const tenantIdFilter = docType.isGlobal
+        ? null
         : (() => {
             const { tenantId: tenantIdParam } = TenantIdQuerySchema.parse(request.query);
-            const tenantId = resolveTenantId(request, tenantIdParam, true) as string;
-            return { id, tenantId, deleted: false };
+            return resolveTenantId(request, tenantIdParam, true) as string;
           })();
 
-      const updated = await db
-        .collection('document_types')
-        .findOneAndUpdate(
-          { ...typeFilter, 'indexFields.id': fieldId },
-          { $set: { 'indexFields.$[elem].deleted': true } },
-          {
-            returnDocument: 'after',
-            arrayFilters: [{ 'elem.id': fieldId }],
-          }
-        );
+      const currentFields: IndexField[] = docType.indexFields ?? [];
+      const fieldIdx = currentFields.findIndex((f) => f.id === fieldId);
+      if (fieldIdx === -1) throw new NotFoundError();
 
-      if (!updated) throw new NotFoundError();
-
-      request.log.info(
-        { documentTypeId: id, fieldId },
-        'campo de índice removido (soft delete)'
+      const updatedFields = currentFields.map((f, i) =>
+        i === fieldIdx ? { ...f, deleted: true } : f
       );
-      return reply.status(200).send(stripMongoId(updated as Record<string, unknown>));
+
+      let updRows: DocTypeRow[];
+      if (docType.isGlobal) {
+        updRows = await sql<DocTypeRow[]>`
+          UPDATE document_types
+          SET index_fields = ${JSON.stringify(updatedFields)}
+          WHERE id = ${id}
+            AND deleted = false
+          RETURNING id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+        `;
+      } else {
+        updRows = await sql<DocTypeRow[]>`
+          UPDATE document_types
+          SET index_fields = ${JSON.stringify(updatedFields)}
+          WHERE id = ${id}
+            AND tenant_id = ${tenantIdFilter}
+            AND deleted = false
+          RETURNING id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
+        `;
+      }
+
+      if (updRows.length === 0) throw new NotFoundError();
+
+      request.log.info({ documentTypeId: id, fieldId }, 'campo de índice removido (soft delete)');
+      return reply.status(200).send(rowToDocType(updRows[0]!));
     }
   );
 };
 
-function stripMongoId(doc: Record<string, unknown>): Record<string, unknown> {
-  const { _id: _ignored, ...rest } = doc;
-  return rest;
-}
-
-/**
- * Remove propriedades com valor `undefined` do objeto, para compatibilidade
- * com `exactOptionalPropertyTypes`.
- */
 function removeUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> {
   const result: Partial<T> = {};
   for (const key of Object.keys(obj) as (keyof T)[]) {
@@ -723,34 +760,25 @@ function removeUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> 
   return result;
 }
 
-/**
- * Enriquece um único tipo de documento com o campo `departments: [{id, name}]`,
- * resolvendo os nomes a partir da coleção `departments` do banco.
- *
- * Tipos globais (sem departmentIds) retornam sempre `departments: []`.
- * Tipos de empresa retornam um objeto por departmentId com o nome resolvido;
- * IDs sem documento correspondente (ex.: departamento soft-deleted) ficam com
- * `name: ''` para não quebrar a resposta.
- */
 async function enrichWithDepartments(
-  doc: Record<string, unknown>,
-  db: Db
+  doc: DocumentTypeDoc,
+  sql: Sql
 ): Promise<Record<string, unknown>> {
-  const stripped = stripMongoId(doc);
-  const deptIds = stripped['departmentIds'] as string[] | undefined;
+  const deptIds = doc.departmentIds;
 
   if (!Array.isArray(deptIds) || deptIds.length === 0) {
-    return { ...stripped, departments: [] };
+    return { ...doc, departments: [] };
   }
 
-  const deptDocs = await db
-    .collection('departments')
-    .find({ id: { $in: deptIds }, deleted: false })
-    .project<DepartmentNameDoc>({ _id: 0, id: 1, name: 1 })
-    .toArray();
+  const deptDocs = await sql<DepartmentNameDoc[]>`
+    SELECT id, name
+    FROM departments
+    WHERE id = ANY(${deptIds}::uuid[])
+      AND deleted = false
+  `;
 
   const nameMap = new Map<string, string>(deptDocs.map((d) => [d.id, d.name]));
   const departments = deptIds.map((deptId) => ({ id: deptId, name: nameMap.get(deptId) ?? '' }));
 
-  return { ...stripped, departments };
+  return { ...doc, departments };
 }
