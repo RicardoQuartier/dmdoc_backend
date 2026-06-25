@@ -15,7 +15,10 @@ import { newId } from '@dmdoc/db-mongo';
  */
 
 const TENANT_A = '11111111-1111-1111-1111-111111111111';
+const TENANT_B = '22222222-2222-2222-2222-222222222222';
 const ADMIN_A_ID = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+const UPLOADER_A_ID = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
+const USER_A_ID = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
 const PASSWORD = 'senha-muito-secreta-123';
 
 let app: FastifyInstance;
@@ -231,5 +234,241 @@ describe('GET /departments — documentCount', () => {
 
     expect(comDocs?.documentCount).toBe(2);
     expect(vazio?.documentCount).toBe(0);
+  });
+});
+
+describe('GET /departments?writable=true — filtro de escrita (seletor de upload)', () => {
+  /**
+   * Regra de negócio (wiki "Permissões por departamento (ACL)" → seção
+   * "Seletor de departamento no upload"):
+   *   - Admin (TENANT_ADMIN / SUPER_ADMIN / MTA): todos os departamentos ATIVOS
+   *     do escopo, sem restrição de ACL.
+   *   - UPLOADER / USER: apenas a subárvore expandida das RAÍZES CONCEDIDAS
+   *     (ativas). Sem nenhuma raiz concedida → lista vazia (200, não erro).
+   *   - Multi-tenant: continua escopado por tenant (nunca vaza de outro tenant).
+   *
+   * Bug corrigido: o handler ignorava `?writable=true` e devolvia TODOS os
+   * departamentos do tenant para USER/UPLOADER, contrariando a ACL.
+   */
+
+  // Árvore do TENANT_A:
+  //   Financeiro (raiz) → Contas a Pagar (filho)
+  //   RH (raiz, NÃO concedida)
+  const FINANCEIRO = '33333333-3333-3333-3333-333333333331';
+  const CONTAS_A_PAGAR = '33333333-3333-3333-3333-333333333332';
+  const RH = '33333333-3333-3333-3333-333333333333';
+  // Departamento do TENANT_B (não deve vazar para atores do TENANT_A)
+  const DEPT_TENANT_B = '44444444-4444-4444-4444-444444444444';
+
+  async function seedTreeAndActors(): Promise<void> {
+    await testDb.db.collection('tenants').insertOne({
+      id: TENANT_B,
+      name: 'Empresa B',
+      diskQuotaBytes: 10 * 1024 ** 3,
+      userQuota: 20,
+      active: true,
+      createdAt: new Date(),
+    });
+
+    await testDb.db.collection('departments').insertMany([
+      {
+        id: FINANCEIRO,
+        tenantId: TENANT_A,
+        parentId: null,
+        name: 'Financeiro',
+        level: 0,
+        tags: [],
+        deleted: false,
+        createdAt: new Date(),
+      },
+      {
+        id: CONTAS_A_PAGAR,
+        tenantId: TENANT_A,
+        parentId: FINANCEIRO,
+        name: 'Contas a Pagar',
+        level: 1,
+        tags: [],
+        deleted: false,
+        createdAt: new Date(),
+      },
+      {
+        id: RH,
+        tenantId: TENANT_A,
+        parentId: null,
+        name: 'RH',
+        level: 0,
+        tags: [],
+        deleted: false,
+        createdAt: new Date(),
+      },
+      {
+        id: DEPT_TENANT_B,
+        tenantId: TENANT_B,
+        parentId: null,
+        name: 'Financeiro B',
+        level: 0,
+        tags: [],
+        deleted: false,
+        createdAt: new Date(),
+      },
+    ]);
+
+    await seedUser(testDb.db, {
+      id: UPLOADER_A_ID,
+      tenantId: TENANT_A,
+      email: 'uploader-a@empresa.com',
+      password: PASSWORD,
+      role: 'UPLOADER',
+    });
+
+    await seedUser(testDb.db, {
+      id: USER_A_ID,
+      tenantId: TENANT_A,
+      email: 'user-a@empresa.com',
+      password: PASSWORD,
+      role: 'USER',
+    });
+  }
+
+  async function grantRoot(userId: string, departmentId: string): Promise<void> {
+    await testDb.db.collection('department_permissions').insertOne({
+      userId,
+      departmentId,
+      tenantId: TENANT_A,
+      canRead: true,
+      canWrite: true,
+    });
+  }
+
+  it('USER sem nenhuma raiz concedida → [] (200)', async () => {
+    await seedTreeAndActors();
+    const token = await login('user-a@empresa.com');
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments?writable=true',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([]);
+  });
+
+  it('UPLOADER sem nenhuma raiz concedida → [] (200)', async () => {
+    await seedTreeAndActors();
+    const token = await login('uploader-a@empresa.com');
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments?writable=true',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([]);
+  });
+
+  it('UPLOADER com 1 raiz concedida → somente a subárvore (raiz + filhos), nunca outras raízes', async () => {
+    await seedTreeAndActors();
+    await grantRoot(UPLOADER_A_ID, FINANCEIRO);
+    const token = await login('uploader-a@empresa.com');
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments?writable=true',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
+    // subárvore de Financeiro: ele próprio + Contas a Pagar; RH NÃO entra.
+    expect(ids).toEqual([FINANCEIRO, CONTAS_A_PAGAR].sort());
+  });
+
+  it('USER com raiz concedida → subárvore expandida (ACL leitura==escrita)', async () => {
+    await seedTreeAndActors();
+    await grantRoot(USER_A_ID, FINANCEIRO);
+    const token = await login('user-a@empresa.com');
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments?writable=true',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
+    expect(ids).toEqual([FINANCEIRO, CONTAS_A_PAGAR].sort());
+  });
+
+  it('TENANT_ADMIN → todos os departamentos ATIVOS do tenant (sem restrição de ACL)', async () => {
+    await seedTreeAndActors();
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments?writable=true',
+      headers: { authorization: `Bearer ${tokenA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
+    expect(ids).toEqual([FINANCEIRO, CONTAS_A_PAGAR, RH].sort());
+    // jamais inclui o departamento do TENANT_B
+    expect(ids).not.toContain(DEPT_TENANT_B);
+  });
+
+  it('multi-tenant: UPLOADER do TENANT_A com raiz concedida nunca enxerga depto do TENANT_B', async () => {
+    await seedTreeAndActors();
+    await grantRoot(UPLOADER_A_ID, FINANCEIRO);
+    const token = await login('uploader-a@empresa.com');
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments?writable=true',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as Array<{ id: string }>).map((d) => d.id);
+    expect(ids).not.toContain(DEPT_TENANT_B);
+  });
+
+  it('subárvore concedida exclui departamento soft-deletado (destino de upload exige ativo)', async () => {
+    await seedTreeAndActors();
+    // soft-delete do filho Contas a Pagar
+    await testDb.db
+      .collection('departments')
+      .updateOne({ id: CONTAS_A_PAGAR }, { $set: { deleted: true } });
+    await grantRoot(UPLOADER_A_ID, FINANCEIRO);
+    const token = await login('uploader-a@empresa.com');
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments?writable=true',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as Array<{ id: string }>).map((d) => d.id);
+    expect(ids).toEqual([FINANCEIRO]);
+    expect(ids).not.toContain(CONTAS_A_PAGAR);
+  });
+
+  it('GET /departments sem ?writable retorna todos os deptos do tenant para o UPLOADER (ACL não se aplica)', async () => {
+    await seedTreeAndActors();
+    await grantRoot(UPLOADER_A_ID, FINANCEIRO);
+    const token = await login('uploader-a@empresa.com');
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
+    // Sem ?writable: comportamento de gestão — todos os departamentos do tenant,
+    // independente da ACL de escrita.
+    expect(ids).toEqual([FINANCEIRO, CONTAS_A_PAGAR, RH].sort());
   });
 });

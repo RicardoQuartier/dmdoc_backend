@@ -31,16 +31,15 @@ const EnvSchema = z.object({
     .transform((v) => v === 'true')
     .default('false'),
 
-  // Extração de texto — microserviço unificado em Python
-  // (PyMuPDF/docx/xlsx/pptx + EasyOCR), mesmo motor em dev e prod.
-  EXTRACTOR: z.enum(['python']).default('python'),
-  /** URL do microserviço de extração Python. */
-  EXTRACTOR_URL: z.string().url().optional(),
+  // Extração de texto — comunicação assíncrona via Redis (fila extract:requests).
+  // O extractor Python baixa o arquivo do S3 diretamente e publica o resultado em
+  // extract:result:{requestId}. O worker aguarda via BLPOP sem timeout HTTP.
   /**
-   * Timeout total (ms) da chamada ao extractor. OCR em CPU é lento; default 10 min.
-   * 0 desabilita o timeout.
+   * Timeout do BLPOP aguardando resultado de extração (segundos).
+   * Default 2h — cobre documentos grandes com OCR em CPU.
+   * 0 bloqueia indefinidamente (não recomendado em produção).
    */
-  EXTRACTOR_TIMEOUT_MS: z.coerce.number().int().nonnegative().default(600_000),
+  EXTRACT_BLPOP_TIMEOUT_SECS: z.coerce.number().int().nonnegative().default(7200),
 
   // Embeddings (sempre OpenAI, nunca OpenRouter)
   OPENAI_API_KEY: z.string().min(1).optional(),

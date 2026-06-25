@@ -102,6 +102,7 @@ export interface SeedUserInput {
   name?: string;
   role?: UserDocument['role'];
   active?: boolean;
+  allowedTenantIds?: string[];
 }
 
 /**
@@ -119,6 +120,9 @@ export async function seedUser(db: Db, input: SeedUserInput): Promise<UserDocume
     active: input.active ?? true,
     createdAt: new Date(),
     deleted: false,
+    ...(input.allowedTenantIds !== undefined
+      ? { allowedTenantIds: input.allowedTenantIds }
+      : {}),
   };
   await db.collection<UserDocument & { deleted: boolean }>(USERS_COLLECTION).insertOne(doc);
   const { deleted: _deleted, ...rest } = doc;

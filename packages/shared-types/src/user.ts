@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { RoleSchema } from './role.js';
+import { RoleSchema, isGlobalRole } from './role.js';
 
 /**
  * Usuário de uma empresa. Tem exatamente um papel (role).
@@ -28,9 +28,14 @@ export const UserSchema = z
     allowedTenantIds: z.array(z.string().uuid()).optional(),
   })
   .refine(
-    (u) => u.role === 'SUPER_ADMIN' || u.role === 'MULTI_TENANT_ADMIN' || u.tenantId !== null,
+    // Invariante de escopo BIDIRECIONAL (spec §5.1, §5.3):
+    //   - role GLOBAL (SUPER_ADMIN, MULTI_TENANT_ADMIN) ⇒ tenantId === null
+    //   - role LOCAL (TENANT_ADMIN, UPLOADER, USER)      ⇒ tenantId !== null
+    (u) => (isGlobalRole(u.role) ? u.tenantId === null : u.tenantId !== null),
     {
-      message: 'Apenas SUPER_ADMIN e MULTI_TENANT_ADMIN podem ter tenantId null',
+      message:
+        'Escopo inválido: SUPER_ADMIN/MULTI_TENANT_ADMIN exigem tenantId null; ' +
+        'TENANT_ADMIN/UPLOADER/USER exigem tenantId não-nulo',
       path: ['tenantId'],
     },
   );

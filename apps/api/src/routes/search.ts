@@ -13,17 +13,11 @@ import { embedQuery } from '../services/embedding.js';
 import { parseCitations } from '../services/citation-parser.js';
 import { RAG_ANSWER_PROMPT } from '../prompts/rag-answer.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
+import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais
 // ---------------------------------------------------------------------------
-
-interface DepartmentPermissionDoc {
-  userId: string;
-  departmentId: string;
-  tenantId: string;
-  canRead: boolean;
-}
 
 interface DocumentDoc {
   id: string;
@@ -37,31 +31,8 @@ interface DocumentDoc {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers de permissão
+// Helpers de filtros estruturados
 // ---------------------------------------------------------------------------
-
-/**
- * Resolve os departmentIds que o usuário pode LER.
- * TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN: null (sem restrição de ACL).
- *   Para MTA, os tenants já estão restritos pelo filtro $in de tenantIds — não
- *   há matriz de permissões por departamento adicional (o MTA é um admin de empresa).
- * UPLOADER / USER: somente onde canRead: true no tenant do JWT.
- */
-async function resolveReadableDepartmentIds(
-  db: Db,
-  userId: string,
-  tenantId: string,
-  role: string
-): Promise<string[] | null> {
-  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN') {
-    return null;
-  }
-  const perms = await db
-    .collection<DepartmentPermissionDoc>('department_permissions')
-    .find({ userId, tenantId, canRead: true })
-    .toArray();
-  return perms.map((p) => p.departmentId);
-}
 
 /**
  * Parâmetros de filtros estruturados (tipagem alinhada com exactOptionalPropertyTypes).
@@ -230,14 +201,14 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     const log = request.log.child({ tenantId: logTenantId, userId, traceId: request.id });
 
     // ------------------------------------------------------------------
-    // 2. Resolver departamentos acessíveis (permissões ACL)
+    // 2. Resolver departamentos acessíveis (ACL por raiz com herança dinâmica)
     //    spec §9 etapa 1 — TENANT_ADMIN/SUPER_ADMIN/MTA: sem restrição (null)
-    //    UPLOADER/USER: somente onde canRead: true no tenant do JWT
+    //    UPLOADER/USER: subárvore expandida das raízes concedidas no tenant do JWT
     // ------------------------------------------------------------------
-    let allowedDepartmentIds = await resolveReadableDepartmentIds(
+    let allowedDepartmentIds = await resolveAccessibleDepartmentIds(
       db,
       userId,
-      singleTenantId ?? '',
+      singleTenantId ?? null,
       role
     );
 

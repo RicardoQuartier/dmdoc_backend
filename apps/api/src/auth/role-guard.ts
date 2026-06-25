@@ -1,6 +1,6 @@
 import type { FastifyRequest } from 'fastify';
 import { ForbiddenError } from '../errors/index.js';
-import type { Role } from '@dmdoc/shared-types';
+import { canManageRole, type Role } from '@dmdoc/shared-types';
 
 /**
  * Guard de role inline para rotas protegidas.
@@ -31,5 +31,29 @@ export function requireRole(request: FastifyRequest, ...roles: Role[]): void {
   }
   if (!roles.includes(role)) {
     throw new ForbiddenError();
+  }
+}
+
+/**
+ * Guard de HIERARQUIA: garante que o solicitante (role do JWT) tenha nível
+ * suficiente para gerir um usuário do papel `targetRole`, segundo a regra
+ * "inferior ou igual" (`canManageRole`): só pode gerir quem está no mesmo nível
+ * ou abaixo. NUNCA acima.
+ *
+ * É uma checagem ADICIONAL em cima do gate base de `requireRole(...ADMIN_ROLES)`:
+ * primeiro garante-se que o solicitante é admin; depois, que o nível dele cobre
+ * o papel-alvo. Falha de hierarquia é 403 (ForbiddenError) — não é cross-tenant.
+ *
+ * Deve rodar APÓS `authenticate` (request.user populado).
+ */
+export function requireCanManageRole(request: FastifyRequest, targetRole: Role): void {
+  const role = request.user?.role;
+  if (!role) {
+    throw new ForbiddenError();
+  }
+  if (!canManageRole(role, targetRole)) {
+    throw new ForbiddenError(
+      `Permissão insuficiente: ${role} não pode gerir usuários de papel ${targetRole}`,
+    );
   }
 }

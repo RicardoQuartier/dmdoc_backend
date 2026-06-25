@@ -1,15 +1,22 @@
 import crypto from 'node:crypto';
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyBaseLogger } from 'fastify';
 import { z } from 'zod';
 import type { MultipartFile } from '@fastify/multipart';
-import { TenantRepository, newId, normalizeLimit } from '@dmdoc/db-mongo';
+import {
+  TenantRepository,
+  DocumentEventsRepository,
+  DOCUMENT_EVENTS_COLLECTION,
+  newId,
+  normalizeLimit,
+} from '@dmdoc/db-mongo';
 import type { TenantDocument } from '@dmdoc/db-mongo';
-import type { DocumentProcessingJobData } from '@dmdoc/shared-types';
+import type { DocumentProcessingJobData, DocumentEvent, CreateDocumentEventInput } from '@dmdoc/shared-types';
 import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import { NotFoundError, QuotaExceededError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
-import { resolveTenantId, resolveTenantContext } from '../auth/resolve-tenant.js';
+import { resolveTenantContext } from '../auth/resolve-tenant.js';
+import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 import { getConfig } from '../config.js';
 
 // ---------------------------------------------------------------------------
@@ -53,14 +60,6 @@ interface DocumentDoc extends TenantDocument {
   costUsdCents: number;
 }
 
-interface DepartmentPermissionDoc {
-  userId: string;
-  departmentId: string;
-  tenantId: string;
-  canRead: boolean;
-  canWrite: boolean;
-}
-
 interface IndexFieldDoc {
   id: string;
   name: string;
@@ -75,6 +74,11 @@ interface IndexFieldDoc {
 // ---------------------------------------------------------------------------
 // Schemas para novas rotas
 // ---------------------------------------------------------------------------
+
+/** Schema dos query params do GET /documents/:id/download. */
+const DownloadQuerySchema = z.object({
+  open: z.coerce.boolean().optional(),
+});
 
 /** Schema dos query params do GET /documents. */
 const ListDocumentsQuerySchema = z.object({
@@ -175,36 +179,17 @@ async function findDocumentInTenants(
 }
 
 /**
- * Resolve quais departmentIds o usuário pode LER.
+ * Valida se o usuário pode LER um departamento específico.
  *
- * - TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN: `null` (sem restrição — retornar todos)
- *   Para MTA o isolamento já é garantido pelo filtro $in de tenantIds.
- * - UPLOADER / USER: apenas os departamentos onde `canRead: true`
- */
-async function resolveReadableDepartmentIds(
-  db: import('mongodb').Db,
-  userId: string,
-  tenantId: string | null,
-  role: string
-): Promise<string[] | null> {
-  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN') {
-    return null;
-  }
-  // Para roles normais, tenantId nunca é null (vem do JWT)
-  const perms = await db
-    .collection<DepartmentPermissionDoc>('department_permissions')
-    .find({ userId, tenantId: tenantId!, canRead: true })
-    .toArray();
-  return perms.map((p) => p.departmentId);
-}
-
-/**
- * Valida se o usuário tem permissão de LEITURA em um departamento específico.
+ * Modelo de ACL por raiz com herança dinâmica (Fase 6): o usuário tem acesso a
+ * um departamento quando ele pertence à subárvore de alguma raiz concedida. A
+ * checagem de acesso (leitura == escrita) usa o set expandido de
+ * `resolveAccessibleDepartmentIds`.
  *
  * - TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN: sempre permitido (desde
  *   que o dept exista no tenant). Para MTA o isolamento já foi feito ao buscar
  *   o documento com `findDocumentInTenants` — o tenantId aqui é o do documento.
- * - UPLOADER / USER: verifica `department_permissions` com `canRead: true`
+ * - UPLOADER / USER: o departamento deve pertencer ao set expandido.
  *
  * IMPORTANTE: o departamento NÃO é filtrado por `deleted: false`. A exclusão de
  * departamento preserva os documentos vinculados (eles seguem `deleted: false`),
@@ -221,8 +206,9 @@ async function assertCanReadDepartment(
   departmentId: string,
   role: string
 ): Promise<void> {
-  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN') {
-    // SUPER_ADMIN/MTA sem tenantId filtrado: aceita qualquer departamento existente.
+  const accessible = await resolveAccessibleDepartmentIds(db, userId, tenantId, role);
+  if (accessible === null) {
+    // Admin sem restrição de ACL: aceita qualquer departamento existente.
     // Sem `deleted: false`: departamento soft-deletado ainda dá acesso aos docs preservados.
     const deptFilter: Record<string, unknown> = { id: departmentId };
     if (tenantId !== null) {
@@ -234,17 +220,17 @@ async function assertCanReadDepartment(
     }
     return;
   }
-  // Para roles normais, tenantId nunca é null (vem do JWT)
-  const perm = await db
-    .collection<DepartmentPermissionDoc>('department_permissions')
-    .findOne({ userId, departmentId, tenantId: tenantId!, canRead: true });
-  if (!perm) {
+  if (!accessible.includes(departmentId)) {
     throw new NotFoundError('Departamento não encontrado ou sem permissão de leitura');
   }
 }
 
 /**
- * Valida se o usuário tem permissão de ESCRITA em um departamento específico.
+ * Valida se o usuário pode ESCREVER em um departamento específico.
+ *
+ * Modelo de ACL por raiz com herança dinâmica (Fase 6): conceder uma raiz dá
+ * acesso total (leitura == escrita) a toda a subárvore. O departamento é
+ * gravável quando pertence ao set expandido de `resolveAccessibleDepartmentIds`.
  *
  * IMPORTANTE: o departamento NÃO é filtrado por `deleted: false`. Como a exclusão
  * de departamento preserva os documentos (eles seguem `deleted: false`), admins
@@ -260,7 +246,9 @@ async function assertCanWriteDepartment(
   departmentId: string,
   role: string
 ): Promise<void> {
-  if (role === 'TENANT_ADMIN' || role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN') {
+  const accessible = await resolveAccessibleDepartmentIds(db, userId, tenantId, role);
+  if (accessible === null) {
+    // Admin sem restrição de ACL: verifica apenas que o dept pertence ao tenant.
     // Sem `deleted: false`: departamento soft-deletado ainda permite operar nos docs preservados.
     const dept = await db
       .collection('departments')
@@ -270,10 +258,7 @@ async function assertCanWriteDepartment(
     }
     return;
   }
-  const perm = await db
-    .collection<DepartmentPermissionDoc>('department_permissions')
-    .findOne({ userId, departmentId, tenantId, canWrite: true });
-  if (!perm) {
+  if (!accessible.includes(departmentId)) {
     throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
   }
 }
@@ -338,6 +323,64 @@ function validateIndexValues(
   }
 
   return errors;
+}
+
+/**
+ * Resolve o `name` de um tipo de documento (tenant OU global) para denormalizar
+ * no evento de upload. Retorna `null` se o tipo não for informado ou não existir
+ * (o evento congela o que era conhecido no momento — não falha por isso).
+ *
+ * Não filtra por `deleted` no caminho global por consistência com a validação
+ * de tipo do upload; um tipo soft-deletado ainda rende o nome para o relatório.
+ */
+async function resolveDocumentTypeName(
+  db: import('mongodb').Db,
+  tenantId: string,
+  documentTypeId: string | null
+): Promise<string | null> {
+  if (documentTypeId === null) {
+    return null;
+  }
+  const docType = await db
+    .collection<{ name?: string }>('document_types')
+    .findOne(
+      { id: documentTypeId, $or: [{ tenantId }, { isGlobal: true }] },
+      { projection: { name: 1 } }
+    );
+  return typeof docType?.name === 'string' ? docType.name : null;
+}
+
+/**
+ * Emite um evento de upload na coleção append-only `document_events`.
+ *
+ * Falha de emissão NUNCA derruba a operação de upload (mesmo padrão do
+ * AuditLog): em erro, loga com Pino (tenantId/documentId/userId) e segue. Mas
+ * loga como ERRO — perder um evento distorce o relatório de cobrança.
+ */
+async function emitUploadEvent(
+  db: import('mongodb').Db,
+  log: FastifyBaseLogger,
+  tenantId: string,
+  input: CreateDocumentEventInput
+): Promise<void> {
+  try {
+    const eventsRepo = new DocumentEventsRepository(
+      db.collection<DocumentEvent>(DOCUMENT_EVENTS_COLLECTION),
+      { tenantId }
+    );
+    await eventsRepo.insertOne(input);
+  } catch (eventError) {
+    log.error(
+      {
+        err: eventError,
+        tenantId,
+        documentId: input.documentId,
+        userId: input.uploadedById,
+        deduplicated: input.deduplicated,
+      },
+      'falha ao emitir evento de upload (document_events)'
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,30 +500,22 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const { departmentId, documentTypeId, indexValues } = fields_;
 
     // ------------------------------------------------------------------
-    // 2. Verificar permissão de escrita no departamento (ACL)
+    // 2. Verificar permissão de escrita no departamento (ACL por raiz)
     //    spec §10 invariante 5 + wiki "Permissões por departamento"
-    //    TENANT_ADMIN não precisa de permissão de ACL — tem acesso total
+    //    ACL por raiz com herança dinâmica (Fase 6): UPLOADER/USER podem
+    //    gravar em qualquer departamento cuja RAIZ foi concedida (pertencimento
+    //    ao set expandido). Admins têm acesso total. Recurso inacessível → 404.
+    //    Diferente de editar documentos órfãos, NÃO se pode arquivar um documento
+    //    NOVO em departamento soft-deletado: exige-se departamento ativo aqui.
     // ------------------------------------------------------------------
     const userRole = request.user!.role;
-    if (userRole === 'UPLOADER' || userRole === 'USER') {
-      const perm = await db.collection<DepartmentPermissionDoc>('department_permissions').findOne({
-        userId,
-        departmentId,
-        tenantId,
-        canWrite: true,
-      });
-      if (!perm) {
-        // Recurso não acessível → 404 (spec §10, invariante 4 — nunca 403)
-        throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
-      }
-    } else {
-      // TENANT_ADMIN: verificar que o departamento pertence ao tenant
-      const dept = await db
-        .collection('departments')
-        .findOne({ id: departmentId, tenantId, deleted: false });
-      if (!dept) {
-        throw new NotFoundError('Departamento não encontrado');
-      }
+    await assertCanWriteDepartment(db, userId, tenantId, departmentId, userRole);
+
+    const activeDept = await db
+      .collection('departments')
+      .findOne({ id: departmentId, tenantId, deleted: false });
+    if (!activeDept) {
+      throw new NotFoundError('Departamento não encontrado');
     }
 
     // ------------------------------------------------------------------
@@ -531,6 +566,28 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     });
 
     if (existingDoc !== null && existingDoc.status !== 'FAILED') {
+      // O reenvio deduplicado É uma operação de upload: gera um NOVO evento
+      // (deduplicated:true) apontando para o documento já existente. Dimensões
+      // congeladas do arquivo ENVIADO agora (mimeType/sizeBytes) + tipo do doc
+      // reaproveitado. pageCount nasce null (backfill é por documentId no worker).
+      // wiki "Histórico de eventos de upload e relatório de uso (cobrança)".
+      const existingTypeName = await resolveDocumentTypeName(
+        db,
+        tenantId,
+        existingDoc.documentTypeId
+      );
+      await emitUploadEvent(db, request.log, tenantId, {
+        documentId: existingDoc.id,
+        uploadedById: userId,
+        eventType: 'upload',
+        mimeType,
+        documentTypeId: existingDoc.documentTypeId,
+        documentTypeName: existingTypeName,
+        sizeBytes: fileSize,
+        pageCount: null,
+        deduplicated: true,
+      });
+
       request.log.info(
         { tenantId, userId, documentId: existingDoc.id, contentHash },
         'documento deduplicado — retornando existente'
@@ -664,6 +721,32 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       );
     }
 
+    // ------------------------------------------------------------------
+    // 11. Evento de upload (document_events — append-only, cobrança)
+    //     Cobre o fluxo de upload NORMAL e também o caso FAILED: quando o
+    //     documento existente estava FAILED, o `if` de dedup acima não
+    //     retornou, então criamos um doc novo e este caminho emite o evento
+    //     com deduplicated:false e o novo documentId.
+    //     QUOTA_EXCEEDED nunca chega aqui (lança antes, no passo 4).
+    //     wiki "Histórico de eventos de upload e relatório de uso (cobrança)".
+    // ------------------------------------------------------------------
+    const documentTypeName = await resolveDocumentTypeName(
+      db,
+      tenantId,
+      documentTypeId ?? null
+    );
+    await emitUploadEvent(db, request.log, tenantId, {
+      documentId: document.id,
+      uploadedById: userId,
+      eventType: 'upload',
+      mimeType,
+      documentTypeId: documentTypeId ?? null,
+      documentTypeName,
+      sizeBytes: fileSize,
+      pageCount: null,
+      deduplicated: false,
+    });
+
     request.log.info(
       { tenantId, userId, documentId: document.id, sizeBytes: fileSize, contentHash },
       'documento enviado com sucesso'
@@ -714,7 +797,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     // ------------------------------------------------------------------
     // 1. Resolver departamentos acessíveis
     // ------------------------------------------------------------------
-    const readableDepartmentIds = await resolveReadableDepartmentIds(
+    const readableDepartmentIds = await resolveAccessibleDepartmentIds(
       db,
       userId,
       effectiveTenantId,
@@ -912,9 +995,16 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     // ------------------------------------------------------------------
     // 3. Gerar URL assinada (5 minutos = 300 segundos)
+    //    ?open=true → ResponseContentDisposition=attachment para que o SO
+    //    abra o arquivo com o app padrão em vez de exibi-lo inline no browser.
     // ------------------------------------------------------------------
+    const { open } = DownloadQuerySchema.parse(request.query);
     const expiresInSeconds = 300;
-    const url = await app.s3.getSignedDownloadUrl(doc.s3Key, expiresInSeconds);
+    const contentDisposition =
+      open === true
+        ? `attachment; filename="${encodeURIComponent(doc.originalFilename)}"`
+        : undefined;
+    const url = await app.s3.getSignedDownloadUrl(doc.s3Key, expiresInSeconds, contentDisposition);
     const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
 
     // ------------------------------------------------------------------

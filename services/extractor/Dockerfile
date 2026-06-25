@@ -29,4 +29,4 @@ ENV OCR_LANGS=${OCR_LANGS}
 RUN python -c "import easyocr; easyocr.Reader('${OCR_LANGS}'.split(','), gpu=False)"
 
 EXPOSE 8000
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "5"]

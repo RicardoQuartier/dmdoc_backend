@@ -12,12 +12,23 @@ export {
   type UpdateInput,
 } from './tenant-repository.js';
 export {
+  DocumentEventsRepository,
+  createDocumentEventsRepository,
+  DOCUMENT_EVENTS_COLLECTION,
+} from './document-events-repository.js';
+export {
   newId,
   toObjectId,
   normalizeLimit,
   type PaginationOptions,
   type Page,
 } from './helpers.js';
+export {
+  assertUserScopeInvariant,
+  validateUserDocument,
+  UserScopeInvariantError,
+  type UserScopeCandidate,
+} from './user-write-validation.js';
 export {
   lexicalSearch,
   vectorSearch,

@@ -1,0 +1,624 @@
+{
+  "name": "Ricardo",
+  "description": "Template de departamentos importado do dump da máquina de testes (Ricardo).",
+  "nodes": [
+    {
+      "refId": "7abf519e-da5d-4b57-920e-743658ee9df6",
+      "parentRefId": null,
+      "name": "TESTE",
+      "tags": []
+    },
+    {
+      "refId": "2cd68f64-9571-4794-b75b-95ed111f354f",
+      "parentRefId": null,
+      "name": "Financeiro",
+      "tags": []
+    },
+    {
+      "refId": "1fde9de6-94a4-4daf-b731-fad85f10952d",
+      "parentRefId": null,
+      "name": "Comercial",
+      "tags": []
+    },
+    {
+      "refId": "4e455b93-b96a-4abe-ad55-18d1045fdeb0",
+      "parentRefId": null,
+      "name": "Marketing",
+      "tags": []
+    },
+    {
+      "refId": "e092713c-f770-43ab-a718-8f5c79917f06",
+      "parentRefId": null,
+      "name": "Presidência",
+      "tags": []
+    },
+    {
+      "refId": "b3aa292b-4de9-4ec8-a599-0898c9ee1b30",
+      "parentRefId": null,
+      "name": "Diretoria",
+      "tags": []
+    },
+    {
+      "refId": "49d05bda-d327-4c45-88a0-eb9518fa891f",
+      "parentRefId": null,
+      "name": "Recursos Humanos",
+      "tags": []
+    },
+    {
+      "refId": "244d0cca-3fae-456a-bc34-ad5c9b17e840",
+      "parentRefId": null,
+      "name": "Contabilidade",
+      "tags": []
+    },
+    {
+      "refId": "56b7d2b2-c266-4a9f-be34-2323ed1aaa35",
+      "parentRefId": null,
+      "name": "Fiscal",
+      "tags": []
+    },
+    {
+      "refId": "088daaa7-9920-43d8-822d-d911412bae8f",
+      "parentRefId": null,
+      "name": "Produção",
+      "tags": []
+    },
+    {
+      "refId": "80a33fa8-1116-44d0-b4cd-1fa2d919a3d6",
+      "parentRefId": null,
+      "name": "Tecnologia da Informação",
+      "tags": []
+    },
+    {
+      "refId": "4207227a-0a9a-4226-8d5e-2ef6505f9a45",
+      "parentRefId": "7abf519e-da5d-4b57-920e-743658ee9df6",
+      "name": "Teste1",
+      "tags": []
+    },
+    {
+      "refId": "e6437731-ebca-46dd-a80d-974141322cb1",
+      "parentRefId": "1fde9de6-94a4-4daf-b731-fad85f10952d",
+      "name": "Vendas Clientes",
+      "tags": []
+    },
+    {
+      "refId": "82d3db6c-6c5c-494c-8802-3c9105374197",
+      "parentRefId": "1fde9de6-94a4-4daf-b731-fad85f10952d",
+      "name": "Parcerias Estratégicas",
+      "tags": []
+    },
+    {
+      "refId": "a282c424-1d93-4d67-b52f-de589336cd35",
+      "parentRefId": "56b7d2b2-c266-4a9f-be34-2323ed1aaa35",
+      "name": "Notas Fiscais",
+      "tags": []
+    },
+    {
+      "refId": "fffe2ae8-95ee-425c-8021-c1be84d5908e",
+      "parentRefId": "244d0cca-3fae-456a-bc34-ad5c9b17e840",
+      "name": "Demonstrações Financeiras",
+      "tags": []
+    },
+    {
+      "refId": "964bf193-6113-4bcf-9719-7d10cd5d3d1d",
+      "parentRefId": "244d0cca-3fae-456a-bc34-ad5c9b17e840",
+      "name": "Conciliação",
+      "tags": []
+    },
+    {
+      "refId": "3e85a959-a473-48eb-985e-274d83c0092f",
+      "parentRefId": "49d05bda-d327-4c45-88a0-eb9518fa891f",
+      "name": "Folha Pagamento",
+      "tags": []
+    },
+    {
+      "refId": "8639037d-c5dd-40ae-ae3c-2f939d5ac15b",
+      "parentRefId": "b3aa292b-4de9-4ec8-a599-0898c9ee1b30",
+      "name": "Governança Corporativa",
+      "tags": []
+    },
+    {
+      "refId": "b2cfa94e-447b-4c20-bc64-e9f774ba5594",
+      "parentRefId": "b3aa292b-4de9-4ec8-a599-0898c9ee1b30",
+      "name": "Planejamento Estratégico",
+      "tags": []
+    },
+    {
+      "refId": "d30d82fa-e13f-472a-9dab-0f0be949e141",
+      "parentRefId": "2cd68f64-9571-4794-b75b-95ed111f354f",
+      "name": "Contas a Pagar",
+      "tags": []
+    },
+    {
+      "refId": "86ccaee9-48f2-4376-8154-d4df8e8f9c88",
+      "parentRefId": "2cd68f64-9571-4794-b75b-95ed111f354f",
+      "name": "Gestão Fluxo Caixa",
+      "tags": []
+    },
+    {
+      "refId": "e00d9e6b-fe62-4a56-87ef-d82707a9560f",
+      "parentRefId": "4e455b93-b96a-4abe-ad55-18d1045fdeb0",
+      "name": "Campanhas Publicitárias",
+      "tags": []
+    },
+    {
+      "refId": "0e867057-f2f4-4eee-9d0e-9f386cef1d0c",
+      "parentRefId": "4e455b93-b96a-4abe-ad55-18d1045fdeb0",
+      "name": "Identidade Visual",
+      "tags": []
+    },
+    {
+      "refId": "adce39ad-3bd6-45f7-b1e2-800a699646b3",
+      "parentRefId": "e092713c-f770-43ab-a718-8f5c79917f06",
+      "name": "Relações Institucionais",
+      "tags": []
+    },
+    {
+      "refId": "e56a3dfd-2cc6-48a4-8754-9c7044328a20",
+      "parentRefId": "e092713c-f770-43ab-a718-8f5c79917f06",
+      "name": "Atos da Presidência",
+      "tags": []
+    },
+    {
+      "refId": "e4900df8-bb73-466a-8367-7adff37c3fe6",
+      "parentRefId": "088daaa7-9920-43d8-822d-d911412bae8f",
+      "name": "Controle de Qualidade",
+      "tags": []
+    },
+    {
+      "refId": "158562af-3c58-42d7-9cbb-8b7482a587eb",
+      "parentRefId": "088daaa7-9920-43d8-822d-d911412bae8f",
+      "name": "Manutenção Máquinas",
+      "tags": []
+    },
+    {
+      "refId": "24a333a4-ead7-4d02-8f84-d7444729e58a",
+      "parentRefId": "80a33fa8-1116-44d0-b4cd-1fa2d919a3d6",
+      "name": "Infraestrutura e Redes",
+      "tags": []
+    },
+    {
+      "refId": "b602caa9-b569-42a2-952e-d5f1a3502d7a",
+      "parentRefId": "80a33fa8-1116-44d0-b4cd-1fa2d919a3d6",
+      "name": "Segurança da Informação",
+      "tags": []
+    },
+    {
+      "refId": "d758d4db-3873-4d4d-8ad9-3b12c173c924",
+      "parentRefId": "4207227a-0a9a-4226-8d5e-2ef6505f9a45",
+      "name": "Teste2",
+      "tags": []
+    },
+    {
+      "refId": "efff2471-c18c-4339-a70c-851b26371b03",
+      "parentRefId": "e6437731-ebca-46dd-a80d-974141322cb1",
+      "name": "Clientes Corporativos",
+      "tags": []
+    },
+    {
+      "refId": "ee6d923d-ba19-4f1b-b992-c226fbcd5c47",
+      "parentRefId": "82d3db6c-6c5c-494c-8802-3c9105374197",
+      "name": "Canais e Distribuidores",
+      "tags": []
+    },
+    {
+      "refId": "6fab6606-57f4-4e0a-b044-de689831a2e6",
+      "parentRefId": "a282c424-1d93-4d67-b52f-de589336cd35",
+      "name": "Entradas Compras",
+      "tags": []
+    },
+    {
+      "refId": "1b8be630-dc69-41d7-bc09-af6491a4f965",
+      "parentRefId": "fffe2ae8-95ee-425c-8021-c1be84d5908e",
+      "name": "Balanço Patrimonial",
+      "tags": []
+    },
+    {
+      "refId": "89f2d1c7-f482-4ddb-8fc5-84b77c35c67b",
+      "parentRefId": "964bf193-6113-4bcf-9719-7d10cd5d3d1d",
+      "name": "Bancária",
+      "tags": []
+    },
+    {
+      "refId": "cde5091a-9dbd-4966-a563-2dac3ae25583",
+      "parentRefId": "3e85a959-a473-48eb-985e-274d83c0092f",
+      "name": "Geral Empresa",
+      "tags": []
+    },
+    {
+      "refId": "31d084a9-3a02-4baa-8d12-5d8d7fc75202",
+      "parentRefId": "8639037d-c5dd-40ae-ae3c-2f939d5ac15b",
+      "name": "Conselho Administração",
+      "tags": []
+    },
+    {
+      "refId": "f318157f-5669-4583-a909-8e2ff928d5f8",
+      "parentRefId": "b2cfa94e-447b-4c20-bc64-e9f774ba5594",
+      "name": "Expansão e MA",
+      "tags": []
+    },
+    {
+      "refId": "6b414e0e-71aa-43d0-b783-deee873913ed",
+      "parentRefId": "d30d82fa-e13f-472a-9dab-0f0be949e141",
+      "name": "Fornecedores Serviços",
+      "tags": []
+    },
+    {
+      "refId": "0d07444d-1870-486d-a503-ca9a9fc987b1",
+      "parentRefId": "86ccaee9-48f2-4376-8154-d4df8e8f9c88",
+      "name": "Projeção e Orçamento",
+      "tags": []
+    },
+    {
+      "refId": "2eba00be-f1ae-4051-aff5-a58a4ce61f21",
+      "parentRefId": "e00d9e6b-fe62-4a56-87ef-d82707a9560f",
+      "name": "Mídia Paga Digital",
+      "tags": []
+    },
+    {
+      "refId": "10246289-81f7-465b-b861-939127565ead",
+      "parentRefId": "0e867057-f2f4-4eee-9d0e-9f386cef1d0c",
+      "name": "Brand Guidelines",
+      "tags": []
+    },
+    {
+      "refId": "822cdc87-d419-4477-9cfe-e5bf30a6582a",
+      "parentRefId": "adce39ad-3bd6-45f7-b1e2-800a699646b3",
+      "name": "Governo e Órgãos Reguladores",
+      "tags": []
+    },
+    {
+      "refId": "cec7b18e-af89-45c7-8272-22dd760cc809",
+      "parentRefId": "e56a3dfd-2cc6-48a4-8754-9c7044328a20",
+      "name": "Decretos e Portarias Internas",
+      "tags": []
+    },
+    {
+      "refId": "145a7a0e-b9b6-4dd2-87f4-4aab1d45771c",
+      "parentRefId": "e4900df8-bb73-466a-8367-7adff37c3fe6",
+      "name": "Inspeção Linha Montagem",
+      "tags": []
+    },
+    {
+      "refId": "297244bc-5d2e-4e68-98f6-c3110916d1e4",
+      "parentRefId": "158562af-3c58-42d7-9cbb-8b7482a587eb",
+      "name": "Manutenção Preventiva",
+      "tags": []
+    },
+    {
+      "refId": "064de516-56e1-4abd-bb44-9b16d6439f50",
+      "parentRefId": "24a333a4-ead7-4d02-8f84-d7444729e58a",
+      "name": "Servidores e Nuvem",
+      "tags": []
+    },
+    {
+      "refId": "81def5c5-1d8e-4c9f-9b84-280b2e850081",
+      "parentRefId": "b602caa9-b569-42a2-952e-d5f1a3502d7a",
+      "name": "Políticas e Auditorias",
+      "tags": []
+    },
+    {
+      "refId": "a5d7938c-0139-4207-aabe-78a5bcc5ea9e",
+      "parentRefId": "efff2471-c18c-4339-a70c-851b26371b03",
+      "name": "2026",
+      "tags": []
+    },
+    {
+      "refId": "7bd8dd15-2c94-4abc-b330-1b5fd1a512f0",
+      "parentRefId": "ee6d923d-ba19-4f1b-b992-c226fbcd5c47",
+      "name": "Parceiro",
+      "tags": []
+    },
+    {
+      "refId": "0c095d4d-faed-48e5-9c26-f72a0904f183",
+      "parentRefId": "6fab6606-57f4-4e0a-b044-de689831a2e6",
+      "name": "Fornecedores Nacionais",
+      "tags": []
+    },
+    {
+      "refId": "2affd58d-9f5b-4f85-a75e-703013cd4892",
+      "parentRefId": "1b8be630-dc69-41d7-bc09-af6491a4f965",
+      "name": "Trimestral",
+      "tags": []
+    },
+    {
+      "refId": "c85e4c2b-e0d7-4b01-a50d-25eda3b38f1c",
+      "parentRefId": "89f2d1c7-f482-4ddb-8fc5-84b77c35c67b",
+      "name": "Banco do Brasil",
+      "tags": []
+    },
+    {
+      "refId": "71c11a97-be36-45d7-973a-bbb830ff560b",
+      "parentRefId": "cde5091a-9dbd-4966-a563-2dac3ae25583",
+      "name": "2026",
+      "tags": []
+    },
+    {
+      "refId": "cff717eb-bb4f-4fd2-a563-c4d3ef7d21c9",
+      "parentRefId": "31d084a9-3a02-4baa-8d12-5d8d7fc75202",
+      "name": "Assembléias Ordinárias",
+      "tags": []
+    },
+    {
+      "refId": "6e375df8-935a-459a-8133-e459c3243b18",
+      "parentRefId": "f318157f-5669-4583-a909-8e2ff928d5f8",
+      "name": "Fusão Empresa X",
+      "tags": []
+    },
+    {
+      "refId": "ca5cdaf5-1b3f-4aa2-a9a1-0651eaf9551c",
+      "parentRefId": "6b414e0e-71aa-43d0-b783-deee873913ed",
+      "name": "Fornecedor",
+      "tags": []
+    },
+    {
+      "refId": "cbb49fb2-81dc-4d42-9f4d-12d9e2bea8e0",
+      "parentRefId": "0d07444d-1870-486d-a503-ca9a9fc987b1",
+      "name": "Mensal",
+      "tags": []
+    },
+    {
+      "refId": "14cc7cc8-4f22-420b-867b-64cfd0b66fcc",
+      "parentRefId": "2eba00be-f1ae-4051-aff5-a58a4ce61f21",
+      "name": "Anúncios Google Meta",
+      "tags": []
+    },
+    {
+      "refId": "7b4a8bd1-e971-4553-92d0-e81f7f424df9",
+      "parentRefId": "10246289-81f7-465b-b861-939127565ead",
+      "name": "Manual da Marca",
+      "tags": []
+    },
+    {
+      "refId": "bd809f9c-4981-4093-8530-ed2e6e3ab2da",
+      "parentRefId": "822cdc87-d419-4477-9cfe-e5bf30a6582a",
+      "name": "Iniciativas Socioambientais ESG",
+      "tags": []
+    },
+    {
+      "refId": "ea7f85af-2f99-4b5a-b8cc-869d8636a434",
+      "parentRefId": "cec7b18e-af89-45c7-8272-22dd760cc809",
+      "name": "Toda a Corporação",
+      "tags": []
+    },
+    {
+      "refId": "e72b3a22-959b-4c07-b162-c38609e47082",
+      "parentRefId": "145a7a0e-b9b6-4dd2-87f4-4aab1d45771c",
+      "name": "Lote 2026 A4",
+      "tags": []
+    },
+    {
+      "refId": "620a2ee1-d3b2-4b63-93df-6b704bbe6fab",
+      "parentRefId": "297244bc-5d2e-4e68-98f6-c3110916d1e4",
+      "name": "Maquinário Injetora 03",
+      "tags": []
+    },
+    {
+      "refId": "4f35738f-ee95-4267-82bc-37c4cc4bd871",
+      "parentRefId": "064de516-56e1-4abd-bb44-9b16d6439f50",
+      "name": "Instância Produção AWS",
+      "tags": []
+    },
+    {
+      "refId": "1e55a62f-712a-464f-adee-124c074284f3",
+      "parentRefId": "81def5c5-1d8e-4c9f-9b84-280b2e850081",
+      "name": "Conformidade LGPD",
+      "tags": []
+    },
+    {
+      "refId": "39b8ec97-07aa-4830-9a40-168c0478a0ae",
+      "parentRefId": "a5d7938c-0139-4207-aabe-78a5bcc5ea9e",
+      "name": "Cliente Proposta",
+      "tags": []
+    },
+    {
+      "refId": "23263df2-ef33-475c-aed7-f04f84189613",
+      "parentRefId": "7bd8dd15-2c94-4abc-b330-1b5fd1a512f0",
+      "name": "2026",
+      "tags": []
+    },
+    {
+      "refId": "1a4bd57b-3e03-4f7a-9ef3-18824f22bde3",
+      "parentRefId": "0c095d4d-faed-48e5-9c26-f72a0904f183",
+      "name": "2026-06-Junho",
+      "tags": []
+    },
+    {
+      "refId": "da57c750-3a20-4efd-84f6-2d3252a08a01",
+      "parentRefId": "2affd58d-9f5b-4f85-a75e-703013cd4892",
+      "name": "2026",
+      "tags": []
+    },
+    {
+      "refId": "009ca0e0-18ed-43c9-8ef5-fba90c814e09",
+      "parentRefId": "c85e4c2b-e0d7-4b01-a50d-25eda3b38f1c",
+      "name": "2026-06-Junho",
+      "tags": []
+    },
+    {
+      "refId": "af1ebf86-b1ab-4986-8aaa-a49b5c8de554",
+      "parentRefId": "71c11a97-be36-45d7-973a-bbb830ff560b",
+      "name": "06-Junho",
+      "tags": []
+    },
+    {
+      "refId": "04831554-5c32-4106-b4c7-27116a1925fb",
+      "parentRefId": "cff717eb-bb4f-4fd2-a563-c4d3ef7d21c9",
+      "name": "2026",
+      "tags": []
+    },
+    {
+      "refId": "6709b58a-f601-402b-ae42-3204a6ef39a3",
+      "parentRefId": "6e375df8-935a-459a-8133-e459c3243b18",
+      "name": "Auditoria Due Diligence",
+      "tags": []
+    },
+    {
+      "refId": "5d5ccded-5329-48ed-9a36-306a882f3384",
+      "parentRefId": "ca5cdaf5-1b3f-4aa2-a9a1-0651eaf9551c",
+      "name": "2026-06 Junho",
+      "tags": []
+    },
+    {
+      "refId": "8c0c44c5-e06e-408c-af02-2feaafa6fb19",
+      "parentRefId": "cbb49fb2-81dc-4d42-9f4d-12d9e2bea8e0",
+      "name": "2026",
+      "tags": []
+    },
+    {
+      "refId": "ac147dc1-647d-41ba-b87d-bfbf8855243e",
+      "parentRefId": "14cc7cc8-4f22-420b-867b-64cfd0b66fcc",
+      "name": "2026-06 Junho",
+      "tags": []
+    },
+    {
+      "refId": "064b545a-397d-4e9b-bec9-2483d6f02611",
+      "parentRefId": "7b4a8bd1-e971-4553-92d0-e81f7f424df9",
+      "name": "Elemento",
+      "tags": []
+    },
+    {
+      "refId": "f65149ad-753e-497c-8093-bc6668f0b219",
+      "parentRefId": "bd809f9c-4981-4093-8530-ed2e6e3ab2da",
+      "name": "2026",
+      "tags": []
+    },
+    {
+      "refId": "6b8c7474-e839-412e-92c3-34698f4f3989",
+      "parentRefId": "ea7f85af-2f99-4b5a-b8cc-869d8636a434",
+      "name": "2026",
+      "tags": []
+    },
+    {
+      "refId": "b1fb9efb-755a-49c3-acf0-caa51f44dbfa",
+      "parentRefId": "e72b3a22-959b-4c07-b162-c38609e47082",
+      "name": "Diário",
+      "tags": []
+    },
+    {
+      "refId": "24d50e9c-28cd-43a6-b0e0-7823e619550d",
+      "parentRefId": "620a2ee1-d3b2-4b63-93df-6b704bbe6fab",
+      "name": "2026",
+      "tags": []
+    },
+    {
+      "refId": "eec491d6-d91a-413a-92bb-6ff21c190322",
+      "parentRefId": "4f35738f-ee95-4267-82bc-37c4cc4bd871",
+      "name": "2026",
+      "tags": []
+    },
+    {
+      "refId": "0aa533fc-da59-4a98-8b00-773209b0c5d7",
+      "parentRefId": "1e55a62f-712a-464f-adee-124c074284f3",
+      "name": "2026",
+      "tags": []
+    },
+    {
+      "refId": "049bf667-94e9-40ff-97e9-759a95d134e2",
+      "parentRefId": "39b8ec97-07aa-4830-9a40-168c0478a0ae",
+      "name": "Contratos e Propostas Assinadas",
+      "tags": []
+    },
+    {
+      "refId": "164d3379-eba6-4164-a792-cc3a1f37ad24",
+      "parentRefId": "23263df2-ef33-475c-aed7-f04f84189613",
+      "name": "NDA",
+      "tags": []
+    },
+    {
+      "refId": "4555b07a-3118-47e2-9609-bae2e4eb184b",
+      "parentRefId": "1a4bd57b-3e03-4f7a-9ef3-18824f22bde3",
+      "name": "Arquivos XML e DANFE",
+      "tags": []
+    },
+    {
+      "refId": "bcda9f01-3381-4c8c-9d18-ee1e24fc15f7",
+      "parentRefId": "da57c750-3a20-4efd-84f6-2d3252a08a01",
+      "name": "Versoes Finais Auditadas",
+      "tags": []
+    },
+    {
+      "refId": "4f593c12-b3cc-45bc-967b-ccd2340e8794",
+      "parentRefId": "009ca0e0-18ed-43c9-8ef5-fba90c814e09",
+      "name": "Extratos e Comprovantes",
+      "tags": []
+    },
+    {
+      "refId": "a3a94505-2fb8-4863-8bc4-d7e259bfd736",
+      "parentRefId": "af1ebf86-b1ab-4986-8aaa-a49b5c8de554",
+      "name": "Holerites e Recibos Encargos",
+      "tags": []
+    },
+    {
+      "refId": "74412ec0-e1b2-47f7-8178-59d638860ede",
+      "parentRefId": "04831554-5c32-4106-b4c7-27116a1925fb",
+      "name": "Atas e Estatutos Assinados",
+      "tags": []
+    },
+    {
+      "refId": "b502302b-fecd-402b-b8f5-91231f12067f",
+      "parentRefId": "6709b58a-f601-402b-ae42-3204a6ef39a3",
+      "name": "Relatórios de Riscos e Laudos",
+      "tags": []
+    },
+    {
+      "refId": "dd28c1d9-ddd3-405e-bdb8-21b03f48b820",
+      "parentRefId": "5d5ccded-5329-48ed-9a36-306a882f3384",
+      "name": "Boletos e Comprovantes Pagamento",
+      "tags": []
+    },
+    {
+      "refId": "d722e927-8987-4681-9c06-b5b789090339",
+      "parentRefId": "8c0c44c5-e06e-408c-af02-2feaafa6fb19",
+      "name": "Planilhas e Dashboards Fechamento",
+      "tags": []
+    },
+    {
+      "refId": "f72776e7-bffc-4b9b-aaf1-ec11a146ea9d",
+      "parentRefId": "ac147dc1-647d-41ba-b87d-bfbf8855243e",
+      "name": "Relatórios Performance e Notas Mídia",
+      "tags": []
+    },
+    {
+      "refId": "53fe4ca3-d06b-484d-b618-2d0e896da01b",
+      "parentRefId": "064b545a-397d-4e9b-bec9-2483d6f02611",
+      "name": "Arquivos Vetorizados e Manuais",
+      "tags": []
+    },
+    {
+      "refId": "4f9e1926-52be-4e22-b4b7-db24ccfa8aee",
+      "parentRefId": "f65149ad-753e-497c-8093-bc6668f0b219",
+      "name": "Certificados e Protocolos Oficiais",
+      "tags": []
+    },
+    {
+      "refId": "f9e2348f-3f13-4f1b-bb93-5daa27647308",
+      "parentRefId": "6b8c7474-e839-412e-92c3-34698f4f3989",
+      "name": "Circulares e Políticas Assinadas",
+      "tags": []
+    },
+    {
+      "refId": "569ec920-1f33-4ea1-b76b-a605984b3a80",
+      "parentRefId": "b1fb9efb-755a-49c3-acf0-caa51f44dbfa",
+      "name": "Checklists e Laudos Conformidade",
+      "tags": []
+    },
+    {
+      "refId": "6bf8f6d2-2a48-4034-86ad-410402ae5be9",
+      "parentRefId": "24d50e9c-28cd-43a6-b0e0-7823e619550d",
+      "name": "Ordens de Serviço e ART",
+      "tags": []
+    },
+    {
+      "refId": "c04cafcf-236e-4561-9a05-57d53629cafc",
+      "parentRefId": "eec491d6-d91a-413a-92bb-6ff21c190322",
+      "name": "Relatórios de Disponibilidade e Logs",
+      "tags": []
+    },
+    {
+      "refId": "3c5584f0-75ca-4dce-8d36-6c31d38fd59c",
+      "parentRefId": "0aa533fc-da59-4a98-8b00-773209b0c5d7",
+      "name": "Relatórios de Vulnerabilidade e Penetração",
+      "tags": []
+    }
+  ]
+}

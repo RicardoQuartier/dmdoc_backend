@@ -1,4 +1,12 @@
-export { RoleSchema, type Role, ADMIN_ROLES, type AdminRole } from './role.js';
+export {
+  RoleSchema,
+  type Role,
+  ADMIN_ROLES,
+  type AdminRole,
+  ROLE_LEVEL,
+  isGlobalRole,
+  canManageRole,
+} from './role.js';
 export {
   AuthUserSchema,
   type AuthUser,
@@ -46,6 +54,14 @@ export {
   type DocumentContent,
 } from './document-content.js';
 export { ChunkSchema, type Chunk } from './chunk.js';
+export {
+  DocumentEventTypeSchema,
+  type DocumentEventType,
+  DocumentEventSchema,
+  type DocumentEvent,
+  CreateDocumentEventInputSchema,
+  type CreateDocumentEventInput,
+} from './document-event.js';
 export {
   DocumentProcessingJobDataSchema,
   type DocumentProcessingJobData,

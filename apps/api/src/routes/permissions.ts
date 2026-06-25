@@ -4,7 +4,7 @@ import { TenantRepository, newId } from '@dmdoc/db-mongo';
 import type { TenantDocument } from '@dmdoc/db-mongo';
 import type { User } from '@dmdoc/shared-types';
 import { ADMIN_ROLES } from '@dmdoc/shared-types';
-import { NotFoundError } from '../errors/index.js';
+import { NotFoundError, ValidationError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
 import { AuditLogger } from '../auth/audit.js';
@@ -27,13 +27,7 @@ interface DepartmentDoc extends TenantDocument {
 }
 
 const PutPermissionsBodySchema = z.object({
-  permissions: z.array(
-    z.object({
-      departmentId: z.string().uuid(),
-      canRead: z.boolean(),
-      canWrite: z.boolean(),
-    })
-  ),
+  rootDepartmentIds: z.array(z.string().uuid()),
 });
 
 const TenantIdQuerySchema = z.object({
@@ -41,18 +35,24 @@ const TenantIdQuerySchema = z.object({
 });
 
 /**
- * Rotas de permissões usuário × departamento.
+ * Rotas de permissões usuário × departamento (ACL por raiz, Fase 6).
  *
- * GET: retorna permissões atuais do usuário (qualquer role autenticada).
+ * O acesso é concedido por DEPARTAMENTO RAIZ (nível 0, `parentId: null`).
+ * Conceder uma raiz dá acesso de leitura E escrita a toda a subárvore (herança
+ * dinâmica — a expansão acontece em tempo de leitura/escrita, não é
+ * materializada). Cada doc de `department_permissions` representa uma raiz
+ * concedida, com `canRead = canWrite = true`.
+ *
+ * GET: retorna as raízes concedidas do usuário (`{ rootDepartmentIds }`).
  *   SUPER_ADMIN sem tenantId: busca globalmente por userId (sem filtro de tenant).
  *   SUPER_ADMIN com tenantId: busca no tenant especificado.
  *
- * PUT: substitui TODAS as permissões do usuário (TENANT_ADMIN / SUPER_ADMIN).
+ * PUT: substitui TODAS as concessões do usuário (TENANT_ADMIN / SUPER_ADMIN).
  *   SUPER_ADMIN: tenantId obrigatório via query param.
  */
 export const permissionsRoutes: FastifyPluginAsync = async (app) => {
   /**
-   * GET /users/:id/permissions — lista permissões do usuário.
+   * GET /users/:id/permissions — lista as raízes concedidas do usuário.
    *
    * SUPER_ADMIN sem ?tenantId: busca global por userId, sem filtro de tenant.
    * SUPER_ADMIN com ?tenantId: verifica usuário no tenant e filtra permissões.
@@ -88,27 +88,29 @@ export const permissionsRoutes: FastifyPluginAsync = async (app) => {
       permissionTenantId = null;
     }
 
-    const permFilter: Record<string, unknown> = { userId: id, deleted: false };
+    const permFilter: Record<string, unknown> = { userId: id, deleted: false, canRead: true };
     if (permissionTenantId !== null) permFilter['tenantId'] = permissionTenantId;
 
     const permissions = await db.collection('department_permissions').find(permFilter).toArray();
 
-    const result = permissions.map(stripMongoId).map((p) => ({
-      departmentId: (p as { departmentId: string }).departmentId,
-      canRead: (p as { canRead: boolean }).canRead,
-      canWrite: (p as { canWrite: boolean }).canWrite,
-    }));
+    const rootDepartmentIds = permissions.map(
+      (p) => (p as unknown as { departmentId: string }).departmentId
+    );
 
-    return reply.status(200).send({ permissions: result });
+    return reply.status(200).send({ rootDepartmentIds });
   });
 
   /**
-   * PUT /users/:id/permissions — substitui todas as permissões do usuário.
+   * PUT /users/:id/permissions — substitui todas as concessões do usuário.
+   *
+   * Body: `{ rootDepartmentIds: string[] }`.
    *
    * 1. Verifica usuário existe no tenant.
-   * 2. Valida todos os departmentIds existem no tenant.
-   * 3. Deleta as permissões atuais.
-   * 4. Insere as novas.
+   * 2. Valida cada id: existe no tenant E é RAIZ (`parentId: null` / nível 0).
+   *    - id inexistente no tenant → 404 (mantém invariante de isolamento).
+   *    - id existe mas não é raiz → 422 VALIDATION_ERROR.
+   * 3. Deleta as concessões atuais.
+   * 4. Insere uma concessão por raiz com `canRead = canWrite = true`.
    *
    * SUPER_ADMIN: tenantId obrigatório via ?tenantId.
    */
@@ -126,54 +128,62 @@ export const permissionsRoutes: FastifyPluginAsync = async (app) => {
     const tenantId = ctx.tenantId;
 
     const { id } = z.object({ id: z.string() }).parse(request.params);
-    const { permissions } = PutPermissionsBodySchema.parse(request.body);
+    const { rootDepartmentIds } = PutPermissionsBodySchema.parse(request.body);
     const db = app.db;
+
+    // Deduplicar para não inserir concessões repetidas da mesma raiz.
+    const uniqueRootIds = [...new Set(rootDepartmentIds)];
 
     // Verificar usuário
     const usersRepo = new TenantRepository<UserDoc>(db.collection('users'), { tenantId });
     const user = await usersRepo.findById(id);
     if (!user) throw new NotFoundError();
 
-    // Verificar cada departamento existe no tenant
+    // Verificar cada departamento: existe no tenant E é raiz (parentId: null).
+    //   - inexistente → 404 (invariante de isolamento)
+    //   - existe mas não é raiz → 422 VALIDATION_ERROR
     const deptsRepo = new TenantRepository<DepartmentDoc>(
       db.collection('departments'),
       { tenantId }
     );
-    for (const perm of permissions) {
-      const dept = await deptsRepo.findById(perm.departmentId);
-      if (!dept) throw new NotFoundError(`Departamento ${perm.departmentId} não encontrado`);
+    for (const departmentId of uniqueRootIds) {
+      const dept = await deptsRepo.findById(departmentId);
+      if (!dept) throw new NotFoundError(`Departamento ${departmentId} não encontrado`);
+      if (dept.parentId !== null) {
+        throw new ValidationError(
+          `Departamento ${departmentId} não é uma raiz (nível 0); apenas raízes podem ser concedidas`
+        );
+      }
     }
 
-    // Substituição completa: deleta atuais e insere novas
+    // Substituição completa: deleta atuais e insere uma por raiz (canRead=canWrite=true).
     await db
       .collection('department_permissions')
       .deleteMany({ userId: id, tenantId });
 
-    if (permissions.length > 0) {
+    if (uniqueRootIds.length > 0) {
       await db.collection('department_permissions').insertMany(
-        permissions.map((p) => ({
+        uniqueRootIds.map((departmentId) => ({
           id: newId(),
           tenantId,
           userId: id,
-          departmentId: p.departmentId,
-          canRead: p.canRead,
-          canWrite: p.canWrite,
+          departmentId,
+          canRead: true,
+          canWrite: true,
           deleted: false,
         }))
       );
     }
 
-    // Retornar lista atualizada
+    // Retornar lista atualizada das raízes concedidas
     const updated = await db
       .collection('department_permissions')
-      .find({ userId: id, tenantId, deleted: false })
+      .find({ userId: id, tenantId, deleted: false, canRead: true })
       .toArray();
 
-    const result = updated.map(stripMongoId).map((p) => ({
-      departmentId: (p as { departmentId: string }).departmentId,
-      canRead: (p as { canRead: boolean }).canRead,
-      canWrite: (p as { canWrite: boolean }).canWrite,
-    }));
+    const updatedRootDepartmentIds = updated.map(
+      (p) => (p as unknown as { departmentId: string }).departmentId
+    );
 
     // AuditLog de mudança de permissão (spec §10, invariante 7 — Fase 5)
     const auditLogger = new AuditLogger(db);
@@ -185,8 +195,8 @@ export const permissionsRoutes: FastifyPluginAsync = async (app) => {
         resource: `users/${id}/permissions`,
         metadata: {
           targetUserId: id,
-          permissionCount: permissions.length,
-          departmentIds: permissions.map((p) => p.departmentId),
+          permissionCount: uniqueRootIds.length,
+          rootDepartmentIds: uniqueRootIds,
         },
       });
     } catch (auditError) {
@@ -197,11 +207,6 @@ export const permissionsRoutes: FastifyPluginAsync = async (app) => {
     }
 
     request.log.info({ tenantId, userId: id }, 'permissões atualizadas');
-    return reply.status(200).send({ permissions: result });
+    return reply.status(200).send({ rootDepartmentIds: updatedRootDepartmentIds });
   });
 };
-
-function stripMongoId(doc: Record<string, unknown>): Record<string, unknown> {
-  const { _id: _ignored, ...rest } = doc;
-  return rest;
-}
