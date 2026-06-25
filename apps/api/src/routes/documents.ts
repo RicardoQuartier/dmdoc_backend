@@ -8,10 +8,12 @@ import {
   DOCUMENT_EVENTS_COLLECTION,
   newId,
   normalizeLimit,
-} from '@dmdoc/db-mongo';
-import type { TenantDocument } from '@dmdoc/db-mongo';
-import type { DocumentProcessingJobData, DocumentEvent, CreateDocumentEventInput } from '@dmdoc/shared-types';
+} from '@dmdoc/db-pg';
+import type { TenantDocument } from '@dmdoc/db-pg';
+import type { Sql } from '@dmdoc/db-pg';
+import type { DocumentProcessingJobData } from '@dmdoc/shared-types';
 import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
+import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
 import { NotFoundError, QuotaExceededError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
@@ -20,54 +22,53 @@ import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 import { getConfig } from '../config.js';
 
 // ---------------------------------------------------------------------------
-// Tipos locais que mapeiam as coleções do MongoDB (spec §5.3)
+// Tipos locais que mapeiam as tabelas do PostgreSQL (spec §5.3)
 // ---------------------------------------------------------------------------
 
-interface TenantMongoDoc {
+interface TenantRow {
   id: string;
   name: string;
-  diskQuotaBytes: number;
-  userQuota: number;
+  disk_quota_bytes: bigint;
+  user_quota: number;
   active: boolean;
-  createdAt: Date;
+  created_at: Date;
 }
 
-interface DocumentTypeDoc extends TenantDocument {
+interface DocumentTypeRow extends TenantDocument {
   name: string;
   description: string | null;
-  isGlobal: boolean;
-  indexFields: unknown[];
-  createdAt: Date;
+  is_global: boolean;
+  created_at: Date;
 }
 
-interface DocumentDoc extends TenantDocument {
-  departmentId: string;
-  documentTypeId: string | null;
+interface DocumentRow extends TenantDocument {
+  tenant_id: string; // postgres.js entrega snake_case; TenantDocument.tenantId é undefined em runtime
+  department_id: string;
+  document_type_id: string | null;
   filename: string;
-  originalFilename: string;
-  contentHash: string;
-  sizeBytes: number;
-  mimeType: string;
-  s3Key: string;
+  original_filename: string;
+  content_hash: string;
+  size_bytes: bigint;
+  mime_type: string;
+  s3_key: string;
   status: 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED';
-  failureReason: string | null;
+  failure_reason: string | null;
   tags: string[];
-  mongoContentId: string | null;
-  indexValues: Record<string, string | number | Date | null>;
-  uploadedById: string;
-  uploadedAt: Date;
-  processedAt: Date | null;
-  costUsdCents: number;
+  index_values: Record<string, string | number | null>;
+  uploaded_by_id: string;
+  uploaded_at: Date;
+  processed_at: Date | null;
+  cost_usd_cents: number;
 }
 
-interface IndexFieldDoc {
+interface IndexFieldRow {
   id: string;
   name: string;
-  fieldType: 'TEXT' | 'DATE' | 'NUMBER';
+  field_type: 'TEXT' | 'DATE' | 'NUMBER';
   required: boolean;
-  aiExtractionHint: string | null;
-  order: number;
-  showOnSearch: boolean;
+  ai_extraction_hint: string | null;
+  sort_order: number;
+  show_on_search: boolean;
   deleted: boolean;
 }
 
@@ -137,85 +138,75 @@ function sanitizeFilename(name: string): string {
  * Busca um documento pelo seu id sem filtrar por tenantId.
  *
  * Usado exclusivamente para SUPER_ADMIN, que não tem um tenantId no JWT e
- * precisa abrir qualquer documento diretamente (ex: a partir dos resultados
- * de busca). O tenant é resolvido a partir do próprio documento encontrado —
- * os checks de permissão subsequentes usam esse tenantId.
- *
- * Retorna null se o documento não existir ou estiver soft-deleted.
+ * precisa abrir qualquer documento diretamente. Retorna null se não existir
+ * ou estiver soft-deleted.
  */
 async function findDocumentGlobally(
-  db: import('mongodb').Db,
+  sql: Sql,
   id: string
-): Promise<DocumentDoc | null> {
-  const raw = await db
-    .collection<DocumentDoc>('documents')
-    .findOne({ id, deleted: false });
-  if (!raw) return null;
-  const { _id: _ignored, ...doc } = raw;
-  return doc as DocumentDoc;
+): Promise<DocumentRow | null> {
+  const rows = await sql<DocumentRow[]>`
+    SELECT *
+    FROM documents
+    WHERE id = ${id}
+      AND deleted = false
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
 }
 
 /**
  * Busca um documento pelo seu id restrito a uma lista de tenants permitidos.
  *
- * Usado exclusivamente para MULTI_TENANT_ADMIN em leitura sem tenantId explícito.
- * O filtro `tenantId: { $in: allowedTenantIds }` garante que o MTA só acessa
- * documentos de empresas da sua lista — nunca de empresas externas.
- *
- * Retorna null se o documento não existir, estiver soft-deleted ou o tenantId
- * do documento não estiver na lista (tratado como inexistente — spec §10, inv. 4).
+ * Usado exclusivamente para MULTI_TENANT_ADMIN. Retorna null se o documento
+ * não existir, estiver soft-deleted, ou o tenantId não estiver na lista.
  */
 async function findDocumentInTenants(
-  db: import('mongodb').Db,
+  sql: Sql,
   id: string,
   allowedTenantIds: string[]
-): Promise<DocumentDoc | null> {
-  const raw = await db
-    .collection<DocumentDoc>('documents')
-    .findOne({ id, tenantId: { $in: allowedTenantIds }, deleted: false });
-  if (!raw) return null;
-  const { _id: _ignored, ...doc } = raw;
-  return doc as DocumentDoc;
+): Promise<DocumentRow | null> {
+  if (allowedTenantIds.length === 0) return null;
+  const rows = await sql<DocumentRow[]>`
+    SELECT *
+    FROM documents
+    WHERE id = ${id}
+      AND tenant_id = ANY(${allowedTenantIds}::uuid[])
+      AND deleted = false
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
 }
 
 /**
  * Valida se o usuário pode LER um departamento específico.
  *
- * Modelo de ACL por raiz com herança dinâmica (Fase 6): o usuário tem acesso a
- * um departamento quando ele pertence à subárvore de alguma raiz concedida. A
- * checagem de acesso (leitura == escrita) usa o set expandido de
- * `resolveAccessibleDepartmentIds`.
- *
- * - TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN: sempre permitido (desde
- *   que o dept exista no tenant). Para MTA o isolamento já foi feito ao buscar
- *   o documento com `findDocumentInTenants` — o tenantId aqui é o do documento.
- * - UPLOADER / USER: o departamento deve pertencer ao set expandido.
- *
- * IMPORTANTE: o departamento NÃO é filtrado por `deleted: false`. A exclusão de
- * departamento preserva os documentos vinculados (eles seguem `deleted: false`),
- * apenas o próprio departamento vira `deleted: true`. Portanto, admins precisam
- * conseguir ler documentos órfãos cujo departamento foi soft-deletado — basta
- * que o departamento exista (e pertença ao tenant, quando aplicável).
- *
  * Lança `NotFoundError` se sem permissão (spec §10, invariante 4 — nunca 403).
  */
 async function assertCanReadDepartment(
-  db: import('mongodb').Db,
+  sql: Sql,
   userId: string,
   tenantId: string | null,
   departmentId: string,
   role: string
 ): Promise<void> {
-  const accessible = await resolveAccessibleDepartmentIds(db, userId, tenantId, role);
+  const accessible = await resolveAccessibleDepartmentIds(sql, userId, tenantId, role);
   if (accessible === null) {
     // Admin sem restrição de ACL: aceita qualquer departamento existente.
-    // Sem `deleted: false`: departamento soft-deletado ainda dá acesso aos docs preservados.
-    const deptFilter: Record<string, unknown> = { id: departmentId };
+    // Sem `deleted = false`: departamento soft-deletado ainda dá acesso aos docs preservados.
+    let exists: boolean;
     if (tenantId !== null) {
-      deptFilter['tenantId'] = tenantId;
+      const rows = await sql<Array<{ id: string }>>`
+        SELECT id FROM departments WHERE id = ${departmentId} AND tenant_id = ${tenantId} LIMIT 1
+      `;
+      exists = rows.length > 0;
+    } else {
+      const rows = await sql<Array<{ id: string }>>`
+        SELECT id FROM departments WHERE id = ${departmentId} LIMIT 1
+      `;
+      exists = rows.length > 0;
     }
-    const dept = await db.collection('departments').findOne(deptFilter);
-    if (!dept) {
+    if (!exists) {
       throw new NotFoundError('Departamento não encontrado');
     }
     return;
@@ -228,32 +219,22 @@ async function assertCanReadDepartment(
 /**
  * Valida se o usuário pode ESCREVER em um departamento específico.
  *
- * Modelo de ACL por raiz com herança dinâmica (Fase 6): conceder uma raiz dá
- * acesso total (leitura == escrita) a toda a subárvore. O departamento é
- * gravável quando pertence ao set expandido de `resolveAccessibleDepartmentIds`.
- *
- * IMPORTANTE: o departamento NÃO é filtrado por `deleted: false`. Como a exclusão
- * de departamento preserva os documentos (eles seguem `deleted: false`), admins
- * precisam conseguir editar/excluir/reprocessar documentos órfãos cujo departamento
- * foi soft-deletado. O isolamento por `tenantId` continua sendo aplicado.
- *
  * Lança `NotFoundError` se sem permissão.
  */
 async function assertCanWriteDepartment(
-  db: import('mongodb').Db,
+  sql: Sql,
   userId: string,
   tenantId: string,
   departmentId: string,
   role: string
 ): Promise<void> {
-  const accessible = await resolveAccessibleDepartmentIds(db, userId, tenantId, role);
+  const accessible = await resolveAccessibleDepartmentIds(sql, userId, tenantId, role);
   if (accessible === null) {
     // Admin sem restrição de ACL: verifica apenas que o dept pertence ao tenant.
-    // Sem `deleted: false`: departamento soft-deletado ainda permite operar nos docs preservados.
-    const dept = await db
-      .collection('departments')
-      .findOne({ id: departmentId, tenantId });
-    if (!dept) {
+    const rows = await sql<Array<{ id: string }>>`
+      SELECT id FROM departments WHERE id = ${departmentId} AND tenant_id = ${tenantId} LIMIT 1
+    `;
+    if (rows.length === 0) {
       throw new NotFoundError('Departamento não encontrado');
     }
     return;
@@ -266,17 +247,11 @@ async function assertCanWriteDepartment(
 /**
  * Valida os valores de `indexValues` contra os `indexFields` do tipo de documento.
  *
- * Regras por fieldType (spec §5.3 + wiki "Tipos de índice"):
- *   - TEXT: string não vazia, máx 500 chars
- *   - DATE: string no formato ISO 8601 (date-only ou datetime)
- *   - NUMBER: parseável como float finito
- *
- * Retorna lista de erros (vazia = válido). Também verifica campos `required`
- * não fornecidos.
+ * Retorna lista de erros (vazia = válido).
  */
 function validateIndexValues(
   indexValues: Record<string, string | number | null>,
-  indexFields: IndexFieldDoc[]
+  indexFields: IndexFieldRow[]
 ): string[] {
   const activeFields = indexFields.filter((f) => !f.deleted);
   const errors: string[] = [];
@@ -284,18 +259,16 @@ function validateIndexValues(
   for (const field of activeFields) {
     const value = indexValues[field.name];
 
-    // Campo obrigatório ausente ou nulo
     if (field.required && (value === undefined || value === null || value === '')) {
       errors.push(`Campo obrigatório ausente: "${field.name}"`);
       continue;
     }
 
-    // Pular validação de tipo para campos opcionais não fornecidos
     if (value === undefined || value === null) {
       continue;
     }
 
-    switch (field.fieldType) {
+    switch (field.field_type) {
       case 'TEXT': {
         if (typeof value !== 'string' || value.trim() === '') {
           errors.push(`Campo "${field.name}" deve ser texto não vazio`);
@@ -306,7 +279,6 @@ function validateIndexValues(
       }
       case 'DATE': {
         const dateStr = String(value);
-        // ISO 8601: aceita YYYY-MM-DD ou YYYY-MM-DDTHH:mm:ss...
         if (!/^\d{4}-\d{2}-\d{2}(T[\d:.Z+-]+)?$/.test(dateStr) || isNaN(Date.parse(dateStr))) {
           errors.push(`Campo "${field.name}" deve ser uma data válida no formato ISO 8601`);
         }
@@ -327,47 +299,66 @@ function validateIndexValues(
 
 /**
  * Resolve o `name` de um tipo de documento (tenant OU global) para denormalizar
- * no evento de upload. Retorna `null` se o tipo não for informado ou não existir
- * (o evento congela o que era conhecido no momento — não falha por isso).
- *
- * Não filtra por `deleted` no caminho global por consistência com a validação
- * de tipo do upload; um tipo soft-deletado ainda rende o nome para o relatório.
+ * no evento de upload.
  */
 async function resolveDocumentTypeName(
-  db: import('mongodb').Db,
+  sql: Sql,
   tenantId: string,
   documentTypeId: string | null
 ): Promise<string | null> {
   if (documentTypeId === null) {
     return null;
   }
-  const docType = await db
-    .collection<{ name?: string }>('document_types')
-    .findOne(
-      { id: documentTypeId, $or: [{ tenantId }, { isGlobal: true }] },
-      { projection: { name: 1 } }
-    );
-  return typeof docType?.name === 'string' ? docType.name : null;
+  const rows = await sql<Array<{ name: string }>>`
+    SELECT name
+    FROM document_types
+    WHERE id = ${documentTypeId}
+      AND (tenant_id = ${tenantId} OR is_global = true)
+    LIMIT 1
+  `;
+  return rows[0]?.name ?? null;
 }
 
 /**
- * Emite um evento de upload na coleção append-only `document_events`.
+ * Mapeia uma linha snake_case do PostgreSQL para o formato camelCase da resposta.
+ */
+function rowToDocument(r: DocumentRow): Record<string, unknown> {
+  return {
+    id: r.id,
+    tenantId: r.tenant_id,
+    departmentId: r.department_id,
+    documentTypeId: r.document_type_id,
+    filename: r.filename,
+    originalFilename: r.original_filename,
+    contentHash: r.content_hash,
+    sizeBytes: Number(r.size_bytes),
+    mimeType: r.mime_type,
+    s3Key: r.s3_key,
+    status: r.status,
+    failureReason: r.failure_reason,
+    tags: r.tags,
+    indexValues: r.index_values,
+    uploadedById: r.uploaded_by_id,
+    uploadedAt: r.uploaded_at,
+    processedAt: r.processed_at,
+    costUsdCents: r.cost_usd_cents,
+    deleted: r.deleted,
+  };
+}
+
+/**
+ * Emite um evento de upload na tabela append-only `document_events`.
  *
- * Falha de emissão NUNCA derruba a operação de upload (mesmo padrão do
- * AuditLog): em erro, loga com Pino (tenantId/documentId/userId) e segue. Mas
- * loga como ERRO — perder um evento distorce o relatório de cobrança.
+ * Falha de emissão NUNCA derruba a operação de upload.
  */
 async function emitUploadEvent(
-  db: import('mongodb').Db,
+  sql: Sql,
   log: FastifyBaseLogger,
   tenantId: string,
-  input: CreateDocumentEventInput
+  input: CreateDocumentEventPgInput
 ): Promise<void> {
   try {
-    const eventsRepo = new DocumentEventsRepository(
-      db.collection<DocumentEvent>(DOCUMENT_EVENTS_COLLECTION),
-      { tenantId }
-    );
+    const eventsRepo = new DocumentEventsRepository(sql, { tenantId });
     await eventsRepo.insertOne(input);
   } catch (eventError) {
     log.error(
@@ -388,44 +379,20 @@ async function emitUploadEvent(
 // ---------------------------------------------------------------------------
 
 /**
- * Rotas de documentos — Fase 3.
- *
- * `POST /documents` — upload multipart com:
- *   - validação de permissão de escrita no departamento
- *   - verificação de cota de disco do tenant
- *   - deduplicação por sha256 (retorna existente com 200 + X-Deduplicated)
- *   - validação opcional de documentTypeId (tenant ou global)
- *   - upload para S3
- *   - persistência no MongoDB com status PENDING
- *   - enfileiramento de job BullMQ
- *   - AuditLog de upload
- *
- * Necessita de `app.decorate('s3', ...)` e `app.decorate('queue', ...)` antes
- * de ser registrado (feito em `app.ts`).
+ * Rotas de documentos — PostgreSQL.
  */
 export const documentsRoutes: FastifyPluginAsync = async (app) => {
   /**
    * POST /documents — upload multipart de documento.
-   *
-   * Campos do formulário (multipart/form-data):
-   *   - file           (Part — binário, obrigatório)
-   *   - departmentId   (field — uuid, obrigatório)
-   *   - documentTypeId (field — uuid, opcional)
-   *   - indexValues    (field — JSON string opcional, mapa campo→valor)
    */
   app.post('/documents', { preHandler: app.authenticate }, async (request, reply) => {
-    // TENANT_ADMIN e UPLOADER operam no tenant do JWT.
-    // MULTI_TENANT_ADMIN envia tenantId explícito no form — validado abaixo.
     requireRole(request, 'TENANT_ADMIN', 'UPLOADER', 'MULTI_TENANT_ADMIN');
 
     const userId = request.user!.sub;
-    const db = app.db;
+    const sql = app.db;
 
     // ------------------------------------------------------------------
-    // 1. Parse multipart — lê todas as partes independente da ordem
-    //    request.file() só expõe fields que vêm ANTES do arquivo no stream,
-    //    então usamos request.parts() e bufferizamos o arquivo dentro do loop
-    //    para que campos posteriores ao arquivo também sejam lidos.
+    // 1. Parse multipart
     // ------------------------------------------------------------------
     const textFields: Record<string, string> = {};
     let fileData: MultipartFile | null = null;
@@ -437,18 +404,14 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
           fileData = part;
           fileBuffer = await streamToBuffer(part.file);
         } else {
-          part.file.resume(); // descarta arquivos extras
+          part.file.resume();
         }
       } else {
         textFields[part.fieldname] = part.value as string;
       }
     }
 
-    // ------------------------------------------------------------------
-    // Resolução de tenantId após leitura do form (multipart não permite
-    // ler fields antes do loop). MTA envia tenantId explícito no form;
-    // demais roles usam o tenantId do JWT.
-    // ------------------------------------------------------------------
+    // Resolução de tenantId
     let tenantId: string;
     if (request.user!.role === 'MULTI_TENANT_ADMIN') {
       const explicitTenantId = textFields['tenantId'];
@@ -474,7 +437,6 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const documentTypeIdRaw = textFields['documentTypeId'];
     const indexValuesRaw = textFields['indexValues'];
 
-    // Valida campos obrigatórios
     const FieldsSchema = z.object({
       departmentId: z.string().uuid('departmentId inválido'),
       documentTypeId: z.string().uuid('documentTypeId inválido').optional(),
@@ -500,26 +462,24 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const { departmentId, documentTypeId, indexValues } = fields_;
 
     // ------------------------------------------------------------------
-    // 2. Verificar permissão de escrita no departamento (ACL por raiz)
-    //    spec §10 invariante 5 + wiki "Permissões por departamento"
-    //    ACL por raiz com herança dinâmica (Fase 6): UPLOADER/USER podem
-    //    gravar em qualquer departamento cuja RAIZ foi concedida (pertencimento
-    //    ao set expandido). Admins têm acesso total. Recurso inacessível → 404.
-    //    Diferente de editar documentos órfãos, NÃO se pode arquivar um documento
-    //    NOVO em departamento soft-deletado: exige-se departamento ativo aqui.
+    // 2. Verificar permissão de escrita no departamento
     // ------------------------------------------------------------------
     const userRole = request.user!.role;
-    await assertCanWriteDepartment(db, userId, tenantId, departmentId, userRole);
+    await assertCanWriteDepartment(sql, userId, tenantId, departmentId, userRole);
 
-    const activeDept = await db
-      .collection('departments')
-      .findOne({ id: departmentId, tenantId, deleted: false });
-    if (!activeDept) {
+    const activeDeptRows = await sql<Array<{ id: string }>>`
+      SELECT id FROM departments
+      WHERE id = ${departmentId}
+        AND tenant_id = ${tenantId}
+        AND deleted = false
+      LIMIT 1
+    `;
+    if (activeDeptRows.length === 0) {
       throw new NotFoundError('Departamento não encontrado');
     }
 
     // ------------------------------------------------------------------
-    // 3. Calcular SHA-256 (buffer já lido no parse multipart)
+    // 3. Calcular SHA-256
     // ------------------------------------------------------------------
     const fileSize = fileBuffer.byteLength;
     const contentHash = sha256hex(fileBuffer);
@@ -529,61 +489,57 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     // ------------------------------------------------------------------
     // 4. Verificar cota de disco do tenant
-    //    wiki "Cotas de disco e de usuários por empresa"
     // ------------------------------------------------------------------
-    const tenant = await db.collection<TenantMongoDoc>('tenants').findOne({ id: tenantId });
+    const tenantRows = await sql<TenantRow[]>`
+      SELECT id, disk_quota_bytes FROM tenants WHERE id = ${tenantId} LIMIT 1
+    `;
+    const tenant = tenantRows[0];
     if (!tenant) {
       throw new NotFoundError('Tenant não encontrado');
     }
 
-    // Calcular uso atual: soma de sizeBytes de todos documentos não deletados
-    const usageAgg = await db
-      .collection<DocumentDoc>('documents')
-      .aggregate<{ total: number }>([
-        { $match: { tenantId, deleted: false } },
-        { $group: { _id: null, total: { $sum: '$sizeBytes' } } },
-      ])
-      .toArray();
+    const usageRows = await sql<Array<{ total: string }>>`
+      SELECT COALESCE(SUM(size_bytes), 0)::text AS total
+      FROM documents
+      WHERE tenant_id = ${tenantId}
+        AND deleted = false
+    `;
+    const currentUsageBytes = BigInt(usageRows[0]?.total ?? '0');
 
-    const currentUsageBytes = usageAgg[0]?.total ?? 0;
-
-    if (currentUsageBytes + fileSize > tenant.diskQuotaBytes) {
+    if (currentUsageBytes + BigInt(fileSize) > tenant.disk_quota_bytes) {
       throw new QuotaExceededError(
         `Cota de disco esgotada: uso atual ${currentUsageBytes} bytes, ` +
-          `arquivo ${fileSize} bytes, limite ${tenant.diskQuotaBytes} bytes`
+          `arquivo ${fileSize} bytes, limite ${tenant.disk_quota_bytes} bytes`
       );
     }
 
     // ------------------------------------------------------------------
-    // 5. Deduplicação: buscar documento com mesmo sha256 + tenantId
-    //    wiki "Deduplicação de documentos por conteúdo"
-    //    Retorna existente se status != FAILED
+    // 5. Deduplicação
     // ------------------------------------------------------------------
-    const existingDoc = await db.collection<DocumentDoc>('documents').findOne({
-      tenantId,
-      contentHash,
-      deleted: false,
-    });
+    const existingRows = await sql<DocumentRow[]>`
+      SELECT *
+      FROM documents
+      WHERE tenant_id = ${tenantId}
+        AND content_hash = ${contentHash}
+        AND deleted = false
+      LIMIT 1
+    `;
+    const existingDoc = existingRows[0] ?? null;
 
     if (existingDoc !== null && existingDoc.status !== 'FAILED') {
-      // O reenvio deduplicado É uma operação de upload: gera um NOVO evento
-      // (deduplicated:true) apontando para o documento já existente. Dimensões
-      // congeladas do arquivo ENVIADO agora (mimeType/sizeBytes) + tipo do doc
-      // reaproveitado. pageCount nasce null (backfill é por documentId no worker).
-      // wiki "Histórico de eventos de upload e relatório de uso (cobrança)".
       const existingTypeName = await resolveDocumentTypeName(
-        db,
+        sql,
         tenantId,
-        existingDoc.documentTypeId
+        existingDoc.document_type_id
       );
-      await emitUploadEvent(db, request.log, tenantId, {
+      await emitUploadEvent(sql, request.log, tenantId, {
         documentId: existingDoc.id,
         uploadedById: userId,
         eventType: 'upload',
         mimeType,
-        documentTypeId: existingDoc.documentTypeId,
+        documentTypeId: existingDoc.document_type_id,
         documentTypeName: existingTypeName,
-        sizeBytes: fileSize,
+        sizeBytes: BigInt(fileSize),
         pageCount: null,
         deduplicated: true,
       });
@@ -595,30 +551,29 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       return reply
         .status(200)
         .header('X-Deduplicated', 'true')
-        .send(existingDoc);
+        .send(rowToDocument(existingDoc));
     }
 
     // ------------------------------------------------------------------
     // 6. Validar documentTypeId (se informado)
-    //    Deve pertencer ao tenant OU ser global (isGlobal: true)
-    //    wiki "Tipos de documento globais e por empresa"
     // ------------------------------------------------------------------
     if (documentTypeId !== undefined) {
-      const docTypeRepo = new TenantRepository<DocumentTypeDoc>(
-        db.collection('document_types'),
-        { tenantId }
-      );
-
-      // Tenta no escopo do tenant primeiro
-      const tenantDocType = await docTypeRepo.findById(documentTypeId);
-      if (!tenantDocType) {
-        // Tenta tipo global (tenantId: null)
-        const globalDocType = await db.collection<DocumentTypeDoc>('document_types').findOne({
-          id: documentTypeId,
-          isGlobal: true,
-          deleted: false,
-        });
-        if (!globalDocType) {
+      const tenantDocTypeRows = await sql<Array<{ id: string }>>`
+        SELECT id FROM document_types
+        WHERE id = ${documentTypeId}
+          AND tenant_id = ${tenantId}
+          AND deleted = false
+        LIMIT 1
+      `;
+      if (tenantDocTypeRows.length === 0) {
+        const globalDocTypeRows = await sql<Array<{ id: string }>>`
+          SELECT id FROM document_types
+          WHERE id = ${documentTypeId}
+            AND is_global = true
+            AND deleted = false
+          LIMIT 1
+        `;
+        if (globalDocTypeRows.length === 0) {
           throw new NotFoundError('Tipo de documento não encontrado');
         }
       }
@@ -626,41 +581,39 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     // ------------------------------------------------------------------
     // 7. Upload para S3
-    //    Chave: tenants/{tenantId}/documents/{sha256}/{filename}
     // ------------------------------------------------------------------
     const s3Key = `tenants/${tenantId}/documents/${contentHash}/${filename}`;
     await app.s3.uploadFile({ key: s3Key, buffer: fileBuffer, mimeType });
 
     // ------------------------------------------------------------------
-    // 8. Persistir documento no MongoDB com status PENDING
+    // 8. Persistir documento no PostgreSQL com status PENDING
     // ------------------------------------------------------------------
     const documentId = newId();
-    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+    const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
 
-    let document: DocumentDoc;
+    let document: DocumentRow;
     try {
       document = await repo.insertOne({
         id: documentId,
-        departmentId,
-        documentTypeId: documentTypeId ?? null,
+        department_id: departmentId,
+        document_type_id: documentTypeId ?? null,
         filename,
-        originalFilename,
-        contentHash,
-        sizeBytes: fileSize,
-        mimeType,
-        s3Key,
+        original_filename: originalFilename,
+        content_hash: contentHash,
+        size_bytes: BigInt(fileSize),
+        mime_type: mimeType,
+        s3_key: s3Key,
         status: 'PENDING',
-        failureReason: null,
+        failure_reason: null,
         tags: [],
-        mongoContentId: null,
-        indexValues: indexValues as Record<string, string | number | Date | null>,
-        uploadedById: userId,
-        uploadedAt: new Date(),
-        processedAt: null,
-        costUsdCents: 0,
-      });
+        index_values: indexValues as Record<string, string | number | null>,
+        uploaded_by_id: userId,
+        uploaded_at: new Date(),
+        processed_at: null,
+        cost_usd_cents: 0,
+      } as Omit<DocumentRow, 'id' | 'tenantId' | 'tenant_id' | 'deleted'>);
     } catch (insertError) {
-      // Rollback: remove arquivo do S3 para evitar objetos órfãos
+      // Rollback: remove arquivo do S3
       try {
         await app.s3.deleteFile(s3Key);
       } catch (deleteError) {
@@ -696,9 +649,8 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     // ------------------------------------------------------------------
     // 10. AuditLog
-    //     spec §10 invariante 7: AuditLog em upload
     // ------------------------------------------------------------------
-    const auditLogger = new AuditLogger(db);
+    const auditLogger = new AuditLogger(sql);
     try {
       await auditLogger.record({
         tenantId,
@@ -714,7 +666,6 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
         },
       });
     } catch (auditError) {
-      // Auditoria nunca derruba a operação principal
       request.log.error(
         { err: auditError, tenantId, userId, documentId: document.id },
         'falha ao registrar audit log de upload'
@@ -722,27 +673,21 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     }
 
     // ------------------------------------------------------------------
-    // 11. Evento de upload (document_events — append-only, cobrança)
-    //     Cobre o fluxo de upload NORMAL e também o caso FAILED: quando o
-    //     documento existente estava FAILED, o `if` de dedup acima não
-    //     retornou, então criamos um doc novo e este caminho emite o evento
-    //     com deduplicated:false e o novo documentId.
-    //     QUOTA_EXCEEDED nunca chega aqui (lança antes, no passo 4).
-    //     wiki "Histórico de eventos de upload e relatório de uso (cobrança)".
+    // 11. Evento de upload
     // ------------------------------------------------------------------
     const documentTypeName = await resolveDocumentTypeName(
-      db,
+      sql,
       tenantId,
       documentTypeId ?? null
     );
-    await emitUploadEvent(db, request.log, tenantId, {
+    await emitUploadEvent(sql, request.log, tenantId, {
       documentId: document.id,
       uploadedById: userId,
       eventType: 'upload',
       mimeType,
       documentTypeId: documentTypeId ?? null,
       documentTypeName,
-      sizeBytes: fileSize,
+      sizeBytes: BigInt(fileSize),
       pageCount: null,
       deduplicated: false,
     });
@@ -752,45 +697,21 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       'documento enviado com sucesso'
     );
 
-    return reply.status(201).send(document);
+    return reply.status(201).send(rowToDocument(document));
   });
 
   // =========================================================================
   // GET /documents — listagem paginada com filtros
   // =========================================================================
-  /**
-   * GET /documents
-   *
-   * Listagem paginada de documentos do tenant com filtros opcionais.
-   * Paginação por cursor estável (ordenada por `id` ASC).
-   *
-   * Query params:
-   *   - departmentId?    — filtra por departamento (verifica permissão de leitura)
-   *   - documentTypeId?  — filtra por tipo de documento
-   *   - tags?            — CSV de tags (ex.: "2026,janeiro")
-   *   - status?          — filtra por status de processamento
-   *   - cursor?          — cursor da página anterior (id do último item)
-   *   - limit?           — itens por página (padrão 20, máx 100)
-   *
-   * Resposta: { items, nextCursor, total }
-   */
   app.get('/documents', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
     const role = request.user!.role;
-    const db = app.db;
+    const sql = app.db;
 
-    // Parse e validação de query params
     const query = ListDocumentsQuerySchema.parse(request.query);
 
-    // Resolve o contexto de tenant:
-    // - roles normais: sempre o do JWT (mode: 'single')
-    // - SUPER_ADMIN com ?tenantId=xxx: mode 'single'
-    // - SUPER_ADMIN sem ?tenantId: mode 'all' (sem filtro)
-    // - MULTI_TENANT_ADMIN com ?tenantId=xxx (∈ lista): mode 'single'
-    // - MULTI_TENANT_ADMIN sem ?tenantId: mode 'allowed' ($in)
     const tenantContext = resolveTenantContext(request, { explicitTenantId: query.tenantId, write: false });
 
-    // Mantém compatibilidade com helpers que esperam string | null
     const effectiveTenantId: string | null =
       tenantContext.mode === 'single' ? tenantContext.tenantId : null;
 
@@ -798,52 +719,55 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     // 1. Resolver departamentos acessíveis
     // ------------------------------------------------------------------
     const readableDepartmentIds = await resolveAccessibleDepartmentIds(
-      db,
+      sql,
       userId,
       effectiveTenantId,
       role
     );
 
-    // Se filtro por departamento específico foi solicitado, verificar permissão
     if (query.departmentId !== undefined) {
-      await assertCanReadDepartment(db, userId, effectiveTenantId, query.departmentId, role);
+      await assertCanReadDepartment(sql, userId, effectiveTenantId, query.departmentId, role);
     }
 
     // ------------------------------------------------------------------
-    // 2. Montar filtro base
+    // 2. Montar query SQL parametrizada
     // ------------------------------------------------------------------
-    type DocFilter = Record<string, unknown>;
-    const baseFilter: DocFilter = { deleted: false };
+    const conditions: string[] = ['d.deleted = false'];
+    const params: unknown[] = [];
+    let paramIdx = 1;
+
+    const addParam = (val: unknown): string => {
+      params.push(val);
+      return `$${paramIdx++}`;
+    };
 
     if (tenantContext.mode === 'single') {
-      baseFilter['tenantId'] = tenantContext.tenantId;
+      conditions.push(`d.tenant_id = ${addParam(tenantContext.tenantId)}`);
     } else if (tenantContext.mode === 'allowed') {
-      // MULTI_TENANT_ADMIN: filtra por $in sobre os tenants permitidos
-      baseFilter['tenantId'] = { $in: tenantContext.tenantIds };
+      conditions.push(`d.tenant_id = ANY(${addParam(tenantContext.tenantIds)}::uuid[])`);
     }
     // mode: 'all' (SUPER_ADMIN sem tenantId) — sem filtro de tenant
 
     // Restrição de departamentos por role
     if (readableDepartmentIds !== null) {
       if (query.departmentId !== undefined) {
-        // Verifica que o departamento solicitado está entre os permitidos
         if (!readableDepartmentIds.includes(query.departmentId)) {
           throw new NotFoundError('Departamento não encontrado ou sem permissão de leitura');
         }
-        baseFilter['departmentId'] = query.departmentId;
+        conditions.push(`d.department_id = ${addParam(query.departmentId)}`);
       } else {
-        baseFilter['departmentId'] = { $in: readableDepartmentIds };
+        conditions.push(`d.department_id = ANY(${addParam(readableDepartmentIds)}::uuid[])`);
       }
     } else if (query.departmentId !== undefined) {
-      baseFilter['departmentId'] = query.departmentId;
+      conditions.push(`d.department_id = ${addParam(query.departmentId)}`);
     }
 
     if (query.documentTypeId !== undefined) {
-      baseFilter['documentTypeId'] = query.documentTypeId;
+      conditions.push(`d.document_type_id = ${addParam(query.documentTypeId)}`);
     }
 
     if (query.status !== undefined) {
-      baseFilter['status'] = query.status;
+      conditions.push(`d.status = ${addParam(query.status)}`);
     }
 
     if (query.tags !== undefined) {
@@ -852,75 +776,76 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
         .map((t) => t.trim())
         .filter((t) => t.length > 0);
       if (tagList.length > 0) {
-        baseFilter['tags'] = { $all: tagList };
+        // PostgreSQL: tags @> ARRAY[...] (contém TODOS)
+        conditions.push(`d.tags @> ${addParam(tagList)}::text[]`);
       }
     }
 
-    // ------------------------------------------------------------------
-    // 3. Paginação por cursor
-    // ------------------------------------------------------------------
+    const whereClause = conditions.join(' AND ');
     const limit = normalizeLimit(query.limit);
 
-    const cursorFilter: DocFilter =
-      query.cursor !== undefined ? { ...baseFilter, id: { $gt: query.cursor } } : baseFilter;
+    // Total (sem cursor)
+    const countQuery = `SELECT COUNT(*) AS count FROM documents d WHERE ${whereClause}`;
+    const countRows = await sql.unsafe<Array<{ count: string }>>(countQuery, params as Parameters<typeof sql.unsafe>[1]);
+    const total = parseInt(countRows[0]?.count ?? '0', 10);
 
-    const collection = db.collection<DocumentDoc>('documents');
+    // Página com cursor
+    const pageConditions = [...conditions];
+    const pageParams = [...params];
+    let pageParamIdx = paramIdx;
 
-    // Total (sem cursor — conta todos que casam com o filtro base)
-    const total = await collection.countDocuments(baseFilter as Parameters<typeof collection.countDocuments>[0]);
+    const addPageParam = (val: unknown): string => {
+      pageParams.push(val);
+      return `$${pageParamIdx++}`;
+    };
 
-    const docs = await collection
-      .find(cursorFilter as Parameters<typeof collection.find>[0])
-      .sort({ id: 1 })
-      .limit(limit + 1)
-      .toArray();
+    if (query.cursor !== undefined) {
+      pageConditions.push(`d.id > ${addPageParam(query.cursor)}`);
+    }
+    const limitPlaceholder = addPageParam(limit + 1);
+
+    const pageQuery = `
+      SELECT d.*
+      FROM documents d
+      WHERE ${pageConditions.join(' AND ')}
+      ORDER BY d.id ASC
+      LIMIT ${limitPlaceholder}
+    `;
+
+    const docs = await sql.unsafe<DocumentRow[]>(pageQuery, pageParams as Parameters<typeof sql.unsafe>[1]);
 
     const hasMore = docs.length > limit;
     const page = hasMore ? docs.slice(0, limit) : docs;
     const last = page.at(-1);
     const nextCursor = hasMore && last ? last.id : null;
 
-    // Strip _id (detalhe interno do Mongo)
-    const items = page.map(({ _id: _ignored, ...rest }) => rest);
-
     request.log.info(
-      { tenantId: effectiveTenantId, userId, total, returned: items.length },
+      { tenantId: effectiveTenantId, userId, total, returned: page.length },
       'listagem de documentos'
     );
 
-    return reply.status(200).send({ items, nextCursor, total });
+    return reply.status(200).send({ items: page.map(rowToDocument), nextCursor, total });
   });
 
   // =========================================================================
   // GET /documents/:id — detalhe de documento
   // =========================================================================
-  /**
-   * GET /documents/:id
-   *
-   * Retorna um documento pelo id, verificando isolamento de tenant e permissão
-   * de leitura no departamento do documento.
-   */
   app.get('/documents/:id', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
     const role = request.user!.role;
-    const db = app.db;
+    const sql = app.db;
 
     const { id } = request.params as { id: string };
 
-    let doc: DocumentDoc | null;
+    let doc: DocumentRow | null;
 
     if (role === 'SUPER_ADMIN') {
-      // SUPER_ADMIN não tem tenantId no JWT — busca o documento sem restrição
-      // de tenant e resolve o tenantId a partir do próprio documento.
-      doc = await findDocumentGlobally(db, id);
+      doc = await findDocumentGlobally(sql, id);
     } else if (role === 'MULTI_TENANT_ADMIN') {
-      // MTA sem tenantId explícito: restringe a busca à lista de tenants permitidos.
-      // Garante isolamento — documentos de empresas fora da lista são tratados
-      // como inexistentes (spec §10, invariante 4).
-      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
-      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
       doc = await repo.findById(id);
     }
 
@@ -928,59 +853,48 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    // Verifica permissão de leitura no departamento do documento.
-    // Para SUPER_ADMIN/MTA o tenantId vem do próprio documento (sempre permitido).
-    await assertCanReadDepartment(db, userId, doc.tenantId, doc.departmentId, role);
+    await assertCanReadDepartment(sql, userId, doc.tenant_id, doc.department_id, role);
 
-    // Enriquece com o número de páginas extraído (mora em document_content,
-    // não na coleção documents). Nulo enquanto a extração não rodou.
-    const content = await db
-      .collection<{ extraction?: { pageCount?: number } }>('document_content')
-      .findOne({ documentId: doc.id, tenantId: doc.tenantId }, { projection: { extraction: 1 } });
+    // Enriquece com pageCount de document_content
+    const contentRows = await sql<Array<{ extraction: { pageCount?: number } | null }>>`
+      SELECT extraction
+      FROM document_content
+      WHERE document_id = ${doc.id}
+        AND tenant_id = ${doc.tenant_id}
+      LIMIT 1
+    `;
     const pageCount =
-      typeof content?.extraction?.pageCount === 'number' ? content.extraction.pageCount : null;
+      typeof contentRows[0]?.extraction?.pageCount === 'number'
+        ? contentRows[0].extraction.pageCount
+        : null;
 
     request.log.info(
-      { tenantId: doc.tenantId, userId, documentId: doc.id },
+      { tenantId: doc.tenant_id, userId, documentId: doc.id },
       'detalhe de documento recuperado'
     );
 
-    return reply.status(200).send({ ...doc, pageCount });
+    return reply.status(200).send({ ...rowToDocument(doc), pageCount });
   });
 
   // =========================================================================
   // GET /documents/:id/download — URL assinada S3
   // =========================================================================
-  /**
-   * GET /documents/:id/download
-   *
-   * Gera uma URL pré-assinada do S3 com validade de 5 minutos para download
-   * direto do arquivo. Registra AuditLog de download.
-   *
-   * Resposta: { url: string, expiresAt: string (ISO 8601) }
-   */
   app.get('/documents/:id/download', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
     const role = request.user!.role;
-    const db = app.db;
+    const sql = app.db;
 
     const { id } = request.params as { id: string };
 
-    // ------------------------------------------------------------------
-    // 1. Buscar documento
-    //    SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
-    //    MULTI_TENANT_ADMIN: restringe à lista allowedTenantIds.
-    //    Demais roles: busca escopada ao tenant do JWT.
-    // ------------------------------------------------------------------
-    let doc: DocumentDoc | null;
+    let doc: DocumentRow | null;
 
     if (role === 'SUPER_ADMIN') {
-      doc = await findDocumentGlobally(db, id);
+      doc = await findDocumentGlobally(sql, id);
     } else if (role === 'MULTI_TENANT_ADMIN') {
-      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
-      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
       doc = await repo.findById(id);
     }
 
@@ -988,46 +902,35 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    // ------------------------------------------------------------------
-    // 2. Verificar permissão de leitura no departamento
-    // ------------------------------------------------------------------
-    await assertCanReadDepartment(db, userId, doc.tenantId, doc.departmentId, role);
+    await assertCanReadDepartment(sql, userId, doc.tenant_id, doc.department_id, role);
 
-    // ------------------------------------------------------------------
-    // 3. Gerar URL assinada (5 minutos = 300 segundos)
-    //    ?open=true → ResponseContentDisposition=attachment para que o SO
-    //    abra o arquivo com o app padrão em vez de exibi-lo inline no browser.
-    // ------------------------------------------------------------------
     const { open } = DownloadQuerySchema.parse(request.query);
     const expiresInSeconds = 300;
     const contentDisposition =
       open === true
-        ? `attachment; filename="${encodeURIComponent(doc.originalFilename)}"`
+        ? `attachment; filename="${encodeURIComponent(doc.original_filename)}"`
         : undefined;
-    const url = await app.s3.getSignedDownloadUrl(doc.s3Key, expiresInSeconds, contentDisposition);
+    const url = await app.s3.getSignedDownloadUrl(doc.s3_key, expiresInSeconds, contentDisposition);
     const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
 
-    // ------------------------------------------------------------------
-    // 4. AuditLog de download
-    // ------------------------------------------------------------------
-    const auditLogger = new AuditLogger(db);
+    const auditLogger = new AuditLogger(sql);
     try {
       await auditLogger.record({
-        tenantId: doc.tenantId,
+        tenantId: doc.tenant_id,
         userId,
         action: 'document.download',
         resource: `documents/${doc.id}`,
-        metadata: { filename: doc.originalFilename, s3Key: doc.s3Key },
+        metadata: { filename: doc.original_filename, s3Key: doc.s3_key },
       });
     } catch (auditError) {
       request.log.error(
-        { err: auditError, tenantId: doc.tenantId, userId, documentId: doc.id },
+        { err: auditError, tenantId: doc.tenant_id, userId, documentId: doc.id },
         'falha ao registrar audit log de download'
       );
     }
 
     request.log.info(
-      { tenantId: doc.tenantId, userId, documentId: doc.id },
+      { tenantId: doc.tenant_id, userId, documentId: doc.id },
       'URL de download gerada'
     );
 
@@ -1037,35 +940,22 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
   // =========================================================================
   // GET /documents/:id/preview — converte Office→PDF via extractor e devolve PDF
   // =========================================================================
-  /**
-   * GET /documents/:id/preview
-   *
-   * Baixa o arquivo original do S3, envia ao microserviço extractor para
-   * conversão Office→PDF (LibreOffice headless) e devolve o PDF inline.
-   * Usado pelo frontend para PPTX/PPT — o <iframe> carrega o blob URL.
-   *
-   * Suporta: pptx, ppt, docx, doc, xlsx, xls, odp, odt.
-   * Outros mime types retornam 422.
-   */
   app.get('/documents/:id/preview', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
     const role = request.user!.role;
-    const db = app.db;
+    const sql = app.db;
 
     const { id } = request.params as { id: string };
 
-    // ------------------------------------------------------------------
-    // 1. Buscar documento (mesmo padrão do /download)
-    // ------------------------------------------------------------------
-    let doc: DocumentDoc | null;
+    let doc: DocumentRow | null;
 
     if (role === 'SUPER_ADMIN') {
-      doc = await findDocumentGlobally(db, id);
+      doc = await findDocumentGlobally(sql, id);
     } else if (role === 'MULTI_TENANT_ADMIN') {
-      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
-      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
       doc = await repo.findById(id);
     }
 
@@ -1073,14 +963,8 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    // ------------------------------------------------------------------
-    // 2. Verificar permissão de leitura no departamento
-    // ------------------------------------------------------------------
-    await assertCanReadDepartment(db, userId, doc.tenantId, doc.departmentId, role);
+    await assertCanReadDepartment(sql, userId, doc.tenant_id, doc.department_id, role);
 
-    // ------------------------------------------------------------------
-    // 3. Validar mime type — apenas formatos que o extractor converte
-    // ------------------------------------------------------------------
     const CONVERTIBLE_MIMES = new Set([
       'application/vnd.openxmlformats-officedocument.presentationml.presentation',
       'application/vnd.ms-powerpoint',
@@ -1092,23 +976,17 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       'application/vnd.oasis.opendocument.text',
     ]);
 
-    if (!CONVERTIBLE_MIMES.has(doc.mimeType)) {
-      return reply.status(422).send({ error: `mime type não suportado para preview: ${doc.mimeType}` });
+    if (!CONVERTIBLE_MIMES.has(doc.mime_type)) {
+      return reply.status(422).send({ error: `mime type não suportado para preview: ${doc.mime_type}` });
     }
 
-    // ------------------------------------------------------------------
-    // 4. Baixar arquivo do S3 como buffer
-    // ------------------------------------------------------------------
-    const fileBuffer = await app.s3.downloadFile(doc.s3Key);
+    const fileBuffer = await app.s3.downloadFile(doc.s3_key);
 
-    // ------------------------------------------------------------------
-    // 5. Enviar ao extractor para conversão Office→PDF
-    // ------------------------------------------------------------------
     const { EXTRACTOR_URL } = getConfig();
     const extractorBaseUrl = EXTRACTOR_URL.replace(/\/extract$/, '');
     const formData = new FormData();
-    formData.append('file', new Blob([fileBuffer], { type: doc.mimeType }), doc.originalFilename);
-    formData.append('content_type', doc.mimeType);
+    formData.append('file', new Blob([fileBuffer], { type: doc.mime_type }), doc.original_filename);
+    formData.append('content_type', doc.mime_type);
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 70_000);
@@ -1124,7 +1002,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       if (!extractorResponse.ok) {
         const errText = await extractorResponse.text().catch(() => '');
         request.log.error(
-          { tenantId: doc.tenantId, userId, documentId: doc.id, status: extractorResponse.status, body: errText },
+          { tenantId: doc.tenant_id, userId, documentId: doc.id, status: extractorResponse.status, body: errText },
           'extractor retornou erro na conversão'
         );
         return reply.status(502).send({ error: 'falha na conversão do documento' });
@@ -1140,27 +1018,24 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       clearTimeout(timeout);
     }
 
-    // ------------------------------------------------------------------
-    // 6. AuditLog de preview
-    // ------------------------------------------------------------------
-    const auditLogger = new AuditLogger(db);
+    const auditLogger = new AuditLogger(sql);
     try {
       await auditLogger.record({
-        tenantId: doc.tenantId,
+        tenantId: doc.tenant_id,
         userId,
         action: 'document.preview',
         resource: `documents/${doc.id}`,
-        metadata: { filename: doc.originalFilename, mimeType: doc.mimeType },
+        metadata: { filename: doc.original_filename, mimeType: doc.mime_type },
       });
     } catch (auditError) {
       request.log.error(
-        { err: auditError, tenantId: doc.tenantId, userId, documentId: doc.id },
+        { err: auditError, tenantId: doc.tenant_id, userId, documentId: doc.id },
         'falha ao registrar audit log de preview'
       );
     }
 
     request.log.info(
-      { tenantId: doc.tenantId, userId, documentId: doc.id, mimeType: doc.mimeType },
+      { tenantId: doc.tenant_id, userId, documentId: doc.id, mimeType: doc.mime_type },
       'preview PDF gerado via extractor'
     );
 
@@ -1174,43 +1049,24 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
   // =========================================================================
   // PATCH /documents/:id — edição manual de tipo, índices e tags
   // =========================================================================
-  /**
-   * PATCH /documents/:id
-   *
-   * Atualiza campos editáveis do documento: documentTypeId, indexValues e tags.
-   * Campos protegidos (status, s3Key, contentHash, uploadedById) nunca são
-   * alterados por este endpoint.
-   *
-   * Valida indexValues contra indexFields do tipo quando documentTypeId está
-   * preenchido (informado agora ou já salvo).
-   *
-   * Registra AuditLog com a lista de campos alterados.
-   */
   app.patch('/documents/:id', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
     const role = request.user!.role;
-    const db = app.db;
+    const sql = app.db;
 
     const { id } = request.params as { id: string };
 
-    // Parse e validação de body
     const body = PatchDocumentBodySchema.parse(request.body);
 
-    // ------------------------------------------------------------------
-    // 1. Buscar documento
-    //    SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
-    //    MULTI_TENANT_ADMIN: restringe à lista allowedTenantIds.
-    //    Demais roles: busca escopada ao tenant do JWT.
-    // ------------------------------------------------------------------
-    let doc: DocumentDoc | null;
+    let doc: DocumentRow | null;
 
     if (role === 'SUPER_ADMIN') {
-      doc = await findDocumentGlobally(db, id);
+      doc = await findDocumentGlobally(sql, id);
     } else if (role === 'MULTI_TENANT_ADMIN') {
-      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
-      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
       doc = await repo.findById(id);
     }
 
@@ -1218,100 +1074,77 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    // A partir daqui o tenantId é sempre o do documento.
-    const tenantId = doc.tenantId;
-    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+    const tenantId = doc.tenant_id;
+    const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
 
-    // ------------------------------------------------------------------
-    // 2. Verificar permissão de ESCRITA no departamento
-    // ------------------------------------------------------------------
-    await assertCanWriteDepartment(db, userId, tenantId, doc.departmentId, role);
+    await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
 
-    // ------------------------------------------------------------------
-    // 3. Validar documentTypeId (se informado)
-    //    Deve pertencer ao tenant OU ser global (isGlobal: true)
-    // ------------------------------------------------------------------
-    // Determina o documentTypeId efetivo após o patch:
-    // - se body traz explicitamente null → limpar tipo
-    // - se body traz uuid → usar novo
-    // - se body não traz → manter o do documento
+    // Determina o documentTypeId efetivo após o patch
     const effectiveDocumentTypeId: string | null =
       'documentTypeId' in body
         ? (body.documentTypeId ?? null)
-        : (doc.documentTypeId ?? null);
+        : (doc.document_type_id ?? null);
 
     if (body.documentTypeId !== undefined && body.documentTypeId !== null) {
-      const docTypeRepo = new TenantRepository<DocumentTypeDoc>(
-        db.collection('document_types'),
-        { tenantId }
-      );
-      const tenantDocType = await docTypeRepo.findById(body.documentTypeId);
-      if (!tenantDocType) {
-        const globalDocType = await db.collection<DocumentTypeDoc>('document_types').findOne({
-          id: body.documentTypeId,
-          isGlobal: true,
-          deleted: false,
-        });
-        if (!globalDocType) {
+      const tenantDocTypeRows = await sql<Array<{ id: string }>>`
+        SELECT id FROM document_types
+        WHERE id = ${body.documentTypeId}
+          AND tenant_id = ${tenantId}
+          AND deleted = false
+        LIMIT 1
+      `;
+      if (tenantDocTypeRows.length === 0) {
+        const globalDocTypeRows = await sql<Array<{ id: string }>>`
+          SELECT id FROM document_types
+          WHERE id = ${body.documentTypeId}
+            AND is_global = true
+            AND deleted = false
+          LIMIT 1
+        `;
+        if (globalDocTypeRows.length === 0) {
           throw new NotFoundError('Tipo de documento não encontrado');
         }
       }
     }
 
-    // ------------------------------------------------------------------
-    // 4. Validar indexValues contra indexFields do tipo efetivo
-    // ------------------------------------------------------------------
+    // Validar indexValues contra indexFields do tipo efetivo
     if (body.indexValues !== undefined && effectiveDocumentTypeId !== null) {
-      // Buscar o tipo (tenant ou global) para obter os indexFields
-      const docTypeRepo = new TenantRepository<DocumentTypeDoc>(
-        db.collection('document_types'),
-        { tenantId }
-      );
-      let docType = await docTypeRepo.findById(effectiveDocumentTypeId);
-      if (!docType) {
-        docType = await db.collection<DocumentTypeDoc>('document_types').findOne({
-          id: effectiveDocumentTypeId,
-          isGlobal: true,
-          deleted: false,
-        }) ?? null;
-      }
+      const indexFieldRows = await sql<IndexFieldRow[]>`
+        SELECT dtif.*
+        FROM document_type_index_fields dtif
+        WHERE dtif.document_type_id = ${effectiveDocumentTypeId}
+      `;
 
-      if (docType) {
-        const indexFields = (docType.indexFields as IndexFieldDoc[]) ?? [];
-        const validationErrors = validateIndexValues(
-          body.indexValues as Record<string, string | number | null>,
-          indexFields
-        );
-        if (validationErrors.length > 0) {
-          return reply.status(422).send({
-            error: {
-              code: 'VALIDATION_ERROR',
-              message: 'Valores de índice inválidos',
-              details: validationErrors,
-            },
-          });
-        }
+      const validationErrors = validateIndexValues(
+        body.indexValues as Record<string, string | number | null>,
+        indexFieldRows
+      );
+      if (validationErrors.length > 0) {
+        return reply.status(422).send({
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: 'Valores de índice inválidos',
+            details: validationErrors,
+          },
+        });
       }
     }
 
-    // ------------------------------------------------------------------
-    // 5. Montar update parcial (nunca sobrescreve campos protegidos)
-    // ------------------------------------------------------------------
-    const updateData: Partial<Omit<DocumentDoc, 'id' | 'tenantId' | 'deleted'>> = {};
+    // Montar update parcial (snake_case para TenantRepository)
+    const updateData: Partial<Omit<DocumentRow, 'id' | 'tenantId' | 'deleted'>> = {};
 
     if ('documentTypeId' in body) {
-      updateData.documentTypeId = body.documentTypeId ?? null;
+      updateData.document_type_id = body.documentTypeId ?? null;
     }
     if (body.indexValues !== undefined) {
-      updateData.indexValues = body.indexValues as Record<string, string | number | Date | null>;
+      updateData.index_values = body.indexValues as Record<string, string | number | null>;
     }
     if (body.tags !== undefined) {
       updateData.tags = body.tags;
     }
 
-    // Se não há nada para atualizar, retorna o documento atual sem tocar no banco
     if (Object.keys(updateData).length === 0) {
-      return reply.status(200).send(doc);
+      return reply.status(200).send(rowToDocument(doc));
     }
 
     const updated = await repo.updateById(id, updateData);
@@ -1320,10 +1153,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    // ------------------------------------------------------------------
-    // 6. AuditLog
-    // ------------------------------------------------------------------
-    const auditLogger = new AuditLogger(db);
+    const auditLogger = new AuditLogger(sql);
     try {
       await auditLogger.record({
         tenantId,
@@ -1344,40 +1174,28 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       'documento atualizado'
     );
 
-    return reply.status(200).send(updated);
+    return reply.status(200).send(rowToDocument(updated as DocumentRow));
   });
 
   // =========================================================================
   // DELETE /documents/:id — exclusão lógica + limpeza de chunks/S3
   // =========================================================================
-  /**
-   * DELETE /documents/:id
-   *
-   * Soft-delete do documento (marca `deleted: true`). Remove fisicamente os
-   * chunks e o document_content do MongoDB e o arquivo do S3.
-   *
-   * Permissão: TENANT_ADMIN/SUPER_ADMIN sempre; UPLOADER precisa de canWrite no departamento.
-   * Resposta: 204 No Content.
-   */
   app.delete('/documents/:id', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
     const role = request.user!.role;
-    const db = app.db;
+    const sql = app.db;
 
     const { id } = request.params as { id: string };
 
-    // SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
-    // MULTI_TENANT_ADMIN: restringe à lista allowedTenantIds.
-    // Demais roles: busca escopada ao tenant do JWT.
-    let doc: DocumentDoc | null;
+    let doc: DocumentRow | null;
 
     if (role === 'SUPER_ADMIN') {
-      doc = await findDocumentGlobally(db, id);
+      doc = await findDocumentGlobally(sql, id);
     } else if (role === 'MULTI_TENANT_ADMIN') {
-      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
-      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
       doc = await repo.findById(id);
     }
 
@@ -1385,32 +1203,32 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    const tenantId = doc.tenantId;
-    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+    const tenantId = doc.tenant_id;
+    const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
 
-    await assertCanWriteDepartment(db, userId, tenantId, doc.departmentId, role);
+    await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
 
     await repo.softDelete(id);
 
-    // Remove chunks e document_content — não há valor em mantê-los após exclusão
+    // Remove chunks e document_content
     await Promise.all([
-      db.collection('chunks').deleteMany({ documentId: id, tenantId }),
-      db.collection('document_content').deleteOne({ documentId: id, tenantId }),
+      sql`DELETE FROM chunks WHERE document_id = ${id} AND tenant_id = ${tenantId}`,
+      sql`DELETE FROM document_content WHERE document_id = ${id} AND tenant_id = ${tenantId}`,
     ]);
 
-    // Remove o arquivo do S3 (falha silenciosa — não derruba a operação)
-    await app.s3.deleteFile(doc.s3Key).catch((s3Err: unknown) => {
-      request.log.error({ err: s3Err, s3Key: doc.s3Key }, 'falha ao remover arquivo do S3');
+    // Remove o arquivo do S3
+    await app.s3.deleteFile(doc.s3_key).catch((s3Err: unknown) => {
+      request.log.error({ err: s3Err, s3Key: doc.s3_key }, 'falha ao remover arquivo do S3');
     });
 
-    const auditLogger = new AuditLogger(db);
+    const auditLogger = new AuditLogger(sql);
     try {
       await auditLogger.record({
         tenantId,
         userId,
         action: 'document.delete',
         resource: `documents/${doc.id}`,
-        metadata: { filename: doc.filename, s3Key: doc.s3Key },
+        metadata: { filename: doc.filename, s3Key: doc.s3_key },
       });
     } catch (auditError) {
       request.log.error(
@@ -1427,35 +1245,22 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
   // =========================================================================
   // POST /documents/:id/reprocess — reenfileira job para documento FAILED
   // =========================================================================
-  /**
-   * POST /documents/:id/reprocess
-   *
-   * Reenfileira o job de processamento de um documento que está em status FAILED.
-   * Limpa document_content e chunks anteriores para forçar re-extração completa
-   * (caso contrário a guarda de idempotência no worker retorna o conteúdo antigo).
-   *
-   * Permissão: TENANT_ADMIN/SUPER_ADMIN sempre; UPLOADER precisa de canWrite no departamento.
-   * Spec §8 fase 5, entregável 38.
-   */
   app.post('/documents/:id/reprocess', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
     const role = request.user!.role;
-    const db = app.db;
+    const sql = app.db;
 
     const { id } = request.params as { id: string };
 
-    // SUPER_ADMIN: busca sem filtro de tenant (resolve pelo documento).
-    // MULTI_TENANT_ADMIN: restringe à lista allowedTenantIds.
-    // Demais roles: busca escopada ao tenant do JWT.
-    let doc: DocumentDoc | null;
+    let doc: DocumentRow | null;
 
     if (role === 'SUPER_ADMIN') {
-      doc = await findDocumentGlobally(db, id);
+      doc = await findDocumentGlobally(sql, id);
     } else if (role === 'MULTI_TENANT_ADMIN') {
-      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
-      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
       doc = await repo.findById(id);
     }
 
@@ -1470,19 +1275,19 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       });
     }
 
-    const tenantId = doc.tenantId;
-    const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+    const tenantId = doc.tenant_id;
+    const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
 
-    await assertCanWriteDepartment(db, userId, tenantId, doc.departmentId, role);
+    await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
 
-    // Limpa conteúdo anterior para forçar re-extração completa no worker
-    await db.collection('document_content').deleteOne({ documentId: id, tenantId });
-    await db.collection('chunks').deleteMany({ documentId: id, tenantId });
+    // Limpa conteúdo anterior
+    await sql`DELETE FROM document_content WHERE document_id = ${id} AND tenant_id = ${tenantId}`;
+    await sql`DELETE FROM chunks WHERE document_id = ${id} AND tenant_id = ${tenantId}`;
 
     const updated = await repo.updateById(id, {
       status: 'PENDING',
-      failureReason: null,
-    } as Partial<Omit<DocumentDoc, 'id' | 'tenantId' | 'deleted'>>);
+      failure_reason: null,
+    } as Partial<Omit<DocumentRow, 'id' | 'tenantId' | 'deleted'>>);
 
     if (!updated) {
       throw new NotFoundError('Documento não encontrado');
@@ -1491,8 +1296,8 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const jobData: DocumentProcessingJobData = DocumentProcessingJobDataSchema.parse({
       tenantId,
       documentId: doc.id,
-      s3Key: doc.s3Key,
-      mimeType: doc.mimeType,
+      s3Key: doc.s3_key,
+      mimeType: doc.mime_type,
     });
 
     if (app.queue !== null) {
@@ -1507,14 +1312,14 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       );
     }
 
-    const auditLogger = new AuditLogger(db);
+    const auditLogger = new AuditLogger(sql);
     try {
       await auditLogger.record({
         tenantId,
         userId,
         action: 'document.reprocess',
         resource: `documents/${doc.id}`,
-        metadata: { previousFailureReason: doc.failureReason },
+        metadata: { previousFailureReason: doc.failure_reason },
       });
     } catch (auditError) {
       request.log.error(
@@ -1528,35 +1333,28 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       'documento reenfileirado para reprocessamento'
     );
 
-    return reply.status(202).send(updated);
+    return reply.status(202).send(rowToDocument(updated as DocumentRow));
   });
 
   // =========================================================================
   // GET /documents/:id/status-stream — SSE de status de processamento
   // =========================================================================
-  /**
-   * GET /documents/:id/status-stream
-   *
-   * Abre um stream SSE que emite o status atual do documento a cada 2 segundos.
-   * Fecha automaticamente quando o status atinge um estado terminal (READY ou FAILED).
-   * O cliente deve fechar a conexão caso abandone a página antes disso.
-   */
   app.get('/documents/:id/status-stream', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
     const role = request.user!.role;
-    const db = app.db;
+    const sql = app.db;
 
     const { id } = request.params as { id: string };
 
-    let doc: DocumentDoc | null;
+    let doc: DocumentRow | null;
 
     if (role === 'SUPER_ADMIN') {
-      doc = await findDocumentGlobally(db, id);
+      doc = await findDocumentGlobally(sql, id);
     } else if (role === 'MULTI_TENANT_ADMIN') {
-      doc = await findDocumentInTenants(db, id, request.user?.allowedTenantIds ?? []);
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
     } else {
       const tenantId = request.tenantId as string;
-      const repo = new TenantRepository<DocumentDoc>(db.collection('documents'), { tenantId });
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
       doc = await repo.findById(id);
     }
 
@@ -1564,13 +1362,12 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       throw new NotFoundError('Documento não encontrado');
     }
 
-    await assertCanReadDepartment(db, userId, doc.tenantId, doc.departmentId, role);
+    await assertCanReadDepartment(sql, userId, doc.tenant_id, doc.department_id, role);
 
-    const tenantId = doc.tenantId;
+    const tenantId = doc.tenant_id;
 
     reply.hijack();
 
-    // @fastify/cors é bypassado pelo hijack — headers CORS precisam ser setados manualmente.
     const origin = (request.headers['origin'] as string | undefined) ?? '*';
     reply.raw.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -1587,16 +1384,19 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       `event: status\ndata: ${JSON.stringify(data)}\n\n`;
 
     const sendStatus = async (): Promise<boolean> => {
-      const current = await db.collection<DocumentDoc>('documents').findOne(
-        { id, tenantId },
-        { projection: { status: 1, failureReason: 1 } }
-      );
+      const rows = await sql<Array<{ status: string; failure_reason: string | null }>>`
+        SELECT status, failure_reason
+        FROM documents
+        WHERE id = ${id}
+          AND tenant_id = ${tenantId}
+        LIMIT 1
+      `;
+      const current = rows[0];
       if (!current) return true;
-      reply.raw.write(formatSSE({ status: current.status, failureReason: current.failureReason ?? null }));
+      reply.raw.write(formatSSE({ status: current.status, failureReason: current.failure_reason ?? null }));
       return TERMINAL.has(current.status);
     };
 
-    // Envia status imediatamente e encerra se já for terminal
     const alreadyDone = await sendStatus();
     if (alreadyDone) {
       reply.raw.end();
@@ -1612,7 +1412,6 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       });
     }, 2000);
 
-    // Limpa o intervalo se o cliente fechar a conexão antes do término
     reply.raw.on('close', () => {
       clearInterval(interval);
     });

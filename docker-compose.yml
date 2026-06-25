@@ -2,17 +2,19 @@ name: dmdoc-backend
 
 services:
   # ---------------- Infraestrutura ----------------
-  mongodb:
-    # OBRIGATÓRIO: imagem Atlas Local — suporta $vectorSearch, $search e $rankFusion.
-    # NÃO usar a imagem padrão `mongo`, que não tem esses operadores.
-    image: mongodb/mongodb-atlas-local:latest
-    container_name: dmdoc-mongodb
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: dmdoc-postgres
     ports:
-      - '27017:27017'
+      - '5432:5432'
     volumes:
-      - mongodb_data:/data/db
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: dmdoc
+      POSTGRES_PASSWORD: dmdoc
+      POSTGRES_DB: dmdoc
     healthcheck:
-      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.runCommand('ping').ok"]
+      test: ['CMD-SHELL', 'pg_isready -U dmdoc -d dmdoc']
       interval: 10s
       timeout: 10s
       retries: 5
@@ -34,19 +36,13 @@ services:
 
   # Microserviço de extração de texto (Python) — unifica TODOS os formatos:
   # PyMuPDF (PDF), python-docx (DOCX), openpyxl (XLSX), python-pptx (PPTX) e
-  # EasyOCR para scans/imagens (RG, CNH, certificados). Comunicação via fila Redis
+  # Tesseract para scans/imagens (RG, CNH, certificados). Comunicação via fila Redis
   # (BRPOP extract:requests → download S3 → RPUSH extract:result:{id}) — sem timeout HTTP.
   extractor:
     build:
       context: ./services/extractor
     container_name: dmdoc-extractor
     environment:
-      # CPUs antigas (ex.: i3 3ª geração / Ivy Bridge) têm AVX mas NÃO têm AVX2/FMA.
-      # O PyTorch (via EasyOCR) usa kernels AVX2/FMA por padrão e quebra com SIGILL
-      # (exit 132 / "Illegal instruction"). O torch só aceita 'default', 'avx2' ou
-      # 'avx512' aqui — 'default' força o baseline (sem AVX2), única opção que roda
-      # nessas CPUs. Mais lento no OCR, porém universal.
-      ATEN_CPU_CAPABILITY: default
       EXTRACT_TIMEOUT_S: '480'
       REDIS_URL: redis://redis:6379
       S3_ENDPOINT: http://minio:9000
@@ -116,7 +112,13 @@ services:
       - backend_api_nm:/app/apps/api/node_modules
       - backend_worker_nm:/app/apps/worker/node_modules
       - backend_shared_nm:/app/packages/shared-types/node_modules
-    command: sh -c "corepack enable && pnpm install && pnpm --filter @dmdoc/shared-types build"
+    command: >
+      sh -c "corepack enable && pnpm install &&
+        pnpm --filter @dmdoc/shared-types build &&
+        pnpm --filter @dmdoc/extractor build &&
+        pnpm --filter @dmdoc/llm-provider build &&
+        pnpm --filter @dmdoc/db-pg build &&
+        pnpm --filter @dmdoc/db-mongo build"
 
   # ---------------- API (hot-reload via tsx watch) ----------------
   api:
@@ -126,7 +128,7 @@ services:
     env_file:
       - ./.env
     environment:
-      MONGO_URI: mongodb://mongodb:27017?directConnection=true
+      DATABASE_URL: postgresql://dmdoc:dmdoc@postgres:5432/dmdoc
       REDIS_URL: redis://redis:6379
       S3_ENDPOINT: http://minio:9000
       # Endpoint público para assinar URLs de download/preview. minio:9000 é o host
@@ -151,7 +153,7 @@ services:
     depends_on:
       backend-install:
         condition: service_completed_successfully
-      mongodb:
+      postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -166,7 +168,7 @@ services:
     env_file:
       - ./.env
     environment:
-      MONGO_URI: mongodb://mongodb:27017?directConnection=true
+      DATABASE_URL: postgresql://dmdoc:dmdoc@postgres:5432/dmdoc
       REDIS_URL: redis://redis:6379
       S3_ENDPOINT: http://minio:9000
       AWS_ACCESS_KEY_ID: minioadmin
@@ -174,7 +176,7 @@ services:
       AWS_S3_BUCKET: dmdoc-documents
       AWS_REGION: us-east-1
       S3_FORCE_PATH_STYLE: 'true'
-      EXTRACT_BLPOP_TIMEOUT_SECS: '7200'
+      EXTRACT_BLPOP_TIMEOUT_SECS: '900'
       CHOKIDAR_USEPOLLING: 'true'
     volumes:
       - .:/app
@@ -193,7 +195,7 @@ services:
         condition: service_started
 
 volumes:
-  mongodb_data:
+  postgres_data:
   redis_data:
   minio_data:
   backend_root_nm:

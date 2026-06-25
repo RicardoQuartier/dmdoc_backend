@@ -31,10 +31,43 @@ Executados na raiz do monorepo (`dmdoc_backend/`).
 
 ## Banco de dados
 
-### Índices
+### PostgreSQL (`@dmdoc/db-pg`)
+
+#### Migrations
 
 ```bash
-# Cria todos os índices necessários (regular + Atlas Search + Vector Search)
+# Aplica todas as migrations pendentes
+pnpm --filter db-pg migrate
+
+# Drop completo do schema + re-aplica migrations do zero (apenas dev)
+pnpm --filter db-pg migrate:fresh
+```
+
+> **Banco criado fora do drizzle-kit** (sem histórico de migrations): rode o bootstrap uma vez antes do `migrate`.
+> ```bash
+> pnpm --filter db-pg tsx src/bootstrap-migrations.ts
+> ```
+
+#### Seed e reset
+
+```bash
+# Popula com dados iniciais de desenvolvimento
+pnpm --filter db-pg seed
+
+# Trunca todas as tabelas e re-popula com seed (mantém schema)
+pnpm --filter db-pg db:fresh
+```
+
+---
+
+### MongoDB (`@dmdoc/db-mongo`)
+
+#### Índices
+
+Os índices MongoDB **não estão nas migrations** — precisam ser criados separadamente após o primeiro deploy ou migrate:fresh.
+
+```bash
+# Cria todos os índices (regulares + Atlas Search + Vector Search) — recomendado
 pnpm --filter @dmdoc/db-mongo setup-indexes
 
 # Apenas índices regulares (compound, unique, etc.)
@@ -44,12 +77,14 @@ pnpm --filter @dmdoc/db-mongo create-indexes
 pnpm --filter @dmdoc/db-mongo create-atlas-indexes
 ```
 
+> Todos os comandos são idempotentes — podem ser rodados múltiplas vezes sem efeito colateral.
+
 > Em produção passe `MONGO_URI` explicitamente:
 > ```bash
 > MONGO_URI="mongodb+srv://..." pnpm --filter @dmdoc/db-mongo setup-indexes
 > ```
 
-### Seed e reset
+#### Seed e reset
 
 ```bash
 # Popula o banco com dados iniciais de desenvolvimento

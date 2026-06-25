@@ -27,5 +27,9 @@ export function createDocumentProcessingQueue(
 ): Queue<DocumentProcessingJobData> {
   return new Queue<DocumentProcessingJobData>(DOCUMENT_PROCESSING_QUEUE, {
     connection,
+    defaultJobOptions: {
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 5000 },
+    },
   });
 }

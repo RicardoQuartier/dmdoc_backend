@@ -1,11 +1,11 @@
 import OpenAI from 'openai';
 import { z } from 'zod';
 import type { FastifyPluginAsync, FastifyReply, FastifyBaseLogger } from 'fastify';
-import type { Db } from 'mongodb';
+import type { Sql } from '@dmdoc/db-pg';
 import { SearchRequestSchema } from '@dmdoc/shared-types';
 import type { SearchChunk, Citation } from '@dmdoc/shared-types';
-import { hybridSearch, lexicalSearch, vectorSearch, documentMetadataSearch } from '@dmdoc/db-mongo';
-import type { ChunkSearchResult } from '@dmdoc/db-mongo';
+import { hybridSearch, lexicalSearch, vectorSearch, documentMetadataSearch } from '@dmdoc/db-pg';
+import type { ChunkSearchResult } from '@dmdoc/db-pg';
 import { createLLMProvider } from '@dmdoc/llm-provider';
 import type { LLMProvider } from '@dmdoc/llm-provider';
 import type { Config } from '../config.js';
@@ -19,24 +19,21 @@ import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 // Tipos locais
 // ---------------------------------------------------------------------------
 
-interface DocumentDoc {
+type DocRow = {
   id: string;
-  tenantId: string;
-  departmentId: string;
-  documentTypeId: string | null;
+  tenant_id: string;
+  department_id: string;
+  document_type_id: string | null;
   tags: string[];
-  indexValues: Record<string, string | number | Date | null>;
+  index_values: Record<string, string | number | null> | null;
   status: string;
   deleted: boolean;
-}
+};
 
 // ---------------------------------------------------------------------------
 // Helpers de filtros estruturados
 // ---------------------------------------------------------------------------
 
-/**
- * Parâmetros de filtros estruturados (tipagem alinhada com exactOptionalPropertyTypes).
- */
 interface StructuredFilters {
   departmentIds?: string[] | undefined;
   documentTypeIds?: string[] | undefined;
@@ -54,20 +51,24 @@ interface StructuredFilters {
 }
 
 /**
- * Aplica filtros estruturados na coleção `documents` e retorna os documentIds
+ * Aplica filtros estruturados na tabela `documents` e retorna os documentIds
  * que passam. Retorna `null` quando não há filtros (sem restrição por documentId).
  *
- * Aceita `tenantId` (string — mode 'single') ou `tenantIds` (string[] — mode
- * 'allowed', MULTI_TENANT_ADMIN). Para mode 'all' ambos são undefined.
- *
- * spec §9 etapa 4.
+ * Filtros JSONB para indexValues (spec §9 etapa 4 + §7 search):
+ *   - TEXT/eq:   index_values->>'campo' = $val
+ *   - NUMBER/gte: (index_values->>'campo')::numeric >= $val
+ *   - NUMBER/lte: (index_values->>'campo')::numeric <= $val
+ *   - DATE/gte:  (index_values->>'campo')::timestamptz >= $val
+ *   - DATE/lte:  (index_values->>'campo')::timestamptz <= $val
+ *   - tags:      tags @> $tags::text[]
+ *   - documentTypeIds: document_type_id = ANY($ids::uuid[])
  */
 async function resolveFilteredDocumentIds(
-  db: Db,
+  sql: Sql,
   tenantId: string | undefined,
   tenantIds: string[] | undefined,
   allowedDepartmentIds: string[] | null,
-  filters: StructuredFilters | undefined
+  filters: StructuredFilters | undefined,
 ): Promise<string[] | null> {
   const hasStructuredFilters =
     filters !== undefined &&
@@ -80,56 +81,82 @@ async function resolveFilteredDocumentIds(
     return null;
   }
 
-  type DocFilter = Record<string, unknown>;
-  const filter: DocFilter = { deleted: false, status: 'READY' };
+  // Construção dinâmica de WHERE com sql.unsafe + parâmetros
+  const conditions: string[] = [`d.deleted = false`, `d.status = 'READY'`];
+  const params: unknown[] = [];
+  let paramIdx = 1;
 
-  // Injeta filtro de tenant conforme o modo de contexto
+  const addParam = (val: unknown): string => {
+    params.push(val);
+    return `$${paramIdx++}`;
+  };
+
+  // Filtro de tenant
   if (tenantIds !== undefined && tenantIds.length > 0) {
-    filter['tenantId'] = { $in: tenantIds };
+    conditions.push(`d.tenant_id = ANY(${addParam(tenantIds)}::uuid[])`);
   } else if (tenantId !== undefined) {
-    filter['tenantId'] = tenantId;
+    conditions.push(`d.tenant_id = ${addParam(tenantId)}`);
   }
 
+  // Filtro de departamentos
   if (filters?.departmentIds !== undefined) {
     const requested = filters.departmentIds;
+    let effective: string[];
     if (allowedDepartmentIds !== null) {
-      const allowed = requested.filter((id) => allowedDepartmentIds.includes(id));
-      if (allowed.length === 0) return [];
-      filter['departmentId'] = { $in: allowed };
+      effective = requested.filter((id) => allowedDepartmentIds.includes(id));
+      if (effective.length === 0) return [];
     } else {
-      filter['departmentId'] = { $in: requested };
+      effective = requested;
     }
+    conditions.push(`d.department_id = ANY(${addParam(effective)}::uuid[])`);
   } else if (allowedDepartmentIds !== null) {
-    filter['departmentId'] = { $in: allowedDepartmentIds };
+    conditions.push(`d.department_id = ANY(${addParam(allowedDepartmentIds)}::uuid[])`);
   }
 
+  // Filtro de documentTypeIds: = ANY($ids::uuid[])
   if (filters?.documentTypeIds !== undefined && filters.documentTypeIds.length > 0) {
-    filter['documentTypeId'] = { $in: filters.documentTypeIds };
+    conditions.push(`d.document_type_id = ANY(${addParam(filters.documentTypeIds)}::uuid[])`);
   }
 
+  // Filtro de tags: tags @> $tags::text[] (contém TODOS)
   if (filters?.tags !== undefined && filters.tags.length > 0) {
-    filter['tags'] = { $all: filters.tags };
+    conditions.push(`d.tags @> ${addParam(filters.tags)}::text[]`);
   }
 
+  // Filtros de indexValues (JSONB)
   if (filters?.indexFilters !== undefined) {
-    for (const [fieldName, conditions] of Object.entries(filters.indexFilters)) {
-      const fieldConditions: Record<string, unknown> = {};
-      if (conditions.gte !== undefined) fieldConditions['$gte'] = conditions.gte;
-      if (conditions.lte !== undefined) fieldConditions['$lte'] = conditions.lte;
-      if (conditions.eq !== undefined) fieldConditions['$eq'] = conditions.eq;
-      if (Object.keys(fieldConditions).length > 0) {
-        filter[`indexValues.${fieldName}`] = fieldConditions;
+    for (const [fieldName, conditions_] of Object.entries(filters.indexFilters)) {
+      if (conditions_.eq !== undefined) {
+        conditions.push(`d.index_values->>${addParam(fieldName)} = ${addParam(String(conditions_.eq))}`);
+      }
+      if (conditions_.gte !== undefined) {
+        const val = conditions_.gte;
+        if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val)) {
+          // DATE
+          conditions.push(`(d.index_values->>${addParam(fieldName)})::timestamptz >= ${addParam(val)}::timestamptz`);
+        } else {
+          // NUMBER
+          conditions.push(`(d.index_values->>${addParam(fieldName)})::numeric >= ${addParam(val)}`);
+        }
+      }
+      if (conditions_.lte !== undefined) {
+        const val = conditions_.lte;
+        if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val)) {
+          // DATE
+          conditions.push(`(d.index_values->>${addParam(fieldName)})::timestamptz <= ${addParam(val)}::timestamptz`);
+        } else {
+          // NUMBER
+          conditions.push(`(d.index_values->>${addParam(fieldName)})::numeric <= ${addParam(val)}`);
+        }
       }
     }
   }
 
-  const docs = await db
-    .collection<DocumentDoc>('documents')
-    .find(filter)
-    .project<{ id: string }>({ id: 1 })
-    .toArray();
+  const whereClause = conditions.join(' AND ');
+  const query = `SELECT d.id FROM documents d WHERE ${whereClause}`;
 
-  return docs.map((d) => d.id);
+  const rows = await sql.unsafe<Array<{ id: string }>>(query, params as Parameters<typeof sql.unsafe>[1]);
+  return rows.map((r) => r.id);
 }
 
 // ---------------------------------------------------------------------------
@@ -141,30 +168,16 @@ export interface SearchRoutesOptions {
 }
 
 /**
- * Rotas de Busca RAG — Fase 4.
- *
- * `POST /search` — busca híbrida (lexical + vetorial) com geração opcional
- * de resposta via LLM. Suporta dois modos de resposta:
- *
- * - `generateAnswer: false` → resposta JSON síncrona com chunks relevantes.
- * - `generateAnswer: true`  → resposta SSE com streaming de texto + metadados
- *   finais (citações, custo, chunks) no evento `done`.
- *
- * Recebe `config` por opção para não chamar `getConfig()` no momento do
- * registro — isso permite que os testes injetem config sem variáveis reais.
- *
- * Spec §9 — Pipeline de busca RAG.
+ * Rotas de Busca RAG — Fase 4 (PostgreSQL).
  */
 export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app, options) => {
   const { config } = options;
 
-  // Cliente OpenAI para embeddings (sempre OpenAI, não OpenRouter)
   const openaiClient = new OpenAI({
     apiKey: config.OPENAI_API_KEY || 'sk-placeholder',
     baseURL: 'https://api.openai.com/v1',
   });
 
-  // LLM provider para geração de resposta (pode ser OpenAI ou OpenRouter)
   const llmProvider = createLLMProvider(
     {
       provider: config.LLM_PROVIDER,
@@ -172,56 +185,43 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
       apiKey: config.LLM_API_KEY || 'placeholder',
       model: config.LLM_MODEL,
     },
-    app.log
+    app.log,
   );
 
-  // =========================================================================
-  // POST /search
-  // =========================================================================
   app.post('/search', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
     const role = request.user!.role;
-    const db = app.db;
+    const sql = app.db;
 
-    // ------------------------------------------------------------------
-    // 1. Validar body e resolver contexto de tenant
-    // ------------------------------------------------------------------
     const body = SearchRequestSchema.parse(request.body);
 
-    const { tenantId: tenantIdParam } = z.object({ tenantId: z.string().uuid().optional() }).parse(request.query);
+    const { tenantId: tenantIdParam } = z
+      .object({ tenantId: z.string().uuid().optional() })
+      .parse(request.query);
     const context = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: false });
     const { query, searchMode, filters, topK, generateAnswer } = body;
 
-    // tenantId / tenantIds para os pipelines de busca conforme o mode
     const singleTenantId = context.mode === 'single' ? context.tenantId : undefined;
     const multiTenantIds = context.mode === 'allowed' ? context.tenantIds : undefined;
 
-    // Para logs: usa o tenantId singular quando disponível
-    const logTenantId = singleTenantId ?? (multiTenantIds ? `[${multiTenantIds.join(',')}]` : 'all');
+    const logTenantId =
+      singleTenantId ?? (multiTenantIds ? `[${multiTenantIds.join(',')}]` : 'all');
     const log = request.log.child({ tenantId: logTenantId, userId, traceId: request.id });
 
-    // ------------------------------------------------------------------
-    // 2. Resolver departamentos acessíveis (ACL por raiz com herança dinâmica)
-    //    spec §9 etapa 1 — TENANT_ADMIN/SUPER_ADMIN/MTA: sem restrição (null)
-    //    UPLOADER/USER: subárvore expandida das raízes concedidas no tenant do JWT
-    // ------------------------------------------------------------------
     let allowedDepartmentIds = await resolveAccessibleDepartmentIds(
-      db,
+      sql,
       userId,
       singleTenantId ?? null,
-      role
+      role,
     );
 
-    // Se o request filtra por departamentos específicos, interseccionar
     if (filters?.departmentIds !== undefined && filters.departmentIds.length > 0) {
       if (allowedDepartmentIds !== null) {
         const intersection = filters.departmentIds.filter((id) =>
-          (allowedDepartmentIds as string[]).includes(id)
+          (allowedDepartmentIds as string[]).includes(id),
         );
         if (intersection.length === 0) {
-          if (generateAnswer) {
-            return sendEmptySSE(reply, log);
-          }
+          if (generateAnswer) return sendEmptySSE(reply, log);
           return reply.status(200).send({ answer: null, citations: [], chunks: [], costUsd: 0 });
         }
         allowedDepartmentIds = intersection;
@@ -230,29 +230,21 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
       }
     }
 
-    // ------------------------------------------------------------------
-    // 3. Aplicar filtros estruturados → documentIds (spec §9 etapa 4)
-    // ------------------------------------------------------------------
     const filterDocumentIds = await resolveFilteredDocumentIds(
-      db,
+      sql,
       singleTenantId,
       multiTenantIds,
       allowedDepartmentIds,
-      filters
+      filters as StructuredFilters | undefined,
     );
 
     if (filterDocumentIds !== null && filterDocumentIds.length === 0) {
-      if (generateAnswer) {
-        return sendEmptySSE(reply, log);
-      }
+      if (generateAnswer) return sendEmptySSE(reply, log);
       return reply.status(200).send({ answer: null, citations: [], chunks: [], costUsd: 0 });
     }
 
-    // ------------------------------------------------------------------
-    // 4. Inicia busca por metadados em paralelo (não bloqueia o embedding)
-    //    Busca originalFilename e tags na coleção documents.
-    // ------------------------------------------------------------------
-    const metadataSearchPromise = documentMetadataSearch(db, {
+    // Busca por metadados em paralelo
+    const metadataSearchPromise = documentMetadataSearch(sql, {
       ...(singleTenantId !== undefined ? { tenantId: singleTenantId } : {}),
       ...(multiTenantIds !== undefined ? { tenantIds: multiTenantIds } : {}),
       allowedDepartmentIds,
@@ -260,9 +252,6 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
       queryText: query,
     });
 
-    // ------------------------------------------------------------------
-    // 5. Embedding da query — apenas quando searchMode exige vetorial
-    // ------------------------------------------------------------------
     let embeddingCostUsd = 0;
     let queryEmbedding: number[] | null = null;
 
@@ -272,9 +261,6 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
       embeddingCostUsd = result.costUsd;
     }
 
-    // ------------------------------------------------------------------
-    // 6. Busca por conteúdo — modo selecionado via searchMode (spec §9 etapa 3)
-    // ------------------------------------------------------------------
     const baseParams = {
       ...(singleTenantId !== undefined ? { tenantId: singleTenantId } : {}),
       ...(multiTenantIds !== undefined ? { tenantIds: multiTenantIds } : {}),
@@ -283,93 +269,112 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
       ...(filterDocumentIds !== null ? { filterDocumentIds } : {}),
     };
 
-    let searchResults;
+    let searchResults: ChunkSearchResult[];
 
     if (searchMode === 'lexical') {
-      searchResults = await lexicalSearch(db, { ...baseParams, queryText: query });
+      searchResults = await lexicalSearch(sql, { ...baseParams, queryText: query });
     } else if (searchMode === 'vector') {
-      searchResults = await vectorSearch(db, {
+      searchResults = await vectorSearch(sql, {
         ...baseParams,
         queryEmbedding: queryEmbedding as number[],
       });
     } else {
-      try {
-        searchResults = await hybridSearch(db, {
-          ...baseParams,
-          queryText: query,
-          queryEmbedding: queryEmbedding as number[],
-        });
-      } catch (err: unknown) {
-        // $rankFusion / rankFusionScore não disponível neste MongoDB — degrada para lexical
-        const msg = err instanceof Error ? err.message : '';
-        if (msg.includes('rankFusionScore') || msg.includes('$rankFusion') || msg.includes('Unsupported $meta')) {
-          log.warn({ err: msg }, '$rankFusion indisponível, usando lexical como fallback');
-          searchResults = await lexicalSearch(db, { ...baseParams, queryText: query });
-        } else {
-          throw err;
-        }
-      }
+      // Hybrid — PostgreSQL usa RRF nativo, sem fallback necessário
+      searchResults = await hybridSearch(sql, {
+        ...baseParams,
+        queryText: query,
+        queryEmbedding: queryEmbedding as number[],
+      });
     }
 
     log.info({ returned: searchResults.length, topK, searchMode }, 'busca por conteúdo concluída');
 
-    // ------------------------------------------------------------------
-    // 7. Mescla com resultados de busca por metadados (nome + tags)
-    //    Documentos encontrados por metadado que já aparecem nos chunks
-    //    de conteúdo são ignorados (sem duplicatas).
-    // ------------------------------------------------------------------
+    // Mescla com resultados de busca por metadados
     const metadataDocIds = await metadataSearchPromise;
     const contentDocIds = new Set(searchResults.map((r) => r.documentId));
     const metadataOnlyDocIds = metadataDocIds.filter((id) => !contentDocIds.has(id)).slice(0, 5);
 
     let metadataChunks: ChunkSearchResult[] = [];
     if (metadataOnlyDocIds.length > 0) {
-      const chunkFilter: Record<string, unknown> = { documentId: { $in: metadataOnlyDocIds } };
-      if (multiTenantIds !== undefined) {
-        chunkFilter['tenantId'] = { $in: multiTenantIds };
-      } else if (singleTenantId !== undefined) {
-        chunkFilter['tenantId'] = singleTenantId;
-      }
-      if (allowedDepartmentIds !== null) {
-        chunkFilter['departmentId'] = { $in: allowedDepartmentIds };
-      }
-
-      interface RawChunkDoc {
-        documentId: string;
-        tenantId: string;
-        departmentId: string;
-        documentTypeName: string | null;
-        pageNumber: number | null;
-        chunkIndex: number;
+      // Busca chunks da tabela SQL para documentos encontrados por metadado
+      type RawChunkRow = {
+        document_id: string;
+        tenant_id: string;
+        department_id: string;
+        document_type_name: string | null;
+        page_number: number | null;
+        chunk_index: number;
         text: string;
-        tokenCount: number;
-      }
+        token_count: number;
+      };
 
-      const rawChunks = await db
-        .collection<RawChunkDoc>('chunks')
-        .find(chunkFilter)
-        .sort({ chunkIndex: 1 })
-        .project<RawChunkDoc>({
-          _id: 0,
-          documentId: 1,
-          tenantId: 1,
-          departmentId: 1,
-          documentTypeName: 1,
-          pageNumber: 1,
-          chunkIndex: 1,
-          text: 1,
-          tokenCount: 1,
-        })
-        .toArray();
+      let chunkRows: RawChunkRow[];
+
+      if (multiTenantIds !== undefined) {
+        if (allowedDepartmentIds !== null) {
+          chunkRows = await sql<RawChunkRow[]>`
+            SELECT document_id, tenant_id, department_id, document_type_name, page_number, chunk_index, text, token_count
+            FROM chunks
+            WHERE document_id = ANY(${metadataOnlyDocIds}::uuid[])
+              AND tenant_id = ANY(${multiTenantIds}::uuid[])
+              AND department_id = ANY(${allowedDepartmentIds}::uuid[])
+            ORDER BY chunk_index ASC
+          `;
+        } else {
+          chunkRows = await sql<RawChunkRow[]>`
+            SELECT document_id, tenant_id, department_id, document_type_name, page_number, chunk_index, text, token_count
+            FROM chunks
+            WHERE document_id = ANY(${metadataOnlyDocIds}::uuid[])
+              AND tenant_id = ANY(${multiTenantIds}::uuid[])
+            ORDER BY chunk_index ASC
+          `;
+        }
+      } else if (singleTenantId !== undefined) {
+        if (allowedDepartmentIds !== null) {
+          chunkRows = await sql<RawChunkRow[]>`
+            SELECT document_id, tenant_id, department_id, document_type_name, page_number, chunk_index, text, token_count
+            FROM chunks
+            WHERE document_id = ANY(${metadataOnlyDocIds}::uuid[])
+              AND tenant_id = ${singleTenantId}
+              AND department_id = ANY(${allowedDepartmentIds}::uuid[])
+            ORDER BY chunk_index ASC
+          `;
+        } else {
+          chunkRows = await sql<RawChunkRow[]>`
+            SELECT document_id, tenant_id, department_id, document_type_name, page_number, chunk_index, text, token_count
+            FROM chunks
+            WHERE document_id = ANY(${metadataOnlyDocIds}::uuid[])
+              AND tenant_id = ${singleTenantId}
+            ORDER BY chunk_index ASC
+          `;
+        }
+      } else {
+        chunkRows = await sql<RawChunkRow[]>`
+          SELECT document_id, tenant_id, department_id, document_type_name, page_number, chunk_index, text, token_count
+          FROM chunks
+          WHERE document_id = ANY(${metadataOnlyDocIds}::uuid[])
+          ORDER BY chunk_index ASC
+        `;
+      }
 
       const seenDocIds = new Set<string>();
-      metadataChunks = rawChunks
+      metadataChunks = chunkRows
         .filter((c) => {
-          if (seenDocIds.has(c.documentId)) return false;
-          seenDocIds.add(c.documentId);
+          if (seenDocIds.has(c.document_id)) return false;
+          seenDocIds.add(c.document_id);
           return true;
         })
-        .map((c) => ({ ...c, score: 0 }));
+        .map((c) => ({
+          documentId: c.document_id,
+          tenantId: c.tenant_id,
+          departmentId: c.department_id,
+          documentTypeName: c.document_type_name,
+          pageNumber: c.page_number,
+          chunkIndex: c.chunk_index,
+          text: c.text,
+          tokenCount: c.token_count,
+          score: 0,
+        }));
 
       if (metadataChunks.length > 0) {
         log.info({ metadataMatched: metadataChunks.length }, 'chunks adicionados via busca por metadados');
@@ -378,15 +383,19 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
 
     const allSearchResults = [...searchResults, ...metadataChunks];
 
-    // Enriquece chunks com o nome original do documento (originalFilename)
+    // Enriquece chunks com o nome original do documento
     const uniqueDocIds = [...new Set(allSearchResults.map((r) => r.documentId))];
-    const docDocs = uniqueDocIds.length > 0
-      ? await db.collection('documents')
-          .find({ id: { $in: uniqueDocIds } })
-          .project<{ id: string; originalFilename: string }>({ _id: 0, id: 1, originalFilename: 1 })
-          .toArray()
-      : [];
-    const docNameMap = new Map(docDocs.map((d) => [d.id, d.originalFilename]));
+
+    const docNameMap = new Map<string, string>();
+    if (uniqueDocIds.length > 0) {
+      const docRows = await sql<Array<{ id: string; original_filename: string }>>`
+        SELECT id, original_filename
+        FROM documents
+        WHERE id = ANY(${uniqueDocIds}::uuid[])
+          AND deleted = false
+      `;
+      for (const d of docRows) docNameMap.set(d.id, d.original_filename);
+    }
 
     const chunks: SearchChunk[] = allSearchResults.map((r) => ({
       documentId: r.documentId,
@@ -399,9 +408,6 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
       score: r.score,
     }));
 
-    // ------------------------------------------------------------------
-    // 8. Sem geração de resposta → retorno JSON síncrono
-    // ------------------------------------------------------------------
     if (!generateAnswer || chunks.length === 0) {
       log.info({ generateAnswer, chunksFound: chunks.length }, 'busca sem geração de resposta');
       return reply.status(200).send({
@@ -412,9 +418,6 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
       });
     }
 
-    // ------------------------------------------------------------------
-    // 9. Com geração de resposta → SSE streaming (spec §9 etapas 6-7)
-    // ------------------------------------------------------------------
     return generateSSEResponse(reply, {
       query,
       chunks,
@@ -444,7 +447,7 @@ async function sendEmptySSE(reply: FastifyReply, log: FastifyBaseLogger): Promis
   });
 
   reply.raw.write(
-    formatSSEEvent('done', { type: 'done', citations: [], chunks: [], costUsd: 0 })
+    formatSSEEvent('done', { type: 'done', citations: [], chunks: [], costUsd: 0 }),
   );
 
   reply.raw.end();
@@ -458,7 +461,7 @@ async function generateSSEResponse(
     llmProvider: LLMProvider;
     embeddingCostUsd: number;
     log: FastifyBaseLogger;
-  }
+  },
 ): Promise<void> {
   const { query, chunks, llmProvider, embeddingCostUsd, log } = params;
 
@@ -504,7 +507,7 @@ async function generateSSEResponse(
         citations,
         chunks,
         costUsd: embeddingCostUsd,
-      })
+      }),
     );
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Erro ao gerar resposta';

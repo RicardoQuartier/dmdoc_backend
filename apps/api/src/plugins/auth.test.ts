@@ -33,7 +33,7 @@ beforeAll(async () => {
     }
     return reply.status(500).send({ error: { code: 'INTERNAL_ERROR' } });
   });
-  await app.register(authPlugin, { config, db: testDb.db });
+  await app.register(authPlugin, { config, sql: testDb.db });
   app.get('/protected', { preHandler: app.authenticate }, async (request) => {
     return { user: request.user, tenantId: request.tenantId };
   });

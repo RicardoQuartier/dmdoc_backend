@@ -14,9 +14,11 @@ const EnvSchema = z.object({
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
     .default('info'),
 
-  // MongoDB
-  MONGO_URI: z.string().url().default('mongodb://localhost:27017'),
-  MONGO_DB: z.string().min(1).default('dmdoc'),
+  // PostgreSQL
+  DATABASE_URL: z
+    .string()
+    .url()
+    .default('postgresql://dmdoc:dmdoc@localhost:5432/dmdoc'),
 
   // AWS S3
   AWS_REGION: z.string().min(1).default('us-east-1'),
@@ -36,10 +38,10 @@ const EnvSchema = z.object({
   // extract:result:{requestId}. O worker aguarda via BLPOP sem timeout HTTP.
   /**
    * Timeout do BLPOP aguardando resultado de extração (segundos).
-   * Default 2h — cobre documentos grandes com OCR em CPU.
+   * Default 15min — job falha se o extractor não responder nesse prazo.
    * 0 bloqueia indefinidamente (não recomendado em produção).
    */
-  EXTRACT_BLPOP_TIMEOUT_SECS: z.coerce.number().int().nonnegative().default(7200),
+  EXTRACT_BLPOP_TIMEOUT_SECS: z.coerce.number().int().nonnegative().default(900),
 
   // Embeddings (sempre OpenAI, nunca OpenRouter)
   OPENAI_API_KEY: z.string().min(1).optional(),

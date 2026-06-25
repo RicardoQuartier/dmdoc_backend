@@ -13,14 +13,19 @@ export default defineConfig({
         import.meta.dirname,
         '../../packages/shared-types/src/index.ts'
       ),
-      '@dmdoc/db-mongo': path.resolve(
+      '@dmdoc/db-pg': path.resolve(
         import.meta.dirname,
-        '../../packages/db-mongo/src/index.ts'
+        '../../packages/db-pg/src/index.ts'
       ),
       '@dmdoc/extractor': path.resolve(
         import.meta.dirname,
         '../../packages/extractor/src/index.ts'
       ),
+    },
+  },
+  test: {
+    env: {
+      DATABASE_URL: 'postgresql://dmdoc:dmdoc@localhost:5432/dmdoc_test',
     },
   },
 });

@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
 import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
-import { newId } from '@dmdoc/db-mongo';
+import { newId } from '@dmdoc/db-pg';
 
 /**
  * Testes E2E das rotas de permissões por raiz (ACL, Fase 6).
@@ -33,19 +33,16 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db.collection('users').deleteMany({});
-  await testDb.db.collection('tenants').deleteMany({});
-  await testDb.db.collection('departments').deleteMany({});
-  await testDb.db.collection('department_permissions').deleteMany({});
+  await testDb.db`DELETE FROM department_permissions`;
+  await testDb.db`DELETE FROM departments`;
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','USER')`;
+  await testDb.db`DELETE FROM tenants WHERE id = ${TENANT_ID}`;
 
-  await testDb.db.collection('tenants').insertOne({
-    id: TENANT_ID,
-    name: 'Empresa A',
-    diskQuotaBytes: 10 * 1024 ** 3,
-    userQuota: 20,
-    active: true,
-    createdAt: new Date(),
-  });
+  await testDb.db`
+    INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+    VALUES (${TENANT_ID}, 'Empresa A', ${10 * 1024 ** 3}, 20, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   await seedUser(testDb.db, {
     id: ADMIN_ID,
@@ -81,28 +78,12 @@ async function login(email: string): Promise<string> {
 async function seedRootAndChild(): Promise<{ rootId: string; childId: string }> {
   const rootId = newId();
   const childId = newId();
-  await testDb.db.collection('departments').insertMany([
-    {
-      id: rootId,
-      tenantId: TENANT_ID,
-      parentId: null,
-      name: 'Financeiro (raiz)',
-      level: 0,
-      tags: [],
-      deleted: false,
-      createdAt: new Date(),
-    },
-    {
-      id: childId,
-      tenantId: TENANT_ID,
-      parentId: rootId,
-      name: 'Contas a Pagar (filho)',
-      level: 1,
-      tags: [],
-      deleted: false,
-      createdAt: new Date(),
-    },
-  ]);
+  await testDb.db`
+    INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+    VALUES
+      (${rootId}, ${TENANT_ID}, NULL, 'Financeiro (raiz)', 0, '{}'::text[], false, NOW()),
+      (${childId}, ${TENANT_ID}, ${rootId}, 'Contas a Pagar (filho)', 1, '{}'::text[], false, NOW())
+  `;
   return { rootId, childId };
 }
 
@@ -121,11 +102,8 @@ describe('PUT /users/:id/permissions — validação de raiz', () => {
     expect(res.json().error.code).toBe('VALIDATION_ERROR');
 
     // Nenhuma concessão deve ter sido persistida na rejeição.
-    const perms = await testDb.db
-      .collection('department_permissions')
-      .find({ userId: USER_ID })
-      .toArray();
-    expect(perms).toHaveLength(0);
+    const rows = await testDb.db`SELECT id FROM department_permissions WHERE user_id = ${USER_ID}`;
+    expect(rows).toHaveLength(0);
   });
 });
 

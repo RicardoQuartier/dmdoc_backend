@@ -5,7 +5,7 @@ import FormData from 'form-data';
 import { buildApp } from '../app.js';
 import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
 import type { S3Service } from '../services/s3.js';
-import { newId } from '@dmdoc/db-mongo';
+import { newId } from '@dmdoc/db-pg';
 
 // ---------------------------------------------------------------------------
 // Mock de S3Service — nunca chama AWS real nos testes
@@ -64,83 +64,44 @@ afterAll(async () => {
 beforeEach(async () => {
   vi.clearAllMocks();
 
-  // Limpar coleções
-  await testDb.db.collection('users').deleteMany({});
-  await testDb.db.collection('tenants').deleteMany({});
-  await testDb.db.collection('departments').deleteMany({});
-  await testDb.db.collection('document_types').deleteMany({});
-  await testDb.db.collection('department_permissions').deleteMany({});
-  await testDb.db.collection('documents').deleteMany({});
-  await testDb.db.collection('audit_logs').deleteMany({});
-  await testDb.db.collection('document_events').deleteMany({});
+  // Limpar tabelas (ordem FK-safe)
+  await testDb.db`DELETE FROM document_events`;
+  await testDb.db`DELETE FROM audit_logs`;
+  await testDb.db`DELETE FROM chunks`;
+  await testDb.db`DELETE FROM document_content`;
+  await testDb.db`DELETE FROM documents`;
+  await testDb.db`DELETE FROM department_permissions`;
+  await testDb.db`DELETE FROM document_types`;
+  await testDb.db`DELETE FROM departments`;
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','UPLOADER','USER')`;
+  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
 
   // Inserir tenants
-  await testDb.db.collection('tenants').insertMany([
-    {
-      id: TENANT_A,
-      name: 'Empresa A',
-      diskQuotaBytes: DISK_QUOTA,
-      userQuota: 20,
-      active: true,
-      createdAt: new Date(),
-    },
-    {
-      id: TENANT_B,
-      name: 'Empresa B',
-      diskQuotaBytes: DISK_QUOTA,
-      userQuota: 20,
-      active: true,
-      createdAt: new Date(),
-    },
-  ]);
+  await testDb.db`
+    INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+    VALUES
+      (${TENANT_A}, 'Empresa A', ${DISK_QUOTA}, 20, true, NOW()),
+      (${TENANT_B}, 'Empresa B', ${DISK_QUOTA}, 20, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   // Inserir departamentos
-  await testDb.db.collection('departments').insertMany([
-    {
-      id: DEPT_A_ID,
-      tenantId: TENANT_A,
-      parentId: null,
-      name: 'Financeiro A',
-      level: 0,
-      tags: [],
-      deleted: false,
-      createdAt: new Date(),
-    },
-    {
-      id: DEPT_B_ID,
-      tenantId: TENANT_B,
-      parentId: null,
-      name: 'Financeiro B',
-      level: 0,
-      tags: [],
-      deleted: false,
-      createdAt: new Date(),
-    },
-  ]);
+  await testDb.db`
+    INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+    VALUES
+      (${DEPT_A_ID}, ${TENANT_A}, NULL, 'Financeiro A', 0, '{}'::text[], false, NOW()),
+      (${DEPT_B_ID}, ${TENANT_B}, NULL, 'Financeiro B', 0, '{}'::text[], false, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   // Inserir tipos de documento
-  await testDb.db.collection('document_types').insertMany([
-    {
-      id: DOC_TYPE_ID,
-      tenantId: TENANT_A,
-      name: 'Contrato A',
-      description: null,
-      isGlobal: false,
-      indexFields: [],
-      deleted: false,
-      createdAt: new Date(),
-    },
-    {
-      id: GLOBAL_DOC_TYPE_ID,
-      tenantId: null,
-      name: 'Tipo Global',
-      description: null,
-      isGlobal: true,
-      indexFields: [],
-      deleted: false,
-      createdAt: new Date(),
-    },
-  ]);
+  await testDb.db`
+    INSERT INTO document_types (id, tenant_id, name, description, is_global, index_fields, deleted, created_at)
+    VALUES
+      (${DOC_TYPE_ID}, ${TENANT_A}, 'Contrato A', NULL, false, '[]'::jsonb, false, NOW()),
+      (${GLOBAL_DOC_TYPE_ID}, NULL, 'Tipo Global', NULL, true, '[]'::jsonb, false, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 
   // Inserir usuários
   await seedUser(testDb.db, {
@@ -166,13 +127,11 @@ beforeEach(async () => {
   });
 
   // Permissão de escrita do UPLOADER no departamento A
-  await testDb.db.collection('department_permissions').insertOne({
-    userId: UPLOADER_A_ID,
-    departmentId: DEPT_A_ID,
-    tenantId: TENANT_A,
-    canRead: true,
-    canWrite: true,
-  });
+  await testDb.db`
+    INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
+    VALUES (${UPLOADER_A_ID}, ${DEPT_A_ID}, ${TENANT_A}, true, true)
+    ON CONFLICT (user_id, department_id) DO NOTHING
+  `;
 
   // Obter tokens
   tokenAdminA = await login('admin-a@empresa.com');
@@ -261,7 +220,7 @@ describe('POST /documents — upload básico', () => {
     expect(res.statusCode).toBe(201);
   });
 
-  it('persiste documento no MongoDB com campos corretos', async () => {
+  it('persiste documento no banco com campos corretos', async () => {
     const content = Buffer.from('conteudo-especifico-para-validar-persistencia');
     const expectedHash = crypto.createHash('sha256').update(content).digest('hex');
     const { payload, headers } = buildUploadForm({ content, departmentId: DEPT_A_ID });
@@ -277,13 +236,16 @@ describe('POST /documents — upload básico', () => {
     const body = res.json() as Record<string, unknown>;
 
     // Verificar no banco
-    const doc = await testDb.db.collection('documents').findOne({ id: body.id });
-    expect(doc).not.toBeNull();
-    expect(doc?.tenantId).toBe(TENANT_A);
-    expect(doc?.status).toBe('PENDING');
-    expect(doc?.contentHash).toBe(expectedHash);
-    expect(doc?.uploadedById).toBe(ADMIN_A_ID);
-    expect(doc?.deleted).toBe(false);
+    const rows = await testDb.db<Array<Record<string, unknown>>>`
+      SELECT tenant_id, status, content_hash, uploaded_by_id, deleted
+      FROM documents WHERE id = ${body.id as string}
+    `;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.['tenant_id']).toBe(TENANT_A);
+    expect(rows[0]?.['status']).toBe('PENDING');
+    expect(rows[0]?.['content_hash']).toBe(expectedHash);
+    expect(rows[0]?.['uploaded_by_id']).toBe(ADMIN_A_ID);
+    expect(rows[0]?.['deleted']).toBe(false);
   });
 
   it('cria registro de audit log com action document.upload', async () => {
@@ -299,13 +261,12 @@ describe('POST /documents — upload básico', () => {
     expect(res.statusCode).toBe(201);
     const body = res.json() as Record<string, unknown>;
 
-    const auditLog = await testDb.db.collection('audit_logs').findOne({
-      action: 'document.upload',
-      tenantId: TENANT_A,
-    });
-    expect(auditLog).not.toBeNull();
-    expect(auditLog?.resource).toBe(`documents/${body.id as string}`);
-    expect(auditLog?.userId).toBe(ADMIN_A_ID);
+    const logs = await testDb.db<Array<Record<string, unknown>>>`
+      SELECT * FROM audit_logs WHERE action = 'document.upload' AND tenant_id = ${TENANT_A}
+    `;
+    expect(logs).toHaveLength(1);
+    expect(logs[0]?.['resource']).toBe(`documents/${body.id as string}`);
+    expect(logs[0]?.['user_id']).toBe(ADMIN_A_ID);
   });
 
   it('retorna s3Key com formato correto', async () => {
@@ -368,16 +329,10 @@ describe('POST /documents — classificação manual de tipo', () => {
   it('rejeita documentTypeId de outro tenant com 404', async () => {
     // Tipo do tenant B — não acessível pelo tenant A
     const typeBId = newId();
-    await testDb.db.collection('document_types').insertOne({
-      id: typeBId,
-      tenantId: TENANT_B,
-      name: 'Tipo B',
-      description: null,
-      isGlobal: false,
-      indexFields: [],
-      deleted: false,
-      createdAt: new Date(),
-    });
+    await testDb.db`
+      INSERT INTO document_types (id, tenant_id, name, description, is_global, index_fields, deleted, created_at)
+      VALUES (${typeBId}, ${TENANT_B}, 'Tipo B', NULL, false, '[]'::jsonb, false, NOW())
+    `;
 
     const { payload, headers } = buildUploadForm({
       departmentId: DEPT_A_ID,
@@ -501,9 +456,7 @@ describe('POST /documents — deduplicação por SHA-256', () => {
 describe('POST /documents — verificação de cota', () => {
   it('rejeita upload quando excede cota de disco com 422 QUOTA_EXCEEDED', async () => {
     // Configura tenant A com cota de 1 byte — qualquer upload vai exceder
-    await testDb.db
-      .collection('tenants')
-      .updateOne({ id: TENANT_A }, { $set: { diskQuotaBytes: 1 } });
+    await testDb.db`UPDATE tenants SET disk_quota_bytes = 1 WHERE id = ${TENANT_A}`;
 
     const { payload, headers } = buildUploadForm({ departmentId: DEPT_A_ID });
 
@@ -522,28 +475,19 @@ describe('POST /documents — verificação de cota', () => {
     const halfQuota = Math.floor(DISK_QUOTA / 2);
 
     // Insere documento fictício que já ocupa metade da cota
-    await testDb.db.collection('documents').insertOne({
-      id: newId(),
-      tenantId: TENANT_A,
-      departmentId: DEPT_A_ID,
-      documentTypeId: null,
-      filename: 'existente.pdf',
-      originalFilename: 'existente.pdf',
-      contentHash: 'a'.repeat(64),
-      sizeBytes: halfQuota + 100, // ocupa mais que a metade
-      mimeType: 'application/pdf',
-      s3Key: 'test/key',
-      status: 'READY',
-      failureReason: null,
-      tags: [],
-      mongoContentId: null,
-      indexValues: {},
-      uploadedById: ADMIN_A_ID,
-      uploadedAt: new Date(),
-      processedAt: new Date(),
-      costUsdCents: 0,
-      deleted: false,
-    });
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${newId()}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
+        'existente.pdf', ${'a'.repeat(64)}, ${halfQuota + 100}, 'application/pdf',
+        'test/key', 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NOW(), 0, false
+      )
+    `;
 
     // Tenta enviar outro arquivo grande
     const largeContent = Buffer.alloc(halfQuota + 200, 'x');
@@ -676,9 +620,6 @@ describe('POST /documents — validações de entrada', () => {
 
 // ---------------------------------------------------------------------------
 // ACL por raiz com herança dinâmica (Fase 6).
-//
-// Conceder uma RAIZ dá acesso de leitura E escrita a toda a subárvore — filhos
-// atuais E futuros — sem materializar os filhos em department_permissions.
 // ---------------------------------------------------------------------------
 describe('ACL por raiz — herança dinâmica de acesso à subárvore', () => {
   it('conceder raiz dá ao UPLOADER escrita em um filho existente e num filho criado depois', async () => {
@@ -691,29 +632,19 @@ describe('ACL por raiz — herança dinâmica de acesso à subárvore', () => {
       password: PASSWORD,
       role: 'UPLOADER',
     });
-    await testDb.db.collection('department_permissions').insertOne({
-      id: newId(),
-      userId: uploaderRaizId,
-      departmentId: DEPT_A_ID,
-      tenantId: TENANT_A,
-      canRead: true,
-      canWrite: true,
-      deleted: false,
-    });
+    await testDb.db`
+      INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
+      VALUES (${uploaderRaizId}, ${DEPT_A_ID}, ${TENANT_A}, true, true)
+      ON CONFLICT (user_id, department_id) DO NOTHING
+    `;
     const tokenRaiz = await login('uploader-raiz@empresa.com');
 
-    // 2. Filho EXISTENTE da raiz DEPT_A_ID (parentId = DEPT_A_ID, nível 1).
+    // 2. Filho EXISTENTE da raiz DEPT_A_ID (parent_id = DEPT_A_ID, nível 1).
     const childId = newId();
-    await testDb.db.collection('departments').insertOne({
-      id: childId,
-      tenantId: TENANT_A,
-      parentId: DEPT_A_ID,
-      name: 'Filho de A',
-      level: 1,
-      tags: [],
-      deleted: false,
-      createdAt: new Date(),
-    });
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (${childId}, ${TENANT_A}, ${DEPT_A_ID}, 'Filho de A', 1, '{}'::text[], false, NOW())
+    `;
 
     // Upload no filho existente — deve funcionar (acesso herdado da raiz).
     const formChild = buildUploadForm({ departmentId: childId });
@@ -728,16 +659,10 @@ describe('ACL por raiz — herança dinâmica de acesso à subárvore', () => {
 
     // 3. Filho CRIADO DEPOIS (sem re-salvar permissões) — também acessível.
     const futureChildId = newId();
-    await testDb.db.collection('departments').insertOne({
-      id: futureChildId,
-      tenantId: TENANT_A,
-      parentId: childId,
-      name: 'Neto de A',
-      level: 2,
-      tags: [],
-      deleted: false,
-      createdAt: new Date(),
-    });
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (${futureChildId}, ${TENANT_A}, ${childId}, 'Neto de A', 2, '{}'::text[], false, NOW())
+    `;
 
     const formFuture = buildUploadForm({ departmentId: futureChildId });
     const resFuture = await app.inject({
@@ -760,52 +685,34 @@ describe('ACL por raiz — herança dinâmica de acesso à subárvore', () => {
       password: PASSWORD,
       role: 'UPLOADER',
     });
-    await testDb.db.collection('department_permissions').insertOne({
-      id: newId(),
-      userId: uploaderListId,
-      departmentId: DEPT_A_ID,
-      tenantId: TENANT_A,
-      canRead: true,
-      canWrite: true,
-      deleted: false,
-    });
+    await testDb.db`
+      INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
+      VALUES (${uploaderListId}, ${DEPT_A_ID}, ${TENANT_A}, true, true)
+      ON CONFLICT (user_id, department_id) DO NOTHING
+    `;
     const tokenList = await login('uploader-list@empresa.com');
 
     // Filho da raiz + documento READY nesse filho (inserido direto no banco).
     const childId = newId();
-    await testDb.db.collection('departments').insertOne({
-      id: childId,
-      tenantId: TENANT_A,
-      parentId: DEPT_A_ID,
-      name: 'Filho listável',
-      level: 1,
-      tags: [],
-      deleted: false,
-      createdAt: new Date(),
-    });
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (${childId}, ${TENANT_A}, ${DEPT_A_ID}, 'Filho listável', 1, '{}'::text[], false, NOW())
+    `;
     const docId = newId();
-    await testDb.db.collection('documents').insertOne({
-      id: docId,
-      tenantId: TENANT_A,
-      departmentId: childId,
-      documentTypeId: null,
-      filename: 'filho.pdf',
-      originalFilename: 'filho.pdf',
-      contentHash: 'c'.repeat(64),
-      sizeBytes: 512,
-      mimeType: 'application/pdf',
-      s3Key: `tenants/${TENANT_A}/documents/${'c'.repeat(64)}/filho.pdf`,
-      status: 'READY',
-      failureReason: null,
-      tags: [],
-      mongoContentId: null,
-      indexValues: {},
-      uploadedById: uploaderListId,
-      uploadedAt: new Date(),
-      processedAt: new Date(),
-      costUsdCents: 0,
-      deleted: false,
-    });
+    const hashC = 'c'.repeat(64);
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${TENANT_A}, ${childId}, NULL,
+        'filho.pdf', ${hashC}, 512, 'application/pdf',
+        ${`tenants/${TENANT_A}/documents/${hashC}/filho.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${uploaderListId}, NOW(), NOW(), 0, false
+      )
+    `;
 
     const res = await app.inject({
       method: 'GET',
@@ -820,12 +727,6 @@ describe('ACL por raiz — herança dinâmica de acesso à subárvore', () => {
 
 // ---------------------------------------------------------------------------
 // Regressão: departamento excluído preserva acesso aos documentos órfãos.
-//
-// Regra de negócio: a exclusão de um departamento marca APENAS o departamento
-// como deleted:true; os documentos (e department_permissions) continuam
-// deleted:false. Admins precisam continuar acessando/editando esses documentos
-// órfãos — os guards de ACL (assertCanReadDepartment/assertCanWriteDepartment)
-// não devem exigir department.deleted === false.
 // ---------------------------------------------------------------------------
 describe('documentos órfãos — departamento soft-deletado preserva acesso', () => {
   /**
@@ -834,28 +735,20 @@ describe('documentos órfãos — departamento soft-deletado preserva acesso', (
    */
   async function seedReadyDocument(departmentId: string, tenantId: string): Promise<string> {
     const docId = newId();
-    await testDb.db.collection('documents').insertOne({
-      id: docId,
-      tenantId,
-      departmentId,
-      documentTypeId: null,
-      filename: 'orfao.pdf',
-      originalFilename: 'orfao.pdf',
-      contentHash: 'b'.repeat(64),
-      sizeBytes: 1024,
-      mimeType: 'application/pdf',
-      s3Key: `tenants/${tenantId}/documents/${'b'.repeat(64)}/orfao.pdf`,
-      status: 'READY',
-      failureReason: null,
-      tags: [],
-      mongoContentId: null,
-      indexValues: {},
-      uploadedById: ADMIN_A_ID,
-      uploadedAt: new Date(),
-      processedAt: new Date(),
-      costUsdCents: 0,
-      deleted: false,
-    });
+    const hashB = 'b'.repeat(64);
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${tenantId}, ${departmentId}, NULL,
+        'orfao.pdf', ${hashB}, 1024, 'application/pdf',
+        ${`tenants/${tenantId}/documents/${hashB}/orfao.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NOW(), 0, false
+      )
+    `;
     return docId;
   }
 
@@ -871,10 +764,10 @@ describe('documentos órfãos — departamento soft-deletado preserva acesso', (
     expect(delRes.statusCode).toBe(204);
 
     // Sanidade: departamento está soft-deletado, documento permanece vivo
-    const deptDb = await testDb.db.collection('departments').findOne({ id: DEPT_A_ID });
-    expect(deptDb?.deleted).toBe(true);
-    const docDb = await testDb.db.collection('documents').findOne({ id: docId });
-    expect(docDb?.deleted).toBe(false);
+    const deptRows = await testDb.db<Array<{ deleted: boolean }>>`SELECT deleted FROM departments WHERE id = ${DEPT_A_ID}`;
+    expect(deptRows[0]?.deleted).toBe(true);
+    const docRows = await testDb.db<Array<{ deleted: boolean }>>`SELECT deleted FROM documents WHERE id = ${docId}`;
+    expect(docRows[0]?.deleted).toBe(false);
 
     // GET detalhe deve continuar retornando 200 (antes regredia para 404)
     const res = await app.inject({
@@ -946,8 +839,8 @@ describe('documentos órfãos — departamento soft-deletado preserva acesso', (
     });
 
     expect(res.statusCode).toBe(204);
-    const docDb = await testDb.db.collection('documents').findOne({ id: docId });
-    expect(docDb?.deleted).toBe(true);
+    const docRows = await testDb.db<Array<{ deleted: boolean }>>`SELECT deleted FROM documents WHERE id = ${docId}`;
+    expect(docRows[0]?.deleted).toBe(true);
   });
 
   it('POST /documents para departamento JÁ excluído continua retornando 404 (sem regressão)', async () => {
@@ -975,38 +868,27 @@ describe('documentos órfãos — departamento soft-deletado preserva acesso', (
 
 // ---------------------------------------------------------------------------
 // document_events — registro imutável de upload (cobrança)
-//
-// Regra: TODO upload aceito gera exatamente 1 evento; reenvio dedup gera
-// novo evento (deduplicated:true); QUOTA_EXCEEDED não gera evento; a exclusão
-// do documento NÃO remove o evento; eventos são isolados por tenant.
-// wiki "Histórico de eventos de upload e relatório de uso (cobrança)".
-//
-// A coleção document_events é consultada DIRETAMENTE (sem o TenantRepository),
-// pois por regra de negócio não carrega `deleted` e não passa pelo wrapper.
 // ---------------------------------------------------------------------------
 
 interface RawDocumentEvent {
   id: string;
-  tenantId: string;
-  documentId: string | null;
-  uploadedById: string;
-  eventType: string;
-  mimeType: string;
-  documentTypeId: string | null;
-  documentTypeName: string | null;
-  sizeBytes: number;
-  pageCount: number | null;
+  tenant_id: string;
+  document_id: string | null;
+  uploaded_by_id: string;
+  event_type: string;
+  mime_type: string;
+  document_type_id: string | null;
+  document_type_name: string | null;
+  size_bytes: bigint;
+  page_count: number | null;
   deduplicated: boolean;
-  createdAt: Date;
-  deleted?: unknown;
+  created_at: Date;
 }
 
 async function listEvents(tenantId: string): Promise<RawDocumentEvent[]> {
-  return testDb.db
-    .collection<RawDocumentEvent>('document_events')
-    .find({ tenantId })
-    .sort({ createdAt: 1 })
-    .toArray();
+  return testDb.db<RawDocumentEvent[]>`
+    SELECT * FROM document_events WHERE tenant_id = ${tenantId} ORDER BY created_at ASC
+  `;
 }
 
 describe('POST /documents — emissão de evento em document_events', () => {
@@ -1031,17 +913,17 @@ describe('POST /documents — emissão de evento em document_events', () => {
 
     const event = events[0]!;
     expect(event.deduplicated).toBe(false);
-    expect(event.documentId).toBe(documentId);
-    expect(event.tenantId).toBe(TENANT_A);
-    expect(event.uploadedById).toBe(ADMIN_A_ID);
-    expect(event.eventType).toBe('upload');
-    expect(event.mimeType).toBe('application/pdf');
-    expect(event.documentTypeId).toBe(DOC_TYPE_ID);
-    expect(event.documentTypeName).toBe('Contrato A'); // denormalizado
-    expect(event.sizeBytes).toBeGreaterThan(0);
-    expect(event.pageCount).toBeNull(); // backfill posterior pelo worker
-    // Append-only: NÃO carrega o campo `deleted`
-    expect(event.deleted).toBeUndefined();
+    expect(event.document_id).toBe(documentId);
+    expect(event.tenant_id).toBe(TENANT_A);
+    expect(event.uploaded_by_id).toBe(ADMIN_A_ID);
+    expect(event.event_type).toBe('upload');
+    expect(event.mime_type).toBe('application/pdf');
+    expect(event.document_type_id).toBe(DOC_TYPE_ID);
+    expect(event.document_type_name).toBe('Contrato A'); // denormalizado
+    expect(Number(event.size_bytes)).toBeGreaterThan(0);
+    expect(event.page_count).toBeNull(); // backfill posterior pelo worker
+    // Append-only: o campo `deleted` não existe na tabela
+    expect((event as unknown as Record<string, unknown>)['deleted']).toBeUndefined();
   });
 
   it('reenvio do mesmo arquivo (dedup) gera um SEGUNDO evento deduplicated:true para o mesmo documentId', async () => {
@@ -1073,12 +955,12 @@ describe('POST /documents — emissão de evento em document_events', () => {
 
     const [first, second] = events;
     expect(first!.deduplicated).toBe(false);
-    expect(first!.documentId).toBe(documentId);
+    expect(first!.document_id).toBe(documentId);
 
     expect(second!.deduplicated).toBe(true);
     // O evento de dedup aponta para o MESMO documento (nenhum novo doc criado)
-    expect(second!.documentId).toBe(documentId);
-    expect(second!.sizeBytes).toBe(first!.sizeBytes);
+    expect(second!.document_id).toBe(documentId);
+    expect(second!.size_bytes).toBe(first!.size_bytes);
   });
 
   it('documento deletado NÃO remove o evento — o histórico de upload é preservado', async () => {
@@ -1105,18 +987,16 @@ describe('POST /documents — emissão de evento em document_events', () => {
     });
     expect(delRes.statusCode).toBe(204);
 
-    // O evento continua na coleção (consulta direta — não filtra por deleted)
+    // O evento continua na tabela (consulta direta — não filtra por deleted)
     const after = await listEvents(TENANT_A);
     expect(after).toHaveLength(1);
-    expect(after[0]!.documentId).toBe(documentId);
+    expect(after[0]!.document_id).toBe(documentId);
     expect(after[0]!.deduplicated).toBe(false);
   });
 
   it('upload rejeitado por QUOTA_EXCEEDED NÃO gera evento', async () => {
     // Cota de 1 byte — qualquer upload excede e lança antes da emissão
-    await testDb.db
-      .collection('tenants')
-      .updateOne({ id: TENANT_A }, { $set: { diskQuotaBytes: 1 } });
+    await testDb.db`UPDATE tenants SET disk_quota_bytes = 1 WHERE id = ${TENANT_A}`;
 
     const { payload, headers } = buildUploadForm({ departmentId: DEPT_A_ID });
 
@@ -1159,10 +1039,10 @@ describe('POST /documents — emissão de evento em document_events', () => {
 
     expect(eventsA).toHaveLength(1);
     expect(eventsB).toHaveLength(1);
-    expect(eventsA[0]!.tenantId).toBe(TENANT_A);
-    expect(eventsB[0]!.tenantId).toBe(TENANT_B);
+    expect(eventsA[0]!.tenant_id).toBe(TENANT_A);
+    expect(eventsB[0]!.tenant_id).toBe(TENANT_B);
     // Nenhum evento de A vaza para a consulta de B e vice-versa
-    expect(eventsA.every((e) => e.tenantId === TENANT_A)).toBe(true);
-    expect(eventsB.every((e) => e.tenantId === TENANT_B)).toBe(true);
+    expect(eventsA.every((e) => e.tenant_id === TENANT_A)).toBe(true);
+    expect(eventsB.every((e) => e.tenant_id === TENANT_B)).toBe(true);
   });
 });

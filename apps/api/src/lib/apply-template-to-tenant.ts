@@ -1,16 +1,13 @@
-import type { Db } from 'mongodb';
+import type { Sql } from '@dmdoc/db-pg';
+import { newId } from '@dmdoc/db-pg';
 import type { FastifyBaseLogger } from 'fastify';
-import { newId } from '@dmdoc/db-mongo';
 import type { TemplateNode } from '@dmdoc/shared-types';
 import { NotFoundError } from '../errors/index.js';
 
 /**
  * Documento de departamento criado a partir de um nó de template.
- * Todos os campos injetados manualmente — sem TenantRepository — pois a
- * inserção acontece dentro de uma transação MongoDB já em andamento
- * (a própria transação de criação do tenant).
  */
-interface DepartmentInsertDoc {
+interface DepartmentInsertRow {
   id: string;
   tenantId: string;
   parentId: string | null;
@@ -24,43 +21,45 @@ interface DepartmentInsertDoc {
 
 /**
  * Aplica um template de departamentos a um tenant recém-criado, inserindo
- * os nós do template como departamentos reais na coleção `departments`.
+ * os nós do template como departamentos reais na tabela `departments`.
  *
- * Deve ser chamada com uma `session` MongoDB ativa (dentro de withTransaction)
- * para garantir atomicidade em relação à criação do tenant.
+ * A atomicidade em relação à criação do tenant é garantida pelo chamador via
+ * sql.begin() (postgres.js). O parâmetro `sql` deve ser o cliente já dentro
+ * da transação quando aplicável.
  *
  * Invariantes:
  * - `templateId` deve existir em `department_templates`; se não, lança
  *   `NotFoundError` (a transação faz rollback automático).
  * - Cada nó recebe um `id` uuid novo — os `refId`/`parentRefId` do template
- *   são internos e nunca aparecem nos documentos finais.
- * - A ordem do array `nodes` garante que o pai já foi mapeado antes do filho
- *   (conforme spec §5.3 e validação no schema `TemplateNodeSchema`).
+ *   são internos e nunca aparecem nos registros finais.
+ * - A ordem do array `nodes` garante que o pai já foi mapeado antes do filho.
  * - `level` é calculado recursivamente pelo mapa: raiz = 0, filho = pai + 1.
  *
- * @param db          Instância `Db` do driver MongoDB.
+ * @param sql         Instância postgres.js (pool ou transação ativa).
  * @param tenantId    UUID do tenant para o qual os departamentos serão criados.
  * @param templateId  UUID do template a aplicar.
- * @param session     `ClientSession` MongoDB ativa (para transação atômica).
- * @param logger      Logger Fastify com contexto já pré-formatado (tenantId, etc.).
+ * @param logger      Logger Fastify com contexto já pré-formatado.
  */
 export async function applyTemplateToTenant(
-  db: Db,
+  sql: Sql,
   tenantId: string,
   templateId: string,
-  session: import('mongodb').ClientSession,
   logger: FastifyBaseLogger,
 ): Promise<void> {
   // 1. Buscar o template (sem filtro de tenant — templates são globais).
-  const templateDoc = await db
-    .collection('department_templates')
-    .findOne({ id: templateId }, { session });
+  const templateRows = await sql<Array<{ id: string; nodes: unknown }>>`
+    SELECT id, nodes
+    FROM department_templates
+    WHERE id = ${templateId}
+    LIMIT 1
+  `;
 
+  const templateDoc = templateRows[0];
   if (!templateDoc) {
     throw new NotFoundError('Template de departamentos não encontrado');
   }
 
-  const nodes = templateDoc['nodes'] as TemplateNode[];
+  const nodes = templateDoc.nodes as TemplateNode[];
 
   if (nodes.length === 0) {
     logger.info({ tenantId, templateId, deptCount: 0 }, 'template sem nós; nenhum departamento criado');
@@ -68,18 +67,14 @@ export async function applyTemplateToTenant(
   }
 
   // 2. Sort topológico: garante que pais aparecem antes dos filhos.
-  //    O array do template já deve estar ordenado (spec §5.3), mas fazemos o
-  //    sort aqui por segurança — evita falhas se a ordem for alterada no PATCH.
   const sorted = topologicalSort(nodes);
 
   // 3. Mapear refId → novoId e calcular level de cada nó.
-  //    refIdToNewId: resolve parentRefId → parentId real.
-  //    refIdToLevel: deriva level filho = level pai + 1.
   const refIdToNewId = new Map<string, string>();
   const refIdToLevel = new Map<string, number>();
 
   const now = new Date();
-  const docs: DepartmentInsertDoc[] = [];
+  const rows: DepartmentInsertRow[] = [];
 
   for (const node of sorted) {
     const newDeptId = newId();
@@ -92,9 +87,6 @@ export async function applyTemplateToTenant(
       const resolvedParentId = refIdToNewId.get(node.parentRefId);
       const parentLevel = refIdToLevel.get(node.parentRefId);
 
-      // A validação do schema TemplateNodeSchema garante que parentRefId aponta
-      // para um refId existente. O sort topológico garante que o pai já foi
-      // processado. Esta checagem é uma salvaguarda de runtime.
       if (resolvedParentId === undefined || parentLevel === undefined) {
         throw new Error(
           `Template inválido: parentRefId "${node.parentRefId}" do nó "${node.refId}" não foi encontrado após sort topológico`,
@@ -107,7 +99,7 @@ export async function applyTemplateToTenant(
 
     refIdToLevel.set(node.refId, level);
 
-    docs.push({
+    rows.push({
       id: newDeptId,
       tenantId,
       parentId,
@@ -120,11 +112,26 @@ export async function applyTemplateToTenant(
     });
   }
 
-  // 4. Bulk insert na coleção departments — dentro da session/transação ativa.
-  await db.collection('departments').insertMany(docs, { session });
+  // 4. Bulk insert na tabela departments.
+  for (const row of rows) {
+    await sql`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, created_at, updated_at, deleted)
+      VALUES (
+        ${row.id},
+        ${row.tenantId},
+        ${row.parentId},
+        ${row.name},
+        ${row.level},
+        ${row.tags},
+        ${row.createdAt},
+        ${row.updatedAt},
+        ${row.deleted}
+      )
+    `;
+  }
 
   logger.info(
-    { tenantId, templateId, deptCount: docs.length },
+    { tenantId, templateId, deptCount: rows.length },
     'tenant criado com template; departamentos inseridos',
   );
 }
@@ -133,16 +140,12 @@ export async function applyTemplateToTenant(
  * Ordena os nós do template topologicamente: raízes primeiro, filhos depois.
  *
  * Algoritmo BFS (Kahn): percorre nós sem parent pendente na fila, depois
- * processa os filhos cujos pais já foram emitidos. Detecta ciclos (embora o
- * schema Zod já impeça parentRefId circular por construção).
- *
- * Complexidade: O(n) em tempo e espaço.
+ * processa os filhos cujos pais já foram emitidos.
  */
 function topologicalSort(nodes: TemplateNode[]): TemplateNode[] {
-  // Mapas auxiliares
   const nodeByRefId = new Map<string, TemplateNode>();
-  const childrenOf = new Map<string, string[]>(); // parentRefId → [refId filhos]
-  const inDegree = new Map<string, number>();       // refId → número de pais pendentes
+  const childrenOf = new Map<string, string[]>();
+  const inDegree = new Map<string, number>();
 
   for (const node of nodes) {
     nodeByRefId.set(node.refId, node);
@@ -155,7 +158,6 @@ function topologicalSort(nodes: TemplateNode[]): TemplateNode[] {
     }
   }
 
-  // Fila inicial: nós sem pai (raízes)
   const queue: string[] = [];
   for (const [refId, degree] of inDegree.entries()) {
     if (degree === 0) queue.push(refId);

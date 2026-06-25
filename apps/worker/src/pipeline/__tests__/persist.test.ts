@@ -1,23 +1,23 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { Db } from 'mongodb';
+import type { Sql } from 'postgres';
 import type { Logger } from 'pino';
 import type { DocumentProcessingJobData } from '@dmdoc/shared-types';
 import { persistProcessingResult } from '../persist.js';
 import type { ExtractResult } from '../extract.js';
 
 /**
- * Testes do backfill de `pageCount` em `document_events` na etapa final do
+ * Testes do backfill de `page_count` em `document_events` na etapa final do
  * pipeline (persistProcessingResult, caminho de sucesso → READY).
  *
  * Regra de negócio (wiki "Histórico de eventos de upload e relatório de uso"):
- * o evento de upload nasce com `pageCount: null` e é preenchido por backfill
+ * o evento de upload nasce com `page_count: null` e é preenchido por backfill
  * quando o documento fica READY. O backfill é escopado por `tenantId` —
  * eventos de outra empresa com o mesmo `documentId` nunca são afetados.
  *
- * Não usamos Mongo real: um stub mínimo do `Db` mantém `document_events` em
- * memória e implementa apenas `updateMany` com filtro `{ tenantId, documentId }`
- * e `$set`. As demais coleções tocadas pelo persist (chunks, document_content,
- * documents) recebem stubs no-op — o foco aqui é o backfill e seu escopo.
+ * Não usamos PostgreSQL real: um stub mínimo do `Sql` intercepta as tagged
+ * template literals do postgres.js. As demais operações (DELETE chunks,
+ * INSERT chunks, INSERT document_content, UPDATE documents) são no-op.
+ * O foco aqui é o backfill e seu escopo.
  */
 
 const TENANT_A = '00000000-0000-0000-0000-00000000000a';
@@ -29,53 +29,6 @@ interface UploadEvent {
   tenantId: string;
   documentId: string;
   pageCount: number | null;
-}
-
-interface UpdateFilter {
-  tenantId?: string;
-  documentId?: string;
-}
-
-interface SetUpdate {
-  $set: { pageCount: number };
-}
-
-/**
- * Constrói um `Db` stub. `document_events` é a única coleção com comportamento
- * real (updateMany por { tenantId, documentId } + $set). As demais são no-op.
- */
-function makeDbStub(events: UploadEvent[]): Db {
-  const noop = {
-    deleteMany: vi.fn().mockResolvedValue({ deletedCount: 0 }),
-    insertMany: vi.fn().mockResolvedValue({ insertedCount: 0 }),
-    updateOne: vi.fn().mockResolvedValue({ matchedCount: 1, modifiedCount: 1 }),
-  };
-
-  const documentEvents = {
-    updateMany: vi.fn(
-      (filter: UpdateFilter, update: SetUpdate) => {
-        let modifiedCount = 0;
-        let matchedCount = 0;
-        for (const ev of events) {
-          if (ev.tenantId !== filter.tenantId) continue;
-          if (ev.documentId !== filter.documentId) continue;
-          matchedCount += 1;
-          if (ev.pageCount !== update.$set.pageCount) {
-            ev.pageCount = update.$set.pageCount;
-            modifiedCount += 1;
-          }
-        }
-        return Promise.resolve({ matchedCount, modifiedCount });
-      }
-    ),
-  };
-
-  const collection = vi.fn((name: string) => {
-    if (name === 'document_events') return documentEvents;
-    return noop;
-  });
-
-  return { collection } as unknown as Db;
 }
 
 function makeSilentLogger(): Logger {
@@ -111,13 +64,106 @@ function makeExtractResult(pageCount: number): ExtractResult {
   };
 }
 
+/**
+ * Constrói um `Sql` stub compatível com postgres.js tagged templates.
+ *
+ * postgres.js chama o template tag com (strings: TemplateStringsArray, ...values).
+ * O stub reconstrói a query concatenando as strings com os valores interpolados
+ * para detectar o tipo de operação, depois aplica o comportamento correspondente.
+ *
+ * Também suporta `sql(tableName)` (chamada como função para identificador) e
+ * `sql.json(value)` retornando o valor direto.
+ */
+function makeSqlStub(events: UploadEvent[]): Sql {
+  // Resultado no-op
+  const noopResult = Object.assign([], { count: 0 });
+
+  /**
+   * Reconstrói a query colapsando os valores nos placeholders para detecção.
+   * Não é SQL seguro — apenas para comparação de conteúdo no stub.
+   */
+  function buildQuery(strings: TemplateStringsArray, values: unknown[]): string {
+    let q = '';
+    for (let i = 0; i < strings.length; i++) {
+      q += strings[i] ?? '';
+      if (i < values.length) {
+        const v = values[i];
+        // Se o valor é um identificador retornado por sql(name), extrair o nome
+        if (v && typeof v === 'object' && '__pgIdentifier' in (v as object)) {
+          q += (v as { __pgIdentifier: string }).__pgIdentifier;
+        } else {
+          q += String(v ?? '');
+        }
+      }
+    }
+    return q.toLowerCase();
+  }
+
+  // A função principal (tagged template)
+  const sqlFn = vi.fn().mockImplementation(
+    (strings: TemplateStringsArray | string, ...values: unknown[]) => {
+      // Chamada como sql(tableName) para identificador — retorna marcador especial
+      if (typeof strings === 'string') {
+        return { __pgIdentifier: strings };
+      }
+
+      // Chamada como sql(rowsArray) para bulk insert — retorna marcador
+      if (Array.isArray(strings) && !('raw' in strings)) {
+        return { __pgBulkRows: strings };
+      }
+
+      const query = buildQuery(strings as TemplateStringsArray, values);
+
+      if (query.includes('delete from chunks')) {
+        return Promise.resolve(Object.assign([], { count: 0 }));
+      }
+      if (query.includes('insert into chunks')) {
+        return Promise.resolve(noopResult);
+      }
+      if (query.includes('insert into document_content')) {
+        return Promise.resolve(noopResult);
+      }
+      if (query.includes('update documents')) {
+        return Promise.resolve(noopResult);
+      }
+      if (query.includes('update') && query.includes('document_events')) {
+        // backfillPageCount emite:
+        // UPDATE ${sql('document_events')} SET page_count=${pageCount}
+        // WHERE document_id=${documentId} AND tenant_id=${tenantId}
+        //
+        // Os values interpolados na ordem são:
+        //   values[0] = sql('document_events') → identificador (objeto)
+        //   values[1] = pageCount
+        //   values[2] = documentId
+        //   values[3] = tenantId
+        const [, pageCount, docId, tenantId] = values as [unknown, number, string, string];
+        let count = 0;
+        for (const ev of events) {
+          if (ev.tenantId === tenantId && ev.documentId === docId) {
+            ev.pageCount = pageCount;
+            count++;
+          }
+        }
+        return Promise.resolve(Object.assign([], { count }));
+      }
+
+      return Promise.resolve(noopResult);
+    }
+  );
+
+  // sql.json(value) — encapsula para JSONB
+  (sqlFn as unknown as Record<string, unknown>)['json'] = (val: unknown) => val;
+
+  return sqlFn as unknown as Sql;
+}
+
 describe('persistProcessingResult — backfill de pageCount em document_events', () => {
   it('preenche pageCount em todos os eventos do documentId no tenant', async () => {
     const events: UploadEvent[] = [
       { id: 'e1', tenantId: TENANT_A, documentId: DOCUMENT_ID, pageCount: null },
       { id: 'e2', tenantId: TENANT_A, documentId: DOCUMENT_ID, pageCount: null },
     ];
-    const db = makeDbStub(events);
+    const sql = makeSqlStub(events);
 
     await persistProcessingResult(
       {
@@ -127,7 +173,7 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
         totalEmbeddingsUsd: 0,
         pipelineStartedAt: new Date(),
       },
-      { db, logger: makeSilentLogger() }
+      { sql, logger: makeSilentLogger() }
     );
 
     expect(events.every((e) => e.pageCount === 7)).toBe(true);
@@ -138,7 +184,7 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
       { id: 'a1', tenantId: TENANT_A, documentId: DOCUMENT_ID, pageCount: null },
       { id: 'b1', tenantId: TENANT_B, documentId: DOCUMENT_ID, pageCount: null },
     ];
-    const db = makeDbStub(events);
+    const sql = makeSqlStub(events);
 
     await persistProcessingResult(
       {
@@ -148,7 +194,7 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
         totalEmbeddingsUsd: 0,
         pipelineStartedAt: new Date(),
       },
-      { db, logger: makeSilentLogger() }
+      { sql, logger: makeSilentLogger() }
     );
 
     const tenantAEvent = events.find((e) => e.id === 'a1');
@@ -161,7 +207,7 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
     const events: UploadEvent[] = [
       { id: 'e1', tenantId: TENANT_A, documentId: DOCUMENT_ID, pageCount: null },
     ];
-    const db = makeDbStub(events);
+    const sql = makeSqlStub(events);
 
     const run = (): Promise<void> =>
       persistProcessingResult(
@@ -172,7 +218,7 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
           totalEmbeddingsUsd: 0,
           pipelineStartedAt: new Date(),
         },
-        { db, logger: makeSilentLogger() }
+        { sql, logger: makeSilentLogger() }
       );
 
     await run();

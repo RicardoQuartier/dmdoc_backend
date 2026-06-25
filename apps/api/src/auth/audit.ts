@@ -1,7 +1,8 @@
-import type { Db } from 'mongodb';
+import type { Sql } from '@dmdoc/db-pg';
+import { newId } from '@dmdoc/db-pg';
 
 /**
- * Documento de auditoria como armazenado na coleção `audit_logs` (spec §5.3).
+ * Documento de auditoria como armazenado na tabela `audit_logs` (spec §5.3).
  * `userId`/`tenantId` podem ser `null` (ex.: login de SUPER_ADMIN não tem
  * empresa). O registro é append-only e somente leitura para fins operacionais.
  */
@@ -18,27 +19,33 @@ export const AUDIT_LOGS_COLLECTION = 'audit_logs';
 
 /**
  * Registro mínimo de auditoria. A spec (§10, invariante 7) exige AuditLog em
- * login, upload, delete, mudança de permissão e reprocessamento. Aqui cobrimos
- * apenas o que a Fase 1 produz: `auth.login`. O framework completo de auditoria
- * (mais ações, leitura via /audit-logs) é Fase 5.
+ * login, upload, delete, mudança de permissão e reprocessamento.
  */
 export class AuditLogger {
-  private readonly db: Db;
+  private readonly sql: Sql;
 
-  constructor(db: Db) {
-    this.db = db;
+  constructor(sql: Sql) {
+    this.sql = sql;
   }
 
   /**
    * Insere um registro de auditoria. Não lança em caso de falha de escrita do
-   * log — auditoria nunca deve derrubar a operação principal (ex.: um login
-   * bem-sucedido não vira 500 porque o insert de log falhou). A falha é apenas
+   * log — auditoria nunca deve derrubar a operação principal. A falha é apenas
    * logada pelo chamador.
    */
   async record(entry: Omit<AuditLogDocument, 'createdAt'>): Promise<void> {
-    await this.db.collection<AuditLogDocument>(AUDIT_LOGS_COLLECTION).insertOne({
-      ...entry,
-      createdAt: new Date(),
-    });
+    const id = newId();
+    await this.sql`
+      INSERT INTO audit_logs (id, tenant_id, user_id, action, resource, metadata, created_at)
+      VALUES (
+        ${id},
+        ${entry.tenantId},
+        ${entry.userId},
+        ${entry.action},
+        ${entry.resource},
+        ${JSON.stringify(entry.metadata)},
+        NOW()
+      )
+    `;
   }
 }

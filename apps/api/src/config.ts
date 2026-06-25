@@ -18,9 +18,12 @@ const EnvSchema = z.object({
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
     .default('info'),
 
-  // MongoDB — conexão da API no boot (spec §12).
-  MONGO_URI: z.string().min(1, 'MONGO_URI é obrigatória'),
-  MONGO_DB: z.string().min(1).default('dmdoc'),
+  // PostgreSQL — conexão da API no boot (spec §12).
+  DATABASE_URL: z.string().min(1, 'DATABASE_URL é obrigatória'),
+
+  // MongoDB — mantido para compatibilidade de config durante migração.
+  MONGO_URI: z.string().min(1).optional().default('mongodb://unused:27017'),
+  MONGO_DB: z.string().min(1).optional().default('dmdoc'),
 
   // JWT — autenticação stateless (spec §12). Access curto + refresh longo,
   // assinados com segredos DISTINTOS para que um refresh não seja aceito como

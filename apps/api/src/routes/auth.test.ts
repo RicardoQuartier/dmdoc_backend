@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { AUDIT_LOGS_COLLECTION } from '../auth/audit.js';
 import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
 
 const TENANT_A = '11111111-1111-1111-1111-111111111111';
@@ -22,8 +21,8 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db.collection('users').deleteMany({});
-  await testDb.db.collection(AUDIT_LOGS_COLLECTION).deleteMany({});
+  await testDb.db`DELETE FROM audit_logs`;
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role = 'TENANT_ADMIN'`;
 });
 
 async function seedDefaultUser(active = true): Promise<void> {
@@ -69,12 +68,12 @@ describe('POST /auth/login', () => {
       payload: { email: 'admin@empresa.com', password: PASSWORD },
     });
 
-    const logs = await testDb.db.collection(AUDIT_LOGS_COLLECTION).find({}).toArray();
+    const logs = await testDb.db`SELECT * FROM audit_logs`;
     expect(logs).toHaveLength(1);
     expect(logs[0]).toMatchObject({
       action: 'auth.login',
-      userId: USER_ID,
-      tenantId: TENANT_A,
+      user_id: USER_ID,
+      tenant_id: TENANT_A,
     });
   });
 
@@ -99,7 +98,7 @@ describe('POST /auth/login', () => {
     });
 
     expect(res.statusCode).toBe(401);
-    const logs = await testDb.db.collection(AUDIT_LOGS_COLLECTION).find({}).toArray();
+    const logs = await testDb.db`SELECT * FROM audit_logs`;
     expect(logs).toHaveLength(0);
   });
 
@@ -205,7 +204,7 @@ describe('POST /auth/refresh', () => {
   it('refresh de usuário desativado após emissão → 401', async () => {
     await seedDefaultUser();
     const refreshToken = await loginAndGetRefresh();
-    await testDb.db.collection('users').updateOne({ id: USER_ID }, { $set: { active: false } });
+    await testDb.db`UPDATE users SET active = false WHERE id = ${USER_ID}`;
 
     const res = await app.inject({
       method: 'POST',
