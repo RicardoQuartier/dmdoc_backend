@@ -30,6 +30,7 @@ import {
   jsonb,
   primaryKey,
   unique,
+  uniqueIndex,
   index,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
@@ -299,7 +300,9 @@ export const documents = pgTable(
     deleted: boolean('deleted').notNull().default(false),
   },
   (t) => [
-    unique('uniq_doc_tenant_content_hash').on(t.tenantId, t.contentHash),
+    uniqueIndex('uniq_doc_tenant_content_hash')
+      .on(t.tenantId, t.contentHash)
+      .where(sql`deleted = false`),
     index('docs_by_tenant_status').on(t.tenantId, t.status),
     index('docs_by_tenant_department').on(t.tenantId, t.departmentId),
     index('docs_by_tenant_deleted').on(t.tenantId, t.deleted),
