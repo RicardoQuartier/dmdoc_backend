@@ -36,19 +36,13 @@ services:
 
   # Microserviço de extração de texto (Python) — unifica TODOS os formatos:
   # PyMuPDF (PDF), python-docx (DOCX), openpyxl (XLSX), python-pptx (PPTX) e
-  # EasyOCR para scans/imagens (RG, CNH, certificados). Comunicação via fila Redis
+  # Tesseract para scans/imagens (RG, CNH, certificados). Comunicação via fila Redis
   # (BRPOP extract:requests → download S3 → RPUSH extract:result:{id}) — sem timeout HTTP.
   extractor:
     build:
       context: ./services/extractor
     container_name: dmdoc-extractor
     environment:
-      # CPUs antigas (ex.: i3 3ª geração / Ivy Bridge) têm AVX mas NÃO têm AVX2/FMA.
-      # O PyTorch (via EasyOCR) usa kernels AVX2/FMA por padrão e quebra com SIGILL
-      # (exit 132 / "Illegal instruction"). O torch só aceita 'default', 'avx2' ou
-      # 'avx512' aqui — 'default' força o baseline (sem AVX2), única opção que roda
-      # nessas CPUs. Mais lento no OCR, porém universal.
-      ATEN_CPU_CAPABILITY: default
       EXTRACT_TIMEOUT_S: '480'
       REDIS_URL: redis://redis:6379
       S3_ENDPOINT: http://minio:9000
