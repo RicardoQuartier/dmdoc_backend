@@ -235,7 +235,7 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
     }
 
     request.log.info({ tenantId, userId: user.id }, 'usuário criado');
-    return reply.status(201).send(safeUser(user));
+    return reply.status(201).send(safeUser(rowToUserDoc(user as unknown as UserRow)));
   });
 
   /**
@@ -461,7 +461,7 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
     if (!updated) throw new NotFoundError();
 
     request.log.info({ tenantId, userId: id }, 'usuário atualizado');
-    return reply.status(200).send(safeUser(updated));
+    return reply.status(200).send(safeUser(rowToUserDoc(updated as unknown as UserRow)));
   });
 
   /**
@@ -477,9 +477,15 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const sql = app.db;
 
-    const usersRepo = new TenantRepository<UserDoc>(sql, 'users', { tenantId });
-    const deleted = await usersRepo.softDelete(id);
-    if (!deleted) throw new NotFoundError();
+    const result = await sql`
+      UPDATE users
+      SET deleted = true,
+          email   = email || '__deleted_' || EXTRACT(EPOCH FROM now())::bigint
+      WHERE id         = ${id}
+        AND tenant_id  = ${tenantId}
+        AND deleted    = false
+    `;
+    if (result.count === 0) throw new NotFoundError();
 
     request.log.info({ tenantId, userId: id }, 'usuário removido (soft delete)');
     return reply.status(204).send();

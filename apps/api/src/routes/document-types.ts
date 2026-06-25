@@ -365,7 +365,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     if (!updated) throw new NotFoundError();
 
     request.log.info({ tenantId, documentTypeId: id }, 'tipo de documento atualizado');
-    const enrichedUpdated = await enrichWithDepartments(updated, sql);
+    const enrichedUpdated = await enrichWithDepartments(rowToDocType(updated as unknown as DocTypeRow), sql);
     return reply.status(200).send(enrichedUpdated);
   });
 

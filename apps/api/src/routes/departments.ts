@@ -15,6 +15,30 @@ interface DepartmentDoc extends TenantDocument {
   createdAt: Date;
 }
 
+type DeptRow = {
+  id: string;
+  tenant_id: string;
+  parent_id: string | null;
+  name: string;
+  level: number;
+  tags: string[];
+  created_at: Date;
+  deleted: boolean;
+};
+
+function rowToDept(r: DeptRow): DepartmentDoc {
+  return {
+    id: r.id,
+    tenantId: r.tenant_id,
+    parentId: r.parent_id,
+    name: r.name,
+    level: r.level,
+    tags: r.tags,
+    createdAt: r.created_at,
+    deleted: r.deleted,
+  };
+}
+
 const ListDepartmentsQuerySchema = z.object({
   tenantId: z.string().uuid().optional(),
   writable: z
@@ -50,17 +74,6 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
     const { tenantId: tenantIdParam, writable } = ListDepartmentsQuerySchema.parse(request.query);
     const sql = app.db;
     const role = request.user?.role;
-
-    type DeptRow = {
-      id: string;
-      tenant_id: string;
-      parent_id: string | null;
-      name: string;
-      level: number;
-      tags: string[];
-      created_at: Date;
-      deleted: boolean;
-    };
 
     const aclTenantId =
       role === 'SUPER_ADMIN' || role === 'MULTI_TENANT_ADMIN'
@@ -212,7 +225,7 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
     });
 
     request.log.info({ tenantId, departmentId: dept.id }, 'departamento criado');
-    return reply.status(201).send(dept);
+    return reply.status(201).send(rowToDept(dept as unknown as DeptRow));
   });
 
   /**
@@ -237,7 +250,7 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
     if (!updated) throw new NotFoundError();
 
     request.log.info({ tenantId, departmentId: id }, 'departamento atualizado');
-    return reply.status(200).send(updated);
+    return reply.status(200).send(rowToDept(updated as unknown as DeptRow));
   });
 
   /**

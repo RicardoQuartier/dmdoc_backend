@@ -172,11 +172,10 @@ export const permissionsRoutes: FastifyPluginAsync = async (app) => {
     `;
 
     if (uniqueRootIds.length > 0) {
-      const now = new Date();
       for (const departmentId of uniqueRootIds) {
         await sql`
-          INSERT INTO department_permissions (id, tenant_id, user_id, department_id, can_read, can_write, deleted, created_at)
-          VALUES (${newId()}, ${tenantId}, ${id}, ${departmentId}, true, true, false, ${now})
+          INSERT INTO department_permissions (id, tenant_id, user_id, department_id, can_read, can_write, deleted)
+          VALUES (${newId()}, ${tenantId}, ${id}, ${departmentId}, true, true, false)
         `;
       }
     }
