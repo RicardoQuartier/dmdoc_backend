@@ -19,6 +19,7 @@ COPY . .
 RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @dmdoc/shared-types build \
  && pnpm --filter @dmdoc/extractor build \
+ && pnpm --filter @dmdoc/logger build \
  && pnpm --filter @dmdoc/llm-provider build \
  && pnpm --filter @dmdoc/db-pg build \
  && pnpm --filter @dmdoc/db-mongo build \
