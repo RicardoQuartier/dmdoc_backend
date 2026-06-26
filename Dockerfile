@@ -16,16 +16,12 @@ FROM node:22-slim AS builder
 WORKDIR /app
 RUN corepack enable
 COPY . .
-# `mongodb-memory-server` é devDependency usada só em testes (pacote legado
-# @dmdoc/db-mongo, da migração Mongo→Postgres). Seu postinstall baixaria ~82MB
-# do binário do MongoDB, que a imagem nunca usa — desligamos esse download.
-RUN MONGOMS_DISABLE_POSTINSTALL=1 pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @dmdoc/shared-types build \
  && pnpm --filter @dmdoc/extractor build \
  && pnpm --filter @dmdoc/logger build \
  && pnpm --filter @dmdoc/llm-provider build \
  && pnpm --filter @dmdoc/db-pg build \
- && pnpm --filter @dmdoc/db-mongo build \
  && pnpm --filter @dmdoc/worker build
 
 # ---------- api: Fastify API ----------
