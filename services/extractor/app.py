@@ -20,6 +20,7 @@ antigas (vs. 20-90s do EasyOCR em Westmere/Ivy Bridge sem AVX2).
 """
 
 import asyncio
+import datetime
 import io
 import json
 import logging
@@ -28,6 +29,7 @@ import subprocess
 import tempfile
 import threading
 import zipfile
+from zoneinfo import ZoneInfo
 
 import boto3
 import redis as redis_lib
@@ -38,12 +40,71 @@ import fitz  # PyMuPDF
 import numpy as np
 from PIL import Image
 
-logger = logging.getLogger("dmdoc.extractor")
-_handler = logging.StreamHandler()
-_handler.setFormatter(logging.Formatter("%(levelname)-8s %(name)s - %(message)s"))
-logger.addHandler(_handler)
-logger.setLevel(logging.INFO)
-logger.propagate = False
+_SAO_PAULO_TZ = ZoneInfo("America/Sao_Paulo")
+
+# Atributos padrão de um LogRecord — tudo que NÃO estiver aqui é tratado como
+# campo de contexto (tenantId, documentId, traceId, ...) passado via `extra=`.
+# `color_message` é ruído do uvicorn (mensagem com códigos ANSI) — descartado.
+_LOG_RECORD_BUILTINS = frozenset(vars(logging.makeLogRecord({}))) | {
+    "message",
+    "asctime",
+    "taskName",
+    "color_message",
+}
+
+
+class JsonFormatter(logging.Formatter):
+    """Formata logs como JSON no padrão único do DMDoc (ver packages/logger).
+
+    Cada linha contém:
+      - level:   label minúsculo (info, error, ...)
+      - time:    yyyy-mm-dd hh:mm:ss no fuso America/Sao_Paulo
+      - service: "extractor"
+      - msg:     mensagem já interpolada
+      - campos de contexto extras (traceId, tenantId, documentId, ...)
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, object] = {
+            "level": record.levelname.lower(),
+            "time": datetime.datetime.fromtimestamp(record.created, _SAO_PAULO_TZ).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "service": "extractor",
+            "msg": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key not in _LOG_RECORD_BUILTINS and not key.startswith("_"):
+                payload[key] = value
+        if record.exc_info:
+            payload["err"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def _install_json_handler() -> logging.Logger:
+    """Instala um handler JSON no logger raiz e roteia uvicorn/FastAPI por ele,
+    para que toda a saída do serviço siga o mesmo padrão de log."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+
+    # uvicorn configura seus loggers antes de importar este módulo; aqui os
+    # esvaziamos e deixamos propagar para o handler JSON do root.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uv = logging.getLogger(name)
+        uv.handlers = []
+        uv.propagate = True
+
+    app_logger = logging.getLogger("dmdoc.extractor")
+    app_logger.setLevel(logging.INFO)
+    app_logger.propagate = True
+    return app_logger
+
+
+logger = _install_json_handler()
 
 LANGS = os.environ.get("OCR_LANGS", "pt").split(",")
 
@@ -154,8 +215,9 @@ def _extraction_consumer_loop() -> None:
             result_key = f"{EXTRACT_RESULT_PREFIX}{request_id}"
 
             logger.info(
-                "extraindo requestId=%s s3Key=%s mime=%s",
-                request_id, s3_key, mime,
+                "extraindo s3Key=%s mime=%s",
+                s3_key, mime,
+                extra={"traceId": request_id, "s3Key": s3_key, "mimeType": mime},
             )
 
             try:
@@ -167,8 +229,9 @@ def _extraction_consumer_loop() -> None:
                 out = json.dumps(result)
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
-                    "falha ao processar requestId=%s s3Key=%s: %s",
-                    request_id, s3_key, exc,
+                    "falha ao processar s3Key=%s: %s",
+                    s3_key, exc,
+                    extra={"traceId": request_id, "s3Key": s3_key},
                 )
                 out = json.dumps({"error": str(exc), "text": "", "pageCount": 1, "ocrPages": []})
 
@@ -176,7 +239,9 @@ def _extraction_consumer_loop() -> None:
             pipe.rpush(result_key, out)
             pipe.expire(result_key, RESULT_KEY_TTL_SECS)
             pipe.execute()
-            logger.info("resultado publicado requestId=%s", request_id)
+            logger.info(
+                "resultado publicado", extra={"traceId": request_id}
+            )
 
         except redis_lib.exceptions.ConnectionError as exc:
             logger.error(

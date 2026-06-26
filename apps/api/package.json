@@ -18,6 +18,7 @@
     "@dmdoc/db-mongo": "workspace:*",
     "@dmdoc/db-pg": "workspace:*",
     "@dmdoc/llm-provider": "workspace:*",
+    "@dmdoc/logger": "workspace:*",
     "@dmdoc/shared-types": "workspace:*",
     "@fastify/cors": "^11.2.0",
     "@fastify/multipart": "^10.0.0",

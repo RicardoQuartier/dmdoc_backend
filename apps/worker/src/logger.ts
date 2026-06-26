@@ -1,19 +1,19 @@
-import { pino, type Logger } from 'pino';
+import type { Logger } from 'pino';
+import { createLogger as createBaseLogger } from '@dmdoc/logger';
 import { config as defaultConfig, type Config } from './config.js';
 
 /**
  * Logger estruturado (Pino) do worker.
  *
+ * Usa o padrão único do DMDoc (`@dmdoc/logger`): JSON com `service: 'worker'`,
+ * timestamp `yyyy-mm-dd hh:mm:ss` em America/Sao_Paulo e `level` como label.
+ *
  * Convenção DMDoc (spec §14): nunca `console.log`. Os campos de contexto
- * `tenantId`, `documentId`, `userId` e `traceId` devem ser adicionados via
- * `logger.child({...})` quando houver um job real para processar (Fase 3+).
- * No scaffold da Fase 0 expomos apenas o logger base.
+ * `tenantId`, `documentId`, `userId` e `traceId` são adicionados via
+ * `logger.child({...})` quando há um job real para processar.
  */
 export function createLogger(config: Config = defaultConfig): Logger {
-  return pino({
-    level: config.LOG_LEVEL,
-    base: { service: 'worker' },
-  });
+  return createBaseLogger({ service: 'worker', level: config.LOG_LEVEL });
 }
 
 /** Logger singleton para uso da aplicação. */

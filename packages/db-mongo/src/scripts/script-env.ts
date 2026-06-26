@@ -1,4 +1,5 @@
-import pino from 'pino';
+import type { Logger } from 'pino';
+import { createLogger } from '@dmdoc/logger';
 
 /**
  * Helpers compartilhados pelos scripts de bootstrap (`create-indexes`, `seed`).
@@ -9,12 +10,13 @@ import pino from 'pino';
  */
 
 /**
- * Logger Pino para os scripts. Em TTY usa transport `pino-pretty` se disponível,
- * caindo para JSON puro caso o transport não esteja instalado.
+ * Logger Pino para os scripts, no padrão único do DMDoc (`@dmdoc/logger`):
+ * JSON com `service`, timestamp `yyyy-mm-dd hh:mm:ss` (America/Sao_Paulo) e
+ * `level` como label. O `name` do script vira o `service`.
  */
-export function createScriptLogger(name: string): pino.Logger {
+export function createScriptLogger(name: string): Logger {
   const level = process.env.LOG_LEVEL ?? 'info';
-  return pino({ name, level });
+  return createLogger({ service: name, level });
 }
 
 /**

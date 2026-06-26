@@ -53,6 +53,9 @@ importers:
       '@dmdoc/llm-provider':
         specifier: workspace:*
         version: link:../../packages/llm-provider
+      '@dmdoc/logger':
+        specifier: workspace:*
+        version: link:../../packages/logger
       '@dmdoc/shared-types':
         specifier: workspace:*
         version: link:../../packages/shared-types
@@ -126,6 +129,9 @@ importers:
       '@dmdoc/extractor':
         specifier: workspace:*
         version: link:../../packages/extractor
+      '@dmdoc/logger':
+        specifier: workspace:*
+        version: link:../../packages/logger
       '@dmdoc/shared-types':
         specifier: workspace:*
         version: link:../../packages/shared-types
@@ -169,6 +175,9 @@ importers:
 
   packages/db-mongo:
     dependencies:
+      '@dmdoc/logger':
+        specifier: workspace:*
+        version: link:../logger
       '@dmdoc/shared-types':
         specifier: workspace:*
         version: link:../shared-types
@@ -281,6 +290,22 @@ importers:
       tsx:
         specifier: ^4.19.2
         version: 4.22.4
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.19.20)
+
+  packages/logger:
+    dependencies:
+      pino:
+        specifier: ^9.6.0
+        version: 9.14.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.20
       typescript:
         specifier: ^5.7.2
         version: 5.9.3

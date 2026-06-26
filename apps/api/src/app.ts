@@ -3,6 +3,7 @@ import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import { ZodError } from 'zod';
 import type { Queue } from 'bullmq';
+import { baseLoggerOptions } from '@dmdoc/logger';
 import { createPgClient, type Sql } from '@dmdoc/db-pg';
 import { getConfig, type Config } from './config.js';
 import { AppError } from './errors/index.js';
@@ -79,9 +80,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   const config = options.config ?? getConfig();
 
   const app = Fastify({
-    logger: {
-      level: config.LOG_LEVEL,
-    },
+    logger: baseLoggerOptions({ service: 'api', level: config.LOG_LEVEL }),
+  });
+
+  // Anexa o `traceId` (id da request) ao logger desde o primeiro hook, para que
+  // todas as linhas de uma mesma request saiam correlacionadas sem repasse manual.
+  app.addHook('onRequest', (request, _reply, done) => {
+    request.log = request.log.child({ traceId: request.id });
+    done();
   });
 
   registerErrorHandler(app);
