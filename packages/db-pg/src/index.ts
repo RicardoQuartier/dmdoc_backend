@@ -6,6 +6,7 @@ export * from './tenant-repository.js';
 export * from './document-events-repository.js';
 export * from './search.js';
 export * from './user-write-validation.js';
+export * from './tenant-deletion.js';
 export { dbFresh } from './db-fresh.js';
 export { seed } from './seed.js';
 

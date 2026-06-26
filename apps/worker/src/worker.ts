@@ -7,8 +7,14 @@ import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import { config } from './config.js';
 import { logger } from './logger.js';
 import { createRedisConnection } from './redis.js';
-import { DOCUMENT_PROCESSING_QUEUE, type DocumentProcessingJobData } from './queues.js';
+import {
+  DOCUMENT_PROCESSING_QUEUE,
+  TENANT_DELETION_QUEUE,
+  type DocumentProcessingJobData,
+} from './queues.js';
 import { runPipeline, type PipelineDeps } from './pipeline/index.js';
+import { createWorkerS3 } from './s3.js';
+import { createTenantDeletionWorker } from './tenant-deletion-worker.js';
 
 /**
  * Concorrência do worker (spec §8).
@@ -124,9 +130,19 @@ async function main(): Promise<void> {
     'worker iniciado e ouvindo a fila'
   );
 
+  // Worker de exclusão de empresa (tenant). Sobe ao lado do worker de documentos
+  // e consome a fila `tenant-deletion`, executando a purga pesada em background.
+  const s3 = createWorkerS3(config);
+  const tenantDeletionWorker = createTenantDeletionWorker({ sql, s3, logger });
+
+  logger.info(
+    { queue: TENANT_DELETION_QUEUE },
+    'worker de exclusão de tenant iniciado e ouvindo a fila'
+  );
+
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, 'encerrando worker');
-    await worker.close();
+    await Promise.all([worker.close(), tenantDeletionWorker.close()]);
     extractionPushConn.disconnect();
     await sql.end();
     process.exit(0);

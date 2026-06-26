@@ -66,7 +66,8 @@ const vector = (name: string, dimensions: number) =>
 
 /**
  * Empresa (tenant). Raiz do isolamento multi-tenant.
- * SEM coluna `deleted` — tenants são desativados via `active: false`.
+ * `active = false` desativa a empresa; `deleted = true` marca exclusão lógica
+ * (purga total dos dados, registro preservado para integridade referencial).
  */
 export const tenants = pgTable('tenants', {
   id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
@@ -77,6 +78,8 @@ export const tenants = pgTable('tenants', {
   createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
     .notNull()
     .default(sql`now()`),
+  deleted: boolean('deleted').notNull().default(false),
+  deletedAt: timestamp('deleted_at', { withTimezone: true, mode: 'date' }),
 });
 
 // ---------------------------------------------------------------------------
@@ -389,9 +392,9 @@ export const documentEvents = pgTable(
       .notNull()
       .references(() => tenants.id),
     documentId: uuid('document_id').references(() => documents.id),
-    uploadedById: uuid('uploaded_by_id')
-      .notNull()
-      .references(() => users.id),
+    // Nullable: ao purgar uma empresa excluída, o usuário é removido mas o
+    // evento (append-only) é preservado com uploaded_by_id anulado.
+    uploadedById: uuid('uploaded_by_id').references(() => users.id),
     eventType: text('event_type').notNull().default('upload'), // 'upload'
     mimeType: text('mime_type').notNull(),
     documentTypeId: uuid('document_type_id').references(() => documentTypes.id),

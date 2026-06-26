@@ -19,7 +19,17 @@ async function main(): Promise<void> {
     },
   });
 
-  const app = await buildApp({ config, queue });
+  // Fila BullMQ de purga de empresas (exclusão de tenant).
+  // O worker consome desta fila e executa a purga definitiva em background.
+  const tenantDeletionQueue = new Queue('tenant-deletion', {
+    connection: { url: config.REDIS_URL },
+    defaultJobOptions: {
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 2000 },
+    },
+  });
+
+  const app = await buildApp({ config, queue, tenantDeletionQueue });
 
   try {
     await app.listen({ port: config.APP_PORT, host: '0.0.0.0' });

@@ -27,9 +27,10 @@ try {
   // 2. Mark 0001_initial as already applied (sha256 of the file)
   const hash0001 = '476966a7083bcea0509dc6fbf5cbbcb8d00b94598d34d33bccc6f221f4104fbd';
   const hash0002 = '032167c206fa0b0e9db055e48f96e0ed3281cb1d20d040edd3640baef19c3e1c';
+  const hash0003 = '4907d794fcf57e16c4ed488c71a7870ec75158cde796fbcbce49330e1fe5a00c';
 
   const existing = await sql<{ hash: string }[]>`
-    SELECT hash FROM drizzle.__drizzle_migrations WHERE hash = ANY(${[hash0001, hash0002]})
+    SELECT hash FROM drizzle.__drizzle_migrations WHERE hash = ANY(${[hash0001, hash0002, hash0003]})
   `;
   const existingSet = new Set(existing.map((r) => r.hash));
 
@@ -56,7 +57,20 @@ try {
     console.log('– 0002_partial_unique_content_hash já registrada');
   }
 
-  // 4. Verify
+  // 4. Apply 0003: FK nullable em document_events + colunas deleted em tenants
+  await sql`ALTER TABLE document_events ALTER COLUMN uploaded_by_id DROP NOT NULL`;
+  await sql`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS deleted boolean NOT NULL DEFAULT false`;
+  await sql`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS deleted_at timestamptz`;
+  console.log('✔ 0003: document_events.uploaded_by_id nullable + tenants.deleted/deleted_at');
+
+  if (!existingSet.has(hash0003)) {
+    await sql`INSERT INTO drizzle.__drizzle_migrations (hash, created_at) VALUES (${hash0003}, ${1782432000000})`;
+    console.log('✔ 0003_tenant_deletion marcada como aplicada');
+  } else {
+    console.log('– 0003_tenant_deletion já registrada');
+  }
+
+  // 5. Verify
   const idx = await sql<{ indexdef: string }[]>`
     SELECT indexdef FROM pg_indexes
     WHERE tablename = 'documents' AND indexname = 'uniq_doc_tenant_content_hash'

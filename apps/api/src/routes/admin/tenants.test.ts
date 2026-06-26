@@ -1,5 +1,6 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
+import type { Queue } from 'bullmq';
 import { buildApp } from '../../app.js';
 import { startTestReplSetDb, seedUser, testConfig, type TestReplSetDb } from '../../test/helpers.js';
 import { newId } from '@dmdoc/db-pg';
@@ -54,6 +55,8 @@ afterAll(async () => {
 beforeEach(async () => {
   await testDb.db`DELETE FROM departments`;
   await testDb.db`DELETE FROM department_templates`;
+  // audit_logs referencia tenants(id) via FK RESTRICT — limpar antes de tenants.
+  await testDb.db`DELETE FROM audit_logs`;
   await testDb.db`DELETE FROM tenants`;
 });
 
@@ -290,5 +293,167 @@ describe('POST /admin/tenants com templateId inválido', () => {
     // Nenhum tenant criado
     const rows = await testDb.db`SELECT id FROM tenants WHERE name = 'Empresa Inválida'`;
     expect(rows).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. DELETE /admin/tenants/:id — exclusão (soft-delete) + enfileiramento
+// ---------------------------------------------------------------------------
+describe('DELETE /admin/tenants/:id', () => {
+  const MTA_ID = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+  const MTA_PASSWORD = 'mta-senha-segura-77';
+
+  let deleteApp: FastifyInstance;
+  let mtaToken: string;
+  const queueAddMock = vi.fn(async () => ({ id: 'job-1' }));
+  const tenantDeletionQueue = {
+    add: queueAddMock,
+    close: async () => {},
+  } as unknown as Queue;
+
+  beforeAll(async () => {
+    deleteApp = await buildApp({ config: testConfig(), db: testDb.db, tenantDeletionQueue });
+
+    // MULTI_TENANT_ADMIN é papel global (tenant_id null) — não é SUPER_ADMIN,
+    // então cai no 403; sem tenant_id evita conflito de FK na limpeza de tenants.
+    await seedUser(testDb.db, {
+      id: MTA_ID,
+      tenantId: null,
+      email: 'mta@plataforma.com',
+      password: MTA_PASSWORD,
+      role: 'MULTI_TENANT_ADMIN',
+    });
+
+    const res = await deleteApp.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: { email: 'mta@plataforma.com', password: MTA_PASSWORD },
+    });
+    expect(res.statusCode).toBe(200);
+    mtaToken = res.json().accessToken as string;
+  });
+
+  afterAll(async () => {
+    await deleteApp.close();
+  });
+
+  beforeEach(() => {
+    queueAddMock.mockClear();
+  });
+
+  async function createTenant(name: string): Promise<string> {
+    const res = await deleteApp.inject({
+      method: 'POST',
+      url: '/admin/tenants',
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { name },
+    });
+    expect(res.statusCode).toBe(201);
+    return (res.json() as Record<string, unknown>)['id'] as string;
+  }
+
+  it('retorna 403 para papel não-SUPER_ADMIN', async () => {
+    const tenantId = await createTenant('Empresa 403');
+
+    const res = await deleteApp.inject({
+      method: 'DELETE',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${mtaToken}` },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(queueAddMock).not.toHaveBeenCalled();
+
+    // Tenant permanece intacto (não marcado como deleted)
+    const rows = await testDb.db<Array<{ deleted: boolean }>>`SELECT deleted FROM tenants WHERE id = ${tenantId}`;
+    expect(rows[0]?.deleted).toBe(false);
+  });
+
+  it('retorna 404 para id inexistente', async () => {
+    const res = await deleteApp.inject({
+      method: 'DELETE',
+      url: `/admin/tenants/${newId()}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ error: { code: 'NOT_FOUND' } });
+    expect(queueAddMock).not.toHaveBeenCalled();
+  });
+
+  it('retorna 404 ao tentar excluir um tenant já excluído (idempotência)', async () => {
+    const tenantId = await createTenant('Empresa Já Excluída');
+
+    const first = await deleteApp.inject({
+      method: 'DELETE',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+    });
+    expect(first.statusCode).toBe(202);
+
+    const second = await deleteApp.inject({
+      method: 'DELETE',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+    });
+    expect(second.statusCode).toBe(404);
+    expect(second.json()).toMatchObject({ error: { code: 'NOT_FOUND' } });
+
+    // Só o primeiro disparo enfileirou o job
+    expect(queueAddMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('retorna 202, marca o tenant como deleted e enfileira o job de purga', async () => {
+    const tenantId = await createTenant('Empresa Feliz');
+
+    const res = await deleteApp.inject({
+      method: 'DELETE',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+    });
+
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual({ id: tenantId, status: 'deleting' });
+
+    // Tenant marcado deleted=true / active=false / deleted_at preenchido / renomeado
+    const rows = await testDb.db<Array<{ deleted: boolean; active: boolean; deleted_at: Date | null; name: string }>>`
+      SELECT deleted, active, deleted_at, name FROM tenants WHERE id = ${tenantId}
+    `;
+    expect(rows[0]?.deleted).toBe(true);
+    expect(rows[0]?.active).toBe(false);
+    expect(rows[0]?.deleted_at).not.toBeNull();
+    expect(rows[0]?.name).toMatch(/^\[EXCLUÍDA-\d+\] Empresa Feliz$/);
+
+    // Job enfileirado exatamente uma vez com o payload { tenantId }
+    expect(queueAddMock).toHaveBeenCalledTimes(1);
+    expect(queueAddMock).toHaveBeenCalledWith('purge', { tenantId }, expect.objectContaining({ attempts: 3 }));
+
+    // AuditLog registrado
+    const audit = await testDb.db<Array<{ action: string }>>`
+      SELECT action FROM audit_logs WHERE tenant_id = ${tenantId} AND action = 'tenant.delete.requested'
+    `;
+    expect(audit).toHaveLength(1);
+  });
+
+  it('GET /admin/tenants não retorna empresas excluídas', async () => {
+    const visivelId = await createTenant('Empresa Visível');
+    const excluidaId = await createTenant('Empresa Sumida');
+
+    const del = await deleteApp.inject({
+      method: 'DELETE',
+      url: `/admin/tenants/${excluidaId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+    });
+    expect(del.statusCode).toBe(202);
+
+    const list = await deleteApp.inject({
+      method: 'GET',
+      url: '/admin/tenants',
+      headers: { authorization: `Bearer ${superAdminToken}` },
+    });
+    expect(list.statusCode).toBe(200);
+    const ids = (list.json().items as Array<{ id: string }>).map((t) => t.id);
+    expect(ids).toContain(visivelId);
+    expect(ids).not.toContain(excluidaId);
   });
 });

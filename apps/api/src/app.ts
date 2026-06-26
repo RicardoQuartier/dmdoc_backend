@@ -38,6 +38,11 @@ declare module 'fastify' {
      */
     queue: Queue | null;
     /**
+     * Fila BullMQ de purga de empresas (tenant-deletion).
+     * Null em testes — jobs não são enfileirados.
+     */
+    tenantDeletionQueue: Queue | null;
+    /**
      * Tamanho máximo permitido para upload de arquivo (em bytes).
      * Derivado de `config.MAX_UPLOAD_MB`.
      */
@@ -60,6 +65,12 @@ export interface BuildAppOptions {
    * Em produção, `server.ts` cria a fila e a injeta aqui.
    */
   queue?: Queue | null;
+  /**
+   * Fila BullMQ de purga de empresas (tenant-deletion).
+   * Em testes, passe `null` (ou omita) para desabilitar o enfileiramento.
+   * Em produção, `server.ts` cria a fila e a injeta aqui.
+   */
+  tenantDeletionQueue?: Queue | null;
   /**
    * Instância de S3Service a injetar.
    * Em testes, passe um mock. Em produção é criado a partir da config.
@@ -109,6 +120,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   // Fila BullMQ — null quando não injetada (testes)
   app.decorate('queue', options.queue ?? null);
 
+  // Fila BullMQ de purga de empresas — null quando não injetada (testes)
+  app.decorate('tenantDeletionQueue', options.tenantDeletionQueue ?? null);
+
   // Serviço S3
   const s3 = options.s3 ?? createS3Service(buildS3Config(config));
   app.decorate('s3', s3);
@@ -152,6 +166,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     const queue = options.queue;
     app.addHook('onClose', async () => {
       await queue.close();
+    });
+  }
+
+  // Fecha a fila de purga de empresas no shutdown
+  if (options.tenantDeletionQueue) {
+    const tenantDeletionQueue = options.tenantDeletionQueue;
+    app.addHook('onClose', async () => {
+      await tenantDeletionQueue.close();
     });
   }
 
