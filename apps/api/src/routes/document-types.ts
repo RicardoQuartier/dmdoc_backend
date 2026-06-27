@@ -248,7 +248,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       const now = new Date();
       await sql`
         INSERT INTO document_types (id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted)
-        VALUES (${id}, NULL, ${name}, ${description ?? null}, true, ${now}, ${JSON.stringify([])}, NULL, false)
+        VALUES (${id}, NULL, ${name}, ${description ?? null}, true, ${now}, ${sql.json([])}, NULL, false)
       `;
       request.log.info({ documentTypeId: id }, 'tipo de documento global criado');
       const enrichedGlobal = await enrichWithDepartments(
@@ -458,7 +458,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       if (docType.isGlobal) {
         updRows = await sql<DocTypeRow[]>`
           UPDATE document_types
-          SET index_fields = ${JSON.stringify(newFields)}
+          SET index_fields = ${sql.json(newFields)}
           WHERE id = ${id}
             AND deleted = false
           RETURNING id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
@@ -466,7 +466,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       } else {
         updRows = await sql<DocTypeRow[]>`
           UPDATE document_types
-          SET index_fields = ${JSON.stringify(newFields)}
+          SET index_fields = ${sql.json(newFields)}
           WHERE id = ${id}
             AND tenant_id = ${tenantIdFilter}
             AND deleted = false
@@ -527,7 +527,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       if (docType.isGlobal) {
         updRows = await sql<DocTypeRow[]>`
           UPDATE document_types
-          SET index_fields = ${JSON.stringify(updatedFields)}
+          SET index_fields = ${sql.json(updatedFields)}
           WHERE id = ${id}
             AND deleted = false
           RETURNING id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
@@ -535,7 +535,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       } else {
         updRows = await sql<DocTypeRow[]>`
           UPDATE document_types
-          SET index_fields = ${JSON.stringify(updatedFields)}
+          SET index_fields = ${sql.json(updatedFields)}
           WHERE id = ${id}
             AND tenant_id = ${tenantIdFilter}
             AND deleted = false
@@ -726,7 +726,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       if (docType.isGlobal) {
         updRows = await sql<DocTypeRow[]>`
           UPDATE document_types
-          SET index_fields = ${JSON.stringify(updatedFields)}
+          SET index_fields = ${sql.json(updatedFields)}
           WHERE id = ${id}
             AND deleted = false
           RETURNING id, tenant_id, name, description, is_global, created_at, index_fields, department_ids, deleted
@@ -734,7 +734,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       } else {
         updRows = await sql<DocTypeRow[]>`
           UPDATE document_types
-          SET index_fields = ${JSON.stringify(updatedFields)}
+          SET index_fields = ${sql.json(updatedFields)}
           WHERE id = ${id}
             AND tenant_id = ${tenantIdFilter}
             AND deleted = false
