@@ -31,7 +31,16 @@ const csvStrings = z
       .map((s) => s.trim())
       .filter((s) => s.length > 0),
   )
-  .pipe(z.array(z.string().min(1)));
+  .pipe(
+    z.array(
+      z
+        .string()
+        .regex(
+          /^[a-zA-Z0-9][a-zA-Z0-9!#$&\-^_]*\/[a-zA-Z0-9][a-zA-Z0-9!#$&\-^_.+]*$/,
+          'Invalid MIME type format',
+        ),
+    ),
+  );
 
 const UploadsReportQuerySchema = z.object({
   tenantId: z.string().uuid().optional(),
@@ -46,7 +55,7 @@ const UploadsReportQuerySchema = z.object({
 type TotalRow = { documents: string; pages: string };
 type GroupRow = { group_key: string | null; documents: string; pages: string; label?: string | null };
 type StatusRow = { status: string; count: string };
-type MimeTypeRow = { mime_type: string; group_key: string | null; files: string; pages: string; size_bytes: string };
+type MimeTypeRow = { group_key: string | null; files: string; pages: string; size_bytes: string };
 type UserIdRow = { group_key: string | null; files: string; pages: string; size_bytes: string };
 type DocTypeRow = { group_key: string | null; files: string; pages: string; size_bytes: string; document_type_name?: string | null };
 
@@ -360,7 +369,7 @@ export const reportsRoutes: FastifyPluginAsync = async (app) => {
       // Por formato (mime_type)
       const byFormatRows = await buildEventsQuery<MimeTypeRow>('mime_type');
       const byFormat = byFormatRows.map((row) => ({
-        mimeType: row.mime_type ?? row.group_key,
+        mimeType: row.group_key,
         files: parseInt(row.files, 10),
         pages: parseInt(row.pages, 10),
         sizeBytes: parseInt(row.size_bytes, 10),
@@ -377,8 +386,8 @@ export const reportsRoutes: FastifyPluginAsync = async (app) => {
 
       if (groupBy === 'format') {
         groups = byFormatRows.map((row) => ({
-          key: row.mime_type ?? row.group_key,
-          label: row.mime_type ?? row.group_key,
+          key: row.group_key,
+          label: row.group_key,
           files: parseInt(row.files, 10),
           pages: parseInt(row.pages, 10),
           sizeBytes: parseInt(row.size_bytes, 10),

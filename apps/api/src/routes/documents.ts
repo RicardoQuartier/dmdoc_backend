@@ -93,7 +93,7 @@ const ListDocumentsQuerySchema = z.object({
     .string()
     .optional()
     .transform((v) => (v !== undefined ? parseInt(v, 10) : 20))
-    .pipe(z.number().min(1).max(100)),
+    .pipe(z.number().min(1).max(500)),
 });
 
 /** Schema do body do PATCH /documents/:id. */
@@ -1151,6 +1151,19 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     if (!updated) {
       throw new NotFoundError('Documento não encontrado');
+    }
+
+    if (body.documentTypeId !== undefined) {
+      const newDocTypeName = await resolveDocumentTypeName(sql, tenantId, body.documentTypeId ?? null);
+      const eventsRepo = new DocumentEventsRepository(sql, { tenantId });
+      try {
+        await eventsRepo.syncDocumentType(id, body.documentTypeId ?? null, newDocTypeName);
+      } catch (syncError) {
+        request.log.error(
+          { err: syncError, tenantId, userId, documentId: id },
+          'falha ao sincronizar document_events após atualização de tipo'
+        );
+      }
     }
 
     const auditLogger = new AuditLogger(sql);
