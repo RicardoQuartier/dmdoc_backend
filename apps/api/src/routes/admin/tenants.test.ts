@@ -72,7 +72,7 @@ async function seedTemplate(
     VALUES (
       ${templateId},
       'Template de Teste',
-      ${JSON.stringify(nodes.map((n) => ({ ...n, tags: n.tags ?? [] })))}::jsonb,
+      ${testDb.db.json(nodes.map((n) => ({ ...n, tags: n.tags ?? [] })))},
       NOW(),
       NOW()
     )

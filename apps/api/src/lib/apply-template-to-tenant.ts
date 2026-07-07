@@ -15,7 +15,6 @@ interface DepartmentInsertRow {
   level: number;
   tags: string[];
   createdAt: Date;
-  updatedAt: Date;
   deleted: false;
 }
 
@@ -59,7 +58,12 @@ export async function applyTemplateToTenant(
     throw new NotFoundError('Template de departamentos não encontrado');
   }
 
-  const nodes = templateDoc.nodes as TemplateNode[];
+  // A coluna `nodes` é jsonb. O driver devolve um array já parseado, mas
+  // templates gravados por versões antigas (que serializavam com JSON.stringify
+  // num campo jsonb) ficaram double-encoded — o valor volta como string JSON.
+  // Normalizamos os dois casos para não quebrar templates legados.
+  const rawNodes = templateDoc.nodes;
+  const nodes = (typeof rawNodes === 'string' ? JSON.parse(rawNodes) : rawNodes) as TemplateNode[];
 
   if (nodes.length === 0) {
     logger.info({ tenantId, templateId, deptCount: 0 }, 'template sem nós; nenhum departamento criado');
@@ -107,7 +111,6 @@ export async function applyTemplateToTenant(
       level,
       tags: node.tags,
       createdAt: now,
-      updatedAt: now,
       deleted: false,
     });
   }
@@ -115,7 +118,7 @@ export async function applyTemplateToTenant(
   // 4. Bulk insert na tabela departments.
   for (const row of rows) {
     await sql`
-      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, created_at, updated_at, deleted)
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
       VALUES (
         ${row.id},
         ${row.tenantId},
@@ -123,9 +126,8 @@ export async function applyTemplateToTenant(
         ${row.name},
         ${row.level},
         ${row.tags},
-        ${row.createdAt},
-        ${row.updatedAt},
-        ${row.deleted}
+        ${row.deleted},
+        ${row.createdAt}
       )
     `;
   }
