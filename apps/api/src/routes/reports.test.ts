@@ -59,7 +59,8 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await testDb.db`DELETE FROM document_events`;
-  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','SUPER_ADMIN','UPLOADER','USER')`;
+  await testDb.db`DELETE FROM audit_logs`;
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','SUPER_ADMIN','UPLOADER','USER','MULTI_TENANT_ADMIN')`;
   await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
 
   await testDb.db`
@@ -396,5 +397,110 @@ describe('GET /reports/uploads', () => {
     const body = res.json() as UploadsReport;
     expect(body.tenantId).toBe(TENANT_A);
     expect(body.totals).toEqual({ files: 1, pages: 10, sizeBytes: 1000 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /reports/uploaders
+// ---------------------------------------------------------------------------
+
+interface Uploader {
+  id: string;
+  name: string;
+  email: string;
+}
+
+describe('GET /reports/uploaders', () => {
+  it('retorna 401 sem token', async () => {
+    const res = await app.inject({ method: 'GET', url: '/reports/uploaders' });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('usuário TENANT_ADMIN com evento no tenant aparece na lista', async () => {
+    await insertEvent({ tenantId: TENANT_A, uploadedById: ADMIN_A_ID, mimeType: PDF, documentTypeId: null, documentTypeName: null, sizeBytes: 100, pageCount: 1, documentId: null, createdAt: new Date('2026-03-01') });
+
+    const res = await app.inject({
+      method: 'GET', url: '/reports/uploaders',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Uploader[];
+    const admin = body.find((u) => u.id === ADMIN_A_ID);
+    expect(admin).toEqual({ id: ADMIN_A_ID, name: expect.any(String), email: 'admin-a@test.com' });
+  });
+
+  it('usuário MULTI_TENANT_ADMIN (tenant_id NULL) com evento no tenant aparece na lista', async () => {
+    const mtaId = newId();
+    await seedUser(testDb.db, {
+      id: mtaId, tenantId: null, email: 'mta-uploaders@plataforma.com', password: PASSWORD,
+      role: 'MULTI_TENANT_ADMIN', allowedTenantIds: [TENANT_A], name: 'MTA Uploader',
+    });
+
+    await insertEvent({ tenantId: TENANT_A, uploadedById: mtaId, mimeType: PDF, documentTypeId: null, documentTypeName: null, sizeBytes: 100, pageCount: 1, documentId: null, createdAt: new Date('2026-03-01') });
+
+    const res = await app.inject({
+      method: 'GET', url: '/reports/uploaders',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Uploader[];
+    const mta = body.find((u) => u.id === mtaId);
+    expect(mta).toEqual({ id: mtaId, name: 'MTA Uploader', email: 'mta-uploaders@plataforma.com' });
+  });
+
+  it('usuário sem nenhum evento no tenant não aparece na lista', async () => {
+    // USER_Y_ID nunca fez upload em nenhum teste deste bloco
+    const res = await app.inject({
+      method: 'GET', url: '/reports/uploaders',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Uploader[];
+    expect(body.find((u) => u.id === USER_Y_ID)).toBeUndefined();
+  });
+
+  it('isolamento: evento de outro tenant não vaza para a lista deste tenant', async () => {
+    await insertEvent({ tenantId: TENANT_B, uploadedById: ADMIN_B_ID, mimeType: PDF, documentTypeId: null, documentTypeName: null, sizeBytes: 100, pageCount: 1, documentId: null, createdAt: new Date('2026-03-01') });
+
+    const res = await app.inject({
+      method: 'GET', url: '/reports/uploaders',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Uploader[];
+    expect(body.find((u) => u.id === ADMIN_B_ID)).toBeUndefined();
+  });
+
+  it('SUPER_ADMIN sem tenantId retorna 409', async () => {
+    const res = await app.inject({
+      method: 'GET', url: '/reports/uploaders',
+      headers: { authorization: `Bearer ${tokenSuperAdmin}` },
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it('SUPER_ADMIN com ?tenantId vê os uploaders do tenant informado', async () => {
+    await insertEvent({ tenantId: TENANT_A, uploadedById: USER_X_ID, mimeType: PDF, documentTypeId: null, documentTypeName: null, sizeBytes: 100, pageCount: 1, documentId: null, createdAt: new Date('2026-03-01') });
+
+    const res = await app.inject({
+      method: 'GET', url: `/reports/uploaders?tenantId=${TENANT_A}`,
+      headers: { authorization: `Bearer ${tokenSuperAdmin}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Uploader[];
+    expect(body.find((u) => u.id === USER_X_ID)).toBeDefined();
+  });
+
+  it('TENANT_ADMIN não enxerga uploaders de outro tenant via ?tenantId (param ignorado)', async () => {
+    await insertEvent({ tenantId: TENANT_B, uploadedById: ADMIN_B_ID, mimeType: PDF, documentTypeId: null, documentTypeName: null, sizeBytes: 100, pageCount: 1, documentId: null, createdAt: new Date('2026-03-01') });
+
+    const res = await app.inject({
+      method: 'GET', url: `/reports/uploaders?tenantId=${TENANT_B}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Uploader[];
+    // param ignorado para não-SA → nada de TENANT_B aparece
+    expect(body.find((u) => u.id === ADMIN_B_ID)).toBeUndefined();
   });
 });
