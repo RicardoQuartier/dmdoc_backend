@@ -173,9 +173,19 @@ export const permissionsRoutes: FastifyPluginAsync = async (app) => {
 
     if (uniqueRootIds.length > 0) {
       for (const departmentId of uniqueRootIds) {
+        // Upsert: reativa a concessão caso já exista uma linha (o índice único
+        // uniq_dept_perm_user_dept é sobre (user_id, department_id) e não
+        // considera `deleted`, então a linha soft-deletada acima ainda ocupa o
+        // par e um INSERT puro colidiria com ela — 23505).
         await sql`
           INSERT INTO department_permissions (id, tenant_id, user_id, department_id, can_read, can_write, deleted)
           VALUES (${newId()}, ${tenantId}, ${id}, ${departmentId}, true, true, false)
+          ON CONFLICT (user_id, department_id)
+          DO UPDATE SET
+            deleted = false,
+            can_read = true,
+            can_write = true,
+            tenant_id = EXCLUDED.tenant_id
         `;
       }
     }

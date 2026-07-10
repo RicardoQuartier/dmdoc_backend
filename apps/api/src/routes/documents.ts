@@ -14,7 +14,7 @@ import type { Sql } from '@dmdoc/db-pg';
 import type { DocumentProcessingJobData } from '@dmdoc/shared-types';
 import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
-import { NotFoundError, QuotaExceededError } from '../errors/index.js';
+import { NotFoundError, QuotaExceededError, ValidationError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
@@ -81,19 +81,66 @@ const DownloadQuerySchema = z.object({
   open: z.coerce.boolean().optional(),
 });
 
+/**
+ * Whitelist de colunas ordenáveis do GET /documents.
+ *
+ * `sortBy` NUNCA é interpolado cru no `sql.unsafe` — sempre mapeado através
+ * deste objeto fixo. `nullable: true` exige tratamento especial (NULLS LAST no
+ * `ORDER BY` + OR-chain de nulidade no keyset do `WHERE`) — hoje só
+ * `documentTypeName` (via `document_type_id`, FK nullable).
+ */
+const SORT_COLUMNS = {
+  filename: { expr: 'd.original_filename', nullable: false },
+  status: { expr: 'd.status', nullable: false },
+  companyName: { expr: 't.name', nullable: false },
+  documentTypeName: { expr: 'dt.name', nullable: true },
+  sizeBytes: { expr: 'd.size_bytes', nullable: false },
+  uploadedAt: { expr: 'd.uploaded_at', nullable: false },
+  departmentName: { expr: 'dept.name', nullable: false },
+  uploadedByName: { expr: 'u.name', nullable: false },
+} as const satisfies Record<string, { expr: string; nullable: boolean }>;
+
+type SortByKey = keyof typeof SORT_COLUMNS;
+
+const SORT_BY_KEYS = Object.keys(SORT_COLUMNS) as [SortByKey, ...SortByKey[]];
+
+/**
+ * Divide uma string CSV em uma lista de itens não vazios, com trim.
+ * Mesmo padrão já usado para `tags` nesta rota.
+ */
+function splitCsv(value: string): string[] {
+  return value
+    .split(',')
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+}
+
 /** Schema dos query params do GET /documents. */
 const ListDocumentsQuerySchema = z.object({
   tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas — filtrar por tenant específico
-  departmentId: z.string().uuid().optional(),
-  documentTypeId: z.string().uuid().optional(),
+  departmentId: z.string().uuid().optional(), // retrocompat — single id
+  departmentIds: z
+    .string()
+    .optional()
+    .transform((v) => (v !== undefined ? splitCsv(v) : undefined))
+    .pipe(z.array(z.string().uuid()).optional()),
+  documentTypeId: z.string().uuid().optional(), // retrocompat — single id
+  documentTypeIds: z
+    .string()
+    .optional()
+    .transform((v) => (v !== undefined ? splitCsv(v) : undefined))
+    .pipe(z.array(z.string().uuid()).optional()),
+  uploadedById: z.string().uuid().optional(),
   tags: z.string().optional(), // CSV de tags
   status: z.enum(['PENDING', 'PROCESSING', 'READY', 'FAILED']).optional(),
+  sortBy: z.enum(SORT_BY_KEYS).default('uploadedAt'),
+  sortDir: z.enum(['asc', 'desc']).default('desc'),
   cursor: z.string().optional(),
   limit: z
     .string()
     .optional()
     .transform((v) => (v !== undefined ? parseInt(v, 10) : 20))
-    .pipe(z.number().min(1).max(100)),
+    .pipe(z.number().min(1).max(500)),
 });
 
 /** Schema do body do PATCH /documents/:id. */
@@ -344,6 +391,159 @@ function rowToDocument(r: DocumentRow): Record<string, unknown> {
     costUsdCents: r.cost_usd_cents,
     deleted: r.deleted,
   };
+}
+
+/**
+ * Linha de `documents` enriquecida com os LEFT JOINs exclusivos do
+ * `GET /documents` (spec da tela de listagem — departamento/enviado
+ * por/tipo/empresa). `document_type_name` é nullable porque
+ * `document_type_id` é FK nullable; os demais nomes vêm de FKs `NOT NULL`.
+ */
+interface DocumentListRow extends DocumentRow {
+  department_name: string;
+  uploaded_by_name: string;
+  document_type_name: string | null;
+  company_name: string;
+}
+
+/**
+ * Mapeia uma `DocumentListRow` (com os JOINs de listagem) para o formato
+ * camelCase de resposta do `GET /documents`. Estende `rowToDocument` — nunca
+ * usar em outros handlers, que fazem `SELECT d.*` puro sem esses JOINs.
+ */
+function rowToDocumentListItem(r: DocumentListRow): Record<string, unknown> {
+  return {
+    ...rowToDocument(r),
+    departmentName: r.department_name,
+    uploadedByName: r.uploaded_by_name,
+    documentTypeName: r.document_type_name,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GET /documents — paginação por cursor composto (keyset)
+// ---------------------------------------------------------------------------
+
+/** Valor de ordenação serializado no cursor opaco. */
+type SortCursorValue = string | number | null;
+
+/** Payload decodificado de um cursor de listagem de documentos. */
+interface ListDocumentsCursor {
+  v: SortCursorValue;
+  id: string;
+}
+
+const ListDocumentsCursorSchema = z.object({
+  v: z.union([z.string(), z.number(), z.null()]),
+  id: z.string().uuid(),
+});
+
+/**
+ * Codifica um cursor opaco (base64 de `{v, id}`) a partir do valor da coluna
+ * de ordenação e do `id` (tiebreaker) do último item da página.
+ *
+ * O cursor é opaco do ponto de vista do cliente — apenas o servidor conhece
+ * o formato interno.
+ */
+function encodeListDocumentsCursor(value: SortCursorValue, id: string): string {
+  return Buffer.from(JSON.stringify({ v: value, id })).toString('base64');
+}
+
+/**
+ * Decodifica um cursor opaco de `GET /documents`.
+ *
+ * Lança `ValidationError` (→ 422) se o cursor estiver malformado — base64
+ * inválido, JSON inválido, ou payload fora do formato `{v, id}` esperado.
+ */
+function decodeListDocumentsCursor(cursor: string): ListDocumentsCursor {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'));
+  } catch {
+    throw new ValidationError('cursor inválido');
+  }
+  const result = ListDocumentsCursorSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new ValidationError('cursor inválido');
+  }
+  return result.data;
+}
+
+/**
+ * Extrai, de uma `DocumentListRow`, o valor bruto da coluna de ordenação
+ * corrente — usado tanto para codificar o `nextCursor` quanto (indiretamente)
+ * para validar o formato esperado do cursor recebido.
+ */
+function sortValueForCursor(sortBy: SortByKey, row: DocumentListRow): SortCursorValue {
+  switch (sortBy) {
+    case 'filename':
+      return row.original_filename;
+    case 'status':
+      return row.status;
+    case 'companyName':
+      return row.company_name;
+    case 'documentTypeName':
+      return row.document_type_name;
+    case 'sizeBytes':
+      return Number(row.size_bytes);
+    case 'uploadedAt':
+      return row.uploaded_at.toISOString();
+    case 'departmentName':
+      return row.department_name;
+    case 'uploadedByName':
+      return row.uploaded_by_name;
+  }
+}
+
+/**
+ * Cast SQL explícito a aplicar ao valor de cursor de cada coluna ordenável,
+ * necessário para colunas cujo tipo não é inferido corretamente a partir de
+ * um parâmetro solto (datas e bigint) — mesmo padrão de `audit-logs.ts`.
+ */
+function sqlCastForSortColumn(sortBy: SortByKey): string {
+  switch (sortBy) {
+    case 'uploadedAt':
+      return '::timestamptz';
+    case 'sizeBytes':
+      return '::bigint';
+    default:
+      return '';
+  }
+}
+
+/**
+ * Monta a condição SQL de keyset (`WHERE`) para a página seguinte de
+ * `GET /documents`, dado o valor/`id` do cursor decodificado.
+ *
+ * Contrato: `(sortExpr, d.id) > (cursorValue, cursorId)` para ASC,
+ * `<` para DESC — `d.id` como tiebreaker determinístico.
+ *
+ * Para colunas nullable (hoje só `documentTypeName`), nulos são sempre
+ * ordenados por último (`NULLS LAST`, em ambas direções) — o keyset precisa
+ * de um OR-chain de nulidade equivalente:
+ *   - cursor não-nulo: próximas linhas = (nulas) OU (não-nulas "depois" do cursor)
+ *   - cursor nulo: já estamos no grupo de nulos — próximas linhas = nulas com
+ *     id "depois" do cursor
+ */
+function buildKeysetCondition(params: {
+  expr: string;
+  nullable: boolean;
+  dirCmp: '>' | '<';
+  valuePlaceholder: string;
+  idPlaceholder: string;
+  isNullCursor: boolean;
+}): string {
+  const { expr, nullable, dirCmp, valuePlaceholder, idPlaceholder, isNullCursor } = params;
+
+  if (!nullable) {
+    return `(${expr} ${dirCmp} ${valuePlaceholder} OR (${expr} = ${valuePlaceholder} AND d.id ${dirCmp} ${idPlaceholder}))`;
+  }
+
+  if (isNullCursor) {
+    return `(${expr} IS NULL AND d.id ${dirCmp} ${idPlaceholder})`;
+  }
+
+  return `(${expr} IS NULL OR ${expr} ${dirCmp} ${valuePlaceholder} OR (${expr} = ${valuePlaceholder} AND d.id ${dirCmp} ${idPlaceholder}))`;
 }
 
 /**
@@ -725,8 +925,17 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       role
     );
 
-    if (query.departmentId !== undefined) {
-      await assertCanReadDepartment(sql, userId, effectiveTenantId, query.departmentId, role);
+    // `departmentIds` (multi-seleção) tem prioridade; `departmentId` singular
+    // é mantido por retrocompatibilidade e tratado como lista de 1 elemento.
+    // Cada id é validado individualmente (existência + ACL) — nunca só o
+    // primeiro.
+    const requestedDepartmentIds: string[] | undefined =
+      query.departmentIds ?? (query.departmentId !== undefined ? [query.departmentId] : undefined);
+
+    if (requestedDepartmentIds !== undefined) {
+      for (const deptId of requestedDepartmentIds) {
+        await assertCanReadDepartment(sql, userId, effectiveTenantId, deptId, role);
+      }
     }
 
     // ------------------------------------------------------------------
@@ -748,22 +957,25 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     }
     // mode: 'all' (SUPER_ADMIN sem tenantId) — sem filtro de tenant
 
-    // Restrição de departamentos por role
-    if (readableDepartmentIds !== null) {
-      if (query.departmentId !== undefined) {
-        if (!readableDepartmentIds.includes(query.departmentId)) {
-          throw new NotFoundError('Departamento não encontrado ou sem permissão de leitura');
-        }
-        conditions.push(`d.department_id = ${addParam(query.departmentId)}`);
-      } else {
-        conditions.push(`d.department_id = ANY(${addParam(readableDepartmentIds)}::uuid[])`);
-      }
-    } else if (query.departmentId !== undefined) {
-      conditions.push(`d.department_id = ${addParam(query.departmentId)}`);
+    // Restrição de departamentos por role — `requestedDepartmentIds` já foi
+    // validado (existência + ACL) acima via `assertCanReadDepartment`.
+    if (requestedDepartmentIds !== undefined) {
+      conditions.push(`d.department_id = ANY(${addParam(requestedDepartmentIds)}::uuid[])`);
+    } else if (readableDepartmentIds !== null) {
+      conditions.push(`d.department_id = ANY(${addParam(readableDepartmentIds)}::uuid[])`);
     }
 
-    if (query.documentTypeId !== undefined) {
-      conditions.push(`d.document_type_id = ${addParam(query.documentTypeId)}`);
+    // `documentTypeIds` (multi-seleção) tem prioridade; `documentTypeId`
+    // singular é mantido por retrocompatibilidade e tratado como lista de 1.
+    const requestedDocumentTypeIds: string[] | undefined =
+      query.documentTypeIds ?? (query.documentTypeId !== undefined ? [query.documentTypeId] : undefined);
+
+    if (requestedDocumentTypeIds !== undefined) {
+      conditions.push(`d.document_type_id = ANY(${addParam(requestedDocumentTypeIds)}::uuid[])`);
+    }
+
+    if (query.uploadedById !== undefined) {
+      conditions.push(`d.uploaded_by_id = ${addParam(query.uploadedById)}`);
     }
 
     if (query.status !== undefined) {
@@ -771,10 +983,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     }
 
     if (query.tags !== undefined) {
-      const tagList = query.tags
-        .split(',')
-        .map((t) => t.trim())
-        .filter((t) => t.length > 0);
+      const tagList = splitCsv(query.tags);
       if (tagList.length > 0) {
         // PostgreSQL: tags @> ARRAY[...] (contém TODOS)
         conditions.push(`d.tags @> ${addParam(tagList)}::text[]`);
@@ -784,12 +993,21 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const whereClause = conditions.join(' AND ');
     const limit = normalizeLimit(query.limit);
 
-    // Total (sem cursor)
+    // Total (sem cursor, sem JOINs — nenhum filtro depende das tabelas
+    // relacionadas, só a ordenação/exibição da página precisa delas).
     const countQuery = `SELECT COUNT(*) AS count FROM documents d WHERE ${whereClause}`;
     const countRows = await sql.unsafe<Array<{ count: string }>>(countQuery, params as Parameters<typeof sql.unsafe>[1]);
     const total = parseInt(countRows[0]?.count ?? '0', 10);
 
-    // Página com cursor
+    // ------------------------------------------------------------------
+    // 3. Página com paginação por cursor composto (keyset)
+    // ------------------------------------------------------------------
+    const sortBy = query.sortBy;
+    const sortDir = query.sortDir;
+    const sortColumn = SORT_COLUMNS[sortBy];
+    const dirSql = sortDir === 'asc' ? 'ASC' : 'DESC';
+    const dirCmp = sortDir === 'asc' ? '>' : '<';
+
     const pageConditions = [...conditions];
     const pageParams = [...params];
     let pageParamIdx = paramIdx;
@@ -800,31 +1018,66 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     };
 
     if (query.cursor !== undefined) {
-      pageConditions.push(`d.id > ${addPageParam(query.cursor)}`);
+      const decoded = decodeListDocumentsCursor(query.cursor);
+      const isNullCursor = decoded.v === null;
+      if (isNullCursor && !sortColumn.nullable) {
+        // Cursor com valor nulo só é válido para a coluna nullable
+        // (`documentTypeName`) — indica cursor de outro `sortBy` reaproveitado
+        // incorretamente. Nunca deixa isso virar SQL malformado (valuePlaceholder
+        // vazio) — trata como cursor inválido (422).
+        throw new ValidationError('cursor inválido para a coluna de ordenação atual');
+      }
+      const valuePlaceholder = isNullCursor
+        ? ''
+        : `${addPageParam(decoded.v)}${sqlCastForSortColumn(sortBy)}`;
+      const idPlaceholder = addPageParam(decoded.id);
+      pageConditions.push(
+        buildKeysetCondition({
+          expr: sortColumn.expr,
+          nullable: sortColumn.nullable,
+          dirCmp,
+          valuePlaceholder,
+          idPlaceholder,
+          isNullCursor,
+        })
+      );
     }
     const limitPlaceholder = addPageParam(limit + 1);
 
+    const orderByClause = sortColumn.nullable
+      ? `${sortColumn.expr} ${dirSql} NULLS LAST, d.id ${dirSql}`
+      : `${sortColumn.expr} ${dirSql}, d.id ${dirSql}`;
+
     const pageQuery = `
-      SELECT d.*
+      SELECT d.*,
+        dept.name AS department_name,
+        u.name AS uploaded_by_name,
+        dt.name AS document_type_name,
+        t.name AS company_name
       FROM documents d
+      LEFT JOIN departments dept ON dept.id = d.department_id
+      LEFT JOIN users u ON u.id = d.uploaded_by_id
+      LEFT JOIN document_types dt ON dt.id = d.document_type_id
+      LEFT JOIN tenants t ON t.id = d.tenant_id
       WHERE ${pageConditions.join(' AND ')}
-      ORDER BY d.id ASC
+      ORDER BY ${orderByClause}
       LIMIT ${limitPlaceholder}
     `;
 
-    const docs = await sql.unsafe<DocumentRow[]>(pageQuery, pageParams as Parameters<typeof sql.unsafe>[1]);
+    const docs = await sql.unsafe<DocumentListRow[]>(pageQuery, pageParams as Parameters<typeof sql.unsafe>[1]);
 
     const hasMore = docs.length > limit;
     const page = hasMore ? docs.slice(0, limit) : docs;
     const last = page.at(-1);
-    const nextCursor = hasMore && last ? last.id : null;
+    const nextCursor =
+      hasMore && last ? encodeListDocumentsCursor(sortValueForCursor(sortBy, last), last.id) : null;
 
     request.log.info(
-      { tenantId: effectiveTenantId, userId, total, returned: page.length },
+      { tenantId: effectiveTenantId, userId, total, returned: page.length, sortBy, sortDir },
       'listagem de documentos'
     );
 
-    return reply.status(200).send({ items: page.map(rowToDocument), nextCursor, total });
+    return reply.status(200).send({ items: page.map(rowToDocumentListItem), nextCursor, total });
   });
 
   // =========================================================================
@@ -1151,6 +1404,19 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     if (!updated) {
       throw new NotFoundError('Documento não encontrado');
+    }
+
+    if (body.documentTypeId !== undefined) {
+      const newDocTypeName = await resolveDocumentTypeName(sql, tenantId, body.documentTypeId ?? null);
+      const eventsRepo = new DocumentEventsRepository(sql, { tenantId });
+      try {
+        await eventsRepo.syncDocumentType(id, body.documentTypeId ?? null, newDocTypeName);
+      } catch (syncError) {
+        request.log.error(
+          { err: syncError, tenantId, userId, documentId: id },
+          'falha ao sincronizar document_events após atualização de tipo'
+        );
+      }
     }
 
     const auditLogger = new AuditLogger(sql);

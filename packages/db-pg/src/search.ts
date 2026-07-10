@@ -148,7 +148,7 @@ export async function documentMetadataSearch(
     bindings.push(word);
     const idx = paramIndex++;
     wordParts.push(
-      `(original_filename ILIKE '%' || $${idx}::text || '%' OR $${idx}::text = ANY(tags))`
+      `(original_filename ILIKE '%' || $${idx}::text || '%' OR $${idx}::text = ANY(tags) OR EXISTS (SELECT 1 FROM jsonb_each_text(index_values) kv WHERE kv.value ILIKE '%' || $${idx}::text || '%' OR REPLACE(kv.value, '.', ',') ILIKE '%' || $${idx}::text || '%'))`
     );
   }
 

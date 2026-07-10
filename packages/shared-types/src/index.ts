@@ -65,6 +65,8 @@ export {
 export {
   DocumentProcessingJobDataSchema,
   type DocumentProcessingJobData,
+  TenantDeletionJobDataSchema,
+  type TenantDeletionJobData,
 } from './job.js';
 export {
   TemplateNodeSchema,

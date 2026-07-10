@@ -41,7 +41,7 @@ export const adminDepartmentTemplatesRoutes: FastifyPluginAsync = async (app) =>
       try {
         await sql`
           INSERT INTO department_templates (id, name, description, nodes, created_at, updated_at)
-          VALUES (${id}, ${body.name}, ${description}, ${JSON.stringify(body.nodes)}, ${now}, ${now})
+          VALUES (${id}, ${body.name}, ${description}, ${sql.json(body.nodes)}, ${now}, ${now})
         `;
       } catch (err: unknown) {
         const pgErr = err as { code?: string };
@@ -153,7 +153,7 @@ export const adminDepartmentTemplatesRoutes: FastifyPluginAsync = async (app) =>
       }
       if (updates.nodes !== undefined) {
         setParts.push(`nodes = $${paramIdx++}`);
-        values.push(JSON.stringify(updates.nodes));
+        values.push(sql.json(updates.nodes));
       }
 
       if (setParts.length === 0) {

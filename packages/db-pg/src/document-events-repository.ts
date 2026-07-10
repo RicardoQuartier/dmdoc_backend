@@ -186,9 +186,10 @@ export class DocumentEventsRepository {
   }
 
   /**
-   * ÚNICA mutação permitida sobre um evento já gravado: preenche `page_count`
-   * quando o worker conclui a extração (documento `READY`). Atualiza apenas o
-   * campo `page_count`, escopado por `tenant_id` + `document_id`.
+   * ÚNICA mutação imutável permitida sobre um evento já gravado: preenche
+   * `page_count` quando o worker conclui a extração (documento `READY`).
+   * Atualiza apenas o campo `page_count`, escopado por `tenant_id` +
+   * `document_id`.
    *
    * Retorna `true` se ao menos um evento foi atualizado. Pode atualizar mais
    * de um evento quando o mesmo documento foi alvo de reenvios deduplicados —
@@ -200,6 +201,34 @@ export class DocumentEventsRepository {
     const result = await this.sql`
       UPDATE ${this.sql(DocumentEventsRepository.TABLE)}
       SET page_count = ${pageCount}
+      WHERE document_id = ${documentId}
+        AND tenant_id = ${tenantId}
+    `;
+
+    return result.count > 0;
+  }
+
+  /**
+   * Sincroniza o tipo de documento em todos os eventos do documento.
+   *
+   * Chamado quando o usuário edita o tipo via PATCH /documents/:id, para que
+   * o relatório de uploads reflita a classificação atual. Campos derivados do
+   * arquivo (mime_type, size_bytes, page_count, uploaded_by_id, created_at)
+   * não são alterados.
+   *
+   * Retorna `true` se ao menos um evento foi atualizado.
+   */
+  async syncDocumentType(
+    documentId: string,
+    documentTypeId: string | null,
+    documentTypeName: string | null,
+  ): Promise<boolean> {
+    const tenantId = this.requireTenantId();
+
+    const result = await this.sql`
+      UPDATE ${this.sql(DocumentEventsRepository.TABLE)}
+      SET document_type_id = ${documentTypeId},
+          document_type_name = ${documentTypeName}
       WHERE document_id = ${documentId}
         AND tenant_id = ${tenantId}
     `;

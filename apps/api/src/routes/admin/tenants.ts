@@ -1,8 +1,10 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { newId } from '@dmdoc/db-pg';
+import { TenantDeletionJobDataSchema } from '@dmdoc/shared-types';
 import { ConflictError, NotFoundError } from '../../errors/index.js';
 import { requireRole } from '../../auth/role-guard.js';
+import { AuditLogger } from '../../auth/audit.js';
 import { applyTemplateToTenant } from '../../lib/apply-template-to-tenant.js';
 
 const CreateTenantBodySchema = z.object({
@@ -21,7 +23,7 @@ const PatchTenantBodySchema = z.object({
 });
 
 const ListTenantsQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(100).default(20),
+  limit: z.coerce.number().int().min(1).max(500).default(20),
   cursor: z.string().optional(),
 });
 
@@ -92,7 +94,7 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       rows = await sql<TenantRow[]>`
         SELECT id, name, disk_quota_bytes, user_quota, active, created_at
         FROM tenants
-        WHERE id > ${cursor}
+        WHERE deleted = false AND id > ${cursor}
         ORDER BY id ASC
         LIMIT ${limit + 1}
       `;
@@ -100,6 +102,7 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       rows = await sql<TenantRow[]>`
         SELECT id, name, disk_quota_bytes, user_quota, active, created_at
         FROM tenants
+        WHERE deleted = false
         ORDER BY id ASC
         LIMIT ${limit + 1}
       `;
@@ -191,5 +194,73 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
 
     request.log.info({ tenantId: id }, 'tenant atualizado');
     return reply.status(200).send({ id: r.id, name: r.name, diskQuotaBytes: Number(r.disk_quota_bytes), userQuota: r.user_quota, active: r.active, createdAt: r.created_at });
+  });
+
+  /**
+   * DELETE /admin/tenants/:id — exclui (soft-delete) uma empresa e enfileira a
+   * purga definitiva em background.
+   *
+   * O endpoint apenas marca o tenant e enfileira o job na fila `tenant-deletion`
+   * — ele NÃO executa a purga (S3, dados) diretamente; isso é responsabilidade
+   * do worker. A empresa é marcada `deleted=true`/`active=false` e o nome é
+   * renomeado (libera o índice único de nome imediatamente para reuso).
+   *
+   * Idempotência: como o UPDATE usa `AND deleted = false`, re-disparar sobre um
+   * tenant já excluído cai no 404 (já está deleted).
+   */
+  app.delete('/admin/tenants/:id', { preHandler: app.authenticate }, async (request, reply) => {
+    requireRole(request, 'SUPER_ADMIN');
+
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const sql = app.db;
+
+    // Marca + renomeia em transação. O `RETURNING` só traz linha se o tenant
+    // existia e ainda não estava deleted — combina existência e idempotência.
+    const updated = await sql.begin(async (tx) => {
+      return tx<Array<{ id: string }>>`
+        UPDATE tenants
+        SET active = false,
+            deleted = true,
+            deleted_at = now(),
+            name = '[EXCLUÍDA-' || extract(epoch from now())::bigint || '] ' || name
+        WHERE id = ${id} AND deleted = false
+        RETURNING id
+      `;
+    });
+
+    if (updated.length === 0) {
+      throw new NotFoundError();
+    }
+
+    // Enfileira o job de purga. Em testes a fila é null — apenas loga e segue.
+    if (app.tenantDeletionQueue !== null) {
+      const jobData = TenantDeletionJobDataSchema.parse({ tenantId: id });
+      await app.tenantDeletionQueue.add('purge', jobData, {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2000 },
+      });
+    } else {
+      request.log.warn({ tenantId: id }, 'tenantDeletionQueue não configurada — purga não enfileirada');
+    }
+
+    // AuditLog da solicitação de exclusão.
+    const auditLogger = new AuditLogger(sql);
+    try {
+      await auditLogger.record({
+        tenantId: id,
+        userId: request.user?.sub ?? null,
+        action: 'tenant.delete.requested',
+        resource: `tenants/${id}`,
+        metadata: {},
+      });
+    } catch (auditError) {
+      request.log.error(
+        { err: auditError, tenantId: id, userId: request.user?.sub ?? null },
+        'falha ao registrar audit log de exclusão de tenant',
+      );
+    }
+
+    request.log.info({ tenantId: id }, 'tenant marcado para exclusão e purga enfileirada');
+    return reply.status(202).send({ id, status: 'deleting' });
   });
 };

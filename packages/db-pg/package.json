@@ -15,11 +15,13 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src --max-warnings=0",
+    "test": "vitest run",
     "migrate": "drizzle-kit migrate",
     "generate": "drizzle-kit generate",
     "seed": "tsx src/seed.ts",
     "db:fresh": "tsx src/db-fresh.ts",
-    "migrate:fresh": "tsx src/migrate-fresh.ts"
+    "migrate:fresh": "tsx src/migrate-fresh.ts",
+    "backfill:event-document-type": "tsx src/backfill-event-document-type.ts"
   },
   "dependencies": {
     "@dmdoc/shared-types": "workspace:*",
@@ -34,6 +36,7 @@
     "@types/pg": "^8.11.10",
     "drizzle-kit": "^0.31.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
   }
 }

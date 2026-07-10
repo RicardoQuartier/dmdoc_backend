@@ -28,3 +28,20 @@ export const DocumentProcessingJobDataSchema = z.object({
 });
 
 export type DocumentProcessingJobData = z.infer<typeof DocumentProcessingJobDataSchema>;
+
+/**
+ * Payload de um job de purga de empresa (tenant) na fila `tenant-deletion`.
+ *
+ * Enfileirado pela API (DELETE /admin/tenants/:id) após marcar o tenant como
+ * `deleted=true`. O worker consome este job e executa a purga definitiva dos
+ * dados da empresa (S3, banco) em background.
+ *
+ * Como o restante do contrato de jobs, é a única fonte de verdade do payload:
+ * o produtor valida com `TenantDeletionJobDataSchema` antes de enfileirar; o
+ * worker revalida no início do handler.
+ */
+export const TenantDeletionJobDataSchema = z.object({
+  tenantId: z.string().uuid(),
+});
+
+export type TenantDeletionJobData = z.infer<typeof TenantDeletionJobDataSchema>;

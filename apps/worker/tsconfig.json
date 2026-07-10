@@ -4,7 +4,6 @@
     "noEmit": true,
     "paths": {
       "@dmdoc/shared-types": ["../../packages/shared-types/src/index.ts"],
-      "@dmdoc/db-mongo": ["../../packages/db-mongo/src/index.ts"],
       "@dmdoc/extractor": ["../../packages/extractor/src/index.ts"]
     }
   },

@@ -1,0 +1,9 @@
+# Acelera o build do contexto do monorepo: nunca enviar node_modules/dist/.env do host.
+node_modules
+**/node_modules
+dist
+**/dist
+.env
+**/.env
+.git
+**/*.log

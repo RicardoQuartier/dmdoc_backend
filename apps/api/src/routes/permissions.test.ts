@@ -33,6 +33,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  await testDb.db`DELETE FROM audit_logs`;
   await testDb.db`DELETE FROM department_permissions`;
   await testDb.db`DELETE FROM departments`;
   await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','USER')`;
@@ -129,5 +130,47 @@ describe('PUT /users/:id/permissions — caso feliz', () => {
 
     expect(getRes.statusCode).toBe(200);
     expect(getRes.json().rootDepartmentIds).toEqual([rootId]);
+  });
+
+  it('adicionar uma raiz reenviando a já concedida → 200 (não colide com linha soft-deletada)', async () => {
+    const { rootId: rootAId } = await seedRootAndChild();
+    const rootBId = newId();
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (${rootBId}, ${TENANT_ID}, NULL, 'RH (raiz)', 0, '{}'::text[], false, NOW())
+    `;
+
+    // Concessão inicial: apenas a raiz A.
+    const first = await app.inject({
+      method: 'PUT',
+      url: `/users/${USER_ID}/permissions`,
+      headers: { authorization: `Bearer ${adminToken}` },
+      payload: { rootDepartmentIds: [rootAId] },
+    });
+    expect(first.statusCode).toBe(200);
+
+    // Agora adiciona a raiz B mantendo a A — reenvia a A já concedida.
+    // Antes do fix isto batia em 23505 (uniq_dept_perm_user_dept).
+    const second = await app.inject({
+      method: 'PUT',
+      url: `/users/${USER_ID}/permissions`,
+      headers: { authorization: `Bearer ${adminToken}` },
+      payload: { rootDepartmentIds: [rootAId, rootBId] },
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json().rootDepartmentIds).toEqual(
+      expect.arrayContaining([rootAId, rootBId]),
+    );
+    expect(second.json().rootDepartmentIds).toHaveLength(2);
+
+    // Remove a A e mantém a B — a A deve voltar a ficar soft-deletada.
+    const third = await app.inject({
+      method: 'PUT',
+      url: `/users/${USER_ID}/permissions`,
+      headers: { authorization: `Bearer ${adminToken}` },
+      payload: { rootDepartmentIds: [rootBId] },
+    });
+    expect(third.statusCode).toBe(200);
+    expect(third.json().rootDepartmentIds).toEqual([rootBId]);
   });
 });
