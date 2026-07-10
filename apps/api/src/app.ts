@@ -18,7 +18,7 @@ import { usersRoutes } from './routes/users.js';
 import { departmentsRoutes } from './routes/departments.js';
 import { documentTypesRoutes } from './routes/document-types.js';
 import { permissionsRoutes } from './routes/permissions.js';
-import { documentsRoutes } from './routes/documents.js';
+import { documentsRoutes, type DocumentsRoutesOptions } from './routes/documents.js';
 import { searchRoutes, type SearchRoutesOptions } from './routes/search.js';
 import { auditLogsRoutes } from './routes/audit-logs.js';
 import { usageRoutes } from './routes/usage.js';
@@ -157,7 +157,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(departmentsRoutes);
   await app.register(documentTypesRoutes);
   await app.register(permissionsRoutes);
-  await app.register(documentsRoutes);
+  await app.register(documentsRoutes, { config } satisfies DocumentsRoutesOptions);
   await app.register(searchRoutes, { config } satisfies SearchRoutesOptions);
   await app.register(auditLogsRoutes);
   await app.register(usageRoutes);

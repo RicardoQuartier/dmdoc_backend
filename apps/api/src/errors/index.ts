@@ -5,3 +5,4 @@ export { ForbiddenError } from './ForbiddenError.js';
 export { ConflictError } from './ConflictError.js';
 export { QuotaExceededError } from './QuotaExceededError.js';
 export { ValidationError } from './ValidationError.js';
+export { UpstreamServiceError } from './UpstreamServiceError.js';

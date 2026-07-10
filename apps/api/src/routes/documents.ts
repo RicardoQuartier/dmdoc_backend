@@ -8,18 +8,23 @@ import {
   DOCUMENT_EVENTS_COLLECTION,
   newId,
   normalizeLimit,
+  resolveAiFeatureFlags,
 } from '@dmdoc/db-pg';
 import type { TenantDocument } from '@dmdoc/db-pg';
 import type { Sql } from '@dmdoc/db-pg';
 import type { DocumentProcessingJobData } from '@dmdoc/shared-types';
 import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
-import { NotFoundError, QuotaExceededError, ValidationError } from '../errors/index.js';
+import { createLLMProvider, LLMError } from '@dmdoc/llm-provider';
+import { NotFoundError, QuotaExceededError, ValidationError, ForbiddenError, UpstreamServiceError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
 import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
-import { getConfig } from '../config.js';
+import { getConfig, type Config } from '../config.js';
+import { validateIndexValues, type IndexFieldRow } from '../lib/index-fields.js';
+import { suggestDocumentIndexes } from '../services/index-suggestion.js';
+import { SuggestIndexesResponseSchema } from '../prompts/suggest-indexes.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais que mapeiam as tabelas do PostgreSQL (spec §5.3)
@@ -59,17 +64,6 @@ interface DocumentRow extends TenantDocument {
   uploaded_at: Date;
   processed_at: Date | null;
   cost_usd_cents: number;
-}
-
-interface IndexFieldRow {
-  id: string;
-  name: string;
-  field_type: 'TEXT' | 'DATE' | 'NUMBER';
-  required: boolean;
-  ai_extraction_hint: string | null;
-  sort_order: number;
-  show_on_search: boolean;
-  deleted: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +142,11 @@ const PatchDocumentBodySchema = z.object({
   documentTypeId: z.string().uuid().nullable().optional(),
   indexValues: z.record(z.union([z.string(), z.number(), z.null()])).optional(),
   tags: z.array(z.string()).optional(),
+});
+
+/** Schema dos params de rotas `/documents/:id/*` que exigem um UUID válido. */
+const DocumentIdParamsSchema = z.object({
+  id: z.string().uuid(),
 });
 
 // ---------------------------------------------------------------------------
@@ -289,59 +288,6 @@ async function assertCanWriteDepartment(
   if (!accessible.includes(departmentId)) {
     throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
   }
-}
-
-/**
- * Valida os valores de `indexValues` contra os `indexFields` do tipo de documento.
- *
- * Retorna lista de erros (vazia = válido).
- */
-function validateIndexValues(
-  indexValues: Record<string, string | number | null>,
-  indexFields: IndexFieldRow[]
-): string[] {
-  const activeFields = indexFields.filter((f) => !f.deleted);
-  const errors: string[] = [];
-
-  for (const field of activeFields) {
-    const value = indexValues[field.name];
-
-    if (field.required && (value === undefined || value === null || value === '')) {
-      errors.push(`Campo obrigatório ausente: "${field.name}"`);
-      continue;
-    }
-
-    if (value === undefined || value === null) {
-      continue;
-    }
-
-    switch (field.field_type) {
-      case 'TEXT': {
-        if (typeof value !== 'string' || value.trim() === '') {
-          errors.push(`Campo "${field.name}" deve ser texto não vazio`);
-        } else if (value.length > 500) {
-          errors.push(`Campo "${field.name}" excede 500 caracteres`);
-        }
-        break;
-      }
-      case 'DATE': {
-        const dateStr = String(value);
-        if (!/^\d{4}-\d{2}-\d{2}(T[\d:.Z+-]+)?$/.test(dateStr) || isNaN(Date.parse(dateStr))) {
-          errors.push(`Campo "${field.name}" deve ser uma data válida no formato ISO 8601`);
-        }
-        break;
-      }
-      case 'NUMBER': {
-        const num = typeof value === 'number' ? value : parseFloat(String(value));
-        if (!isFinite(num)) {
-          errors.push(`Campo "${field.name}" deve ser um número válido`);
-        }
-        break;
-      }
-    }
-  }
-
-  return errors;
 }
 
 /**
@@ -578,10 +524,27 @@ async function emitUploadEvent(
 // Plugin de rotas
 // ---------------------------------------------------------------------------
 
+export interface DocumentsRoutesOptions {
+  config: Config;
+}
+
 /**
  * Rotas de documentos — PostgreSQL.
  */
-export const documentsRoutes: FastifyPluginAsync = async (app) => {
+export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async (app, options) => {
+  const { config } = options;
+
+  // Provider de LLM compartilhado entre as chamadas desta rota (mesmo padrão
+  // de `search.ts`) — usado exclusivamente por `POST /documents/:id/suggest-indexes`.
+  const llmProvider = createLLMProvider(
+    {
+      provider: config.LLM_PROVIDER,
+      baseURL: config.LLM_BASE_URL,
+      apiKey: config.LLM_API_KEY || 'placeholder',
+      model: config.LLM_MODEL,
+    },
+    app.log,
+  );
   /**
    * POST /documents — upload multipart de documento.
    */
@@ -1680,6 +1643,116 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     reply.raw.on('close', () => {
       clearInterval(interval);
+    });
+  });
+
+  // =========================================================================
+  // POST /documents/:id/suggest-indexes — sugestão de valores de índice por IA
+  // (Fase 7, entregável #55). Sob demanda — nunca roda automaticamente no
+  // worker. Requer `documentTypeId` já definido (checado pelo próprio service
+  // `suggestDocumentIndexes`, que lança `ValidationError` caso contrário).
+  // =========================================================================
+  app.post('/documents/:id/suggest-indexes', { preHandler: app.authenticate }, async (request, reply) => {
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const sql = app.db;
+
+    const { id } = DocumentIdParamsSchema.parse(request.params);
+
+    // ------------------------------------------------------------------
+    // 1. Resolve o documento respeitando o escopo do role (mesmo padrão de
+    //    GET/PATCH/DELETE) — documento de outro tenant sempre vira 404, nunca
+    //    403 (spec §10, invariante 4).
+    // ------------------------------------------------------------------
+    let doc: DocumentRow | null;
+    if (role === 'SUPER_ADMIN') {
+      doc = await findDocumentGlobally(sql, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
+      doc = await repo.findById(id);
+    }
+
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    const tenantId = doc.tenant_id;
+
+    // Sugestão de índices é uma escrita (persiste `document_content.index_suggestion`
+    // e incrementa custo) — exige a mesma permissão de escrita no departamento
+    // usada em PATCH/DELETE.
+    await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
+
+    const log = request.log.child({ tenantId, documentId: id, userId, traceId: request.id });
+
+    // ------------------------------------------------------------------
+    // 2. Feature flag de IA (Fase 6.9, entregável #71) — checa o valor
+    //    efetivo (plataforma AND empresa) ANTES de chamar o LLM.
+    // ------------------------------------------------------------------
+    const aiFlags = await resolveAiFeatureFlags(sql, tenantId);
+    if (!aiFlags.indexSuggestionEnabled) {
+      log.info({}, 'sugestão de índices por IA desabilitada para esta empresa — LLM não chamado');
+      throw new ForbiddenError('Sugestão de índices por IA está desabilitada para esta empresa');
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Chama o service (que também valida `documentTypeId` e o `content`
+    //    processado — NotFoundError/ValidationError propagam para o error
+    //    handler central, mapeando para 404/422 automaticamente). Falha do
+    //    provedor de LLM (chave inválida/ausente, provedor fora do ar) vira
+    //    502 com mensagem clara — não é um bug do DMDoc, é upstream.
+    // ------------------------------------------------------------------
+    let result: Awaited<ReturnType<typeof suggestDocumentIndexes>>;
+    try {
+      result = await suggestDocumentIndexes(
+        { tenantId, documentId: id },
+        { sql, llmProvider, logger: log }
+      );
+    } catch (err) {
+      if (err instanceof LLMError) {
+        log.error({ err }, 'sugestão de índices falhou por erro do provedor de LLM');
+        throw new UpstreamServiceError(
+          'Não foi possível gerar a sugestão agora — falha ao chamar o provedor de IA. Tente novamente em instantes.'
+        );
+      }
+      throw err;
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Monta a resposta HTTP `{ fields: [{ name, value, confidence }] }`
+    //    (spec §7) combinando a confiança bruta devolvida pelo LLM
+    //    (`rawResponse`, no formato validado por `SuggestIndexesResponseSchema`)
+    //    com o valor JÁ normalizado/validado (`indexSuggestion.values`) — nunca
+    //    expõe o valor cru quando ele foi descartado na normalização/validação
+    //    (campo sem sugestão válida sempre aparece com `value: null`).
+    // ------------------------------------------------------------------
+    const rawParsed = SuggestIndexesResponseSchema.safeParse(result.indexSuggestion.rawResponse);
+    const fields = rawParsed.success
+      ? rawParsed.data.fields.map((f) => ({
+          name: f.name,
+          value: result.indexSuggestion.values[f.name] ?? null,
+          confidence: f.confidence,
+        }))
+      : [];
+
+    log.info(
+      {
+        fieldsRequested: fields.length,
+        fieldsSuggested: fields.filter((f) => f.value !== null).length,
+        costUsd: result.costUsd,
+      },
+      'sugestão de índices retornada'
+    );
+
+    return reply.status(200).send({
+      fields,
+      model: result.indexSuggestion.model,
+      promptVersion: result.indexSuggestion.promptVersion,
+      suggestedAt: result.indexSuggestion.suggestedAt,
+      costUsd: result.costUsd,
     });
   });
 };
