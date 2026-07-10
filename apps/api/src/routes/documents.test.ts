@@ -73,7 +73,10 @@ beforeEach(async () => {
   await testDb.db`DELETE FROM department_permissions`;
   await testDb.db`DELETE FROM document_types`;
   await testDb.db`DELETE FROM departments`;
-  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','UPLOADER','USER')`;
+  // Inclui MULTI_TENANT_ADMIN/SUPER_ADMIN (tenant_id NULL) — sem isso, usuários
+  // desses papéis criados por um teste (ex.: MTA usado no sort por companyName)
+  // vazam para a próxima execução e colidem com `uniq_users_null_tenant_email`.
+  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','UPLOADER','USER','MULTI_TENANT_ADMIN','SUPER_ADMIN')`;
   await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
 
   // Inserir tenants
@@ -1044,5 +1047,345 @@ describe('POST /documents — emissão de evento em document_events', () => {
     // Nenhum evento de A vaza para a consulta de B e vice-versa
     expect(eventsA.every((e) => e.tenant_id === TENANT_A)).toBe(true);
     expect(eventsB.every((e) => e.tenant_id === TENANT_B)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /documents — ordenação, filtros novos (departmentIds/uploadedById) e
+// paginação por cursor composto (keyset). Ver plano da tela de listagem.
+// ---------------------------------------------------------------------------
+describe('GET /documents — ordenação, filtros e paginação por cursor', () => {
+  const DEPT_A2_ID = newId();
+  const USER_ANA_ID = newId();
+  const USER_BRUNO_ID = newId();
+  const USER_CARLA_ID = newId();
+
+  const DOC_ALPHA_ID = newId();
+  const DOC_BETA_ID = newId();
+  const DOC_GAMMA_ID = newId();
+  const DOC_DELTA_ID = newId();
+
+  const BASE_TIME = new Date('2026-01-01T00:00:00.000Z').getTime();
+
+  interface SeedDocOpts {
+    id: string;
+    filename: string;
+    status: 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED';
+    sizeBytes: number;
+    uploadedAt: Date;
+    uploadedById: string;
+    departmentId: string;
+    documentTypeId: string | null;
+    hash: string;
+  }
+
+  async function seedDoc(opts: SeedDocOpts): Promise<void> {
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${opts.id}, ${TENANT_A}, ${opts.departmentId}, ${opts.documentTypeId},
+        ${opts.filename}, ${opts.filename}, ${opts.hash}, ${opts.sizeBytes}, 'application/pdf',
+        ${`tenants/${TENANT_A}/documents/${opts.hash}/${opts.filename}`}, ${opts.status}, NULL, '{}'::text[], '{}'::jsonb,
+        ${opts.uploadedById}, ${opts.uploadedAt}, ${opts.uploadedAt}, 0, false
+      )
+    `;
+  }
+
+  beforeEach(async () => {
+    // Segundo departamento RAIZ em Tenant A ('Comercial A' < 'Financeiro A' alfabeticamente).
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (${DEPT_A2_ID}, ${TENANT_A}, NULL, 'Comercial A', 0, '{}'::text[], false, NOW())
+    `;
+
+    await seedUser(testDb.db, {
+      id: USER_ANA_ID, tenantId: TENANT_A, email: 'ana@empresa.com',
+      password: PASSWORD, role: 'UPLOADER', name: 'Ana Uploader',
+    });
+    await seedUser(testDb.db, {
+      id: USER_BRUNO_ID, tenantId: TENANT_A, email: 'bruno@empresa.com',
+      password: PASSWORD, role: 'UPLOADER', name: 'Bruno Uploader',
+    });
+    await seedUser(testDb.db, {
+      id: USER_CARLA_ID, tenantId: TENANT_A, email: 'carla@empresa.com',
+      password: PASSWORD, role: 'UPLOADER', name: 'Carla Uploader',
+    });
+
+    // filename asc: alpha < beta < delta < gamma
+    // status asc:   FAILED(delta) < PENDING(beta) < READY(alpha/gamma)
+    // sizeBytes asc: delta(500) < alpha(1000) < beta(2000) < gamma(3000)
+    // uploadedAt asc: alpha < beta < gamma < delta
+    // departmentName asc: Comercial A(gamma) < Financeiro A(alpha/beta/delta)
+    // uploadedByName asc: Ana(alpha,delta) < Bruno(beta) < Carla(gamma)
+    // documentTypeName asc (nulls last): Contrato A(alpha) < Tipo Global(gamma) < null(beta,delta)
+    await seedDoc({
+      id: DOC_ALPHA_ID, filename: 'alpha.pdf', status: 'READY', sizeBytes: 1000,
+      uploadedAt: new Date(BASE_TIME + 0), uploadedById: USER_ANA_ID,
+      departmentId: DEPT_A_ID, documentTypeId: DOC_TYPE_ID, hash: 'a'.repeat(64),
+    });
+    await seedDoc({
+      id: DOC_BETA_ID, filename: 'beta.pdf', status: 'PENDING', sizeBytes: 2000,
+      uploadedAt: new Date(BASE_TIME + 60_000), uploadedById: USER_BRUNO_ID,
+      departmentId: DEPT_A_ID, documentTypeId: null, hash: 'b'.repeat(64),
+    });
+    await seedDoc({
+      id: DOC_GAMMA_ID, filename: 'gamma.pdf', status: 'READY', sizeBytes: 3000,
+      uploadedAt: new Date(BASE_TIME + 120_000), uploadedById: USER_CARLA_ID,
+      departmentId: DEPT_A2_ID, documentTypeId: GLOBAL_DOC_TYPE_ID, hash: 'c'.repeat(64),
+    });
+    await seedDoc({
+      id: DOC_DELTA_ID, filename: 'delta.pdf', status: 'FAILED', sizeBytes: 500,
+      uploadedAt: new Date(BASE_TIME + 180_000), uploadedById: USER_ANA_ID,
+      departmentId: DEPT_A_ID, documentTypeId: null, hash: 'd'.repeat(64),
+    });
+  });
+
+  interface ListDocsResponse {
+    items: Array<Record<string, unknown>>;
+    nextCursor: string | null;
+    total: number;
+  }
+
+  async function listDocs(query: string, token = tokenAdminA): Promise<ListDocsResponse> {
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents${query}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(200);
+    return res.json() as ListDocsResponse;
+  }
+
+  it('ordena por filename ASC e DESC', async () => {
+    const asc = await listDocs('?sortBy=filename&sortDir=asc&limit=10');
+    expect(asc.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID, DOC_BETA_ID, DOC_DELTA_ID, DOC_GAMMA_ID]);
+
+    const desc = await listDocs('?sortBy=filename&sortDir=desc&limit=10');
+    expect(desc.items.map((d) => d['id'])).toEqual([DOC_GAMMA_ID, DOC_DELTA_ID, DOC_BETA_ID, DOC_ALPHA_ID]);
+  });
+
+  it('ordena por status ASC e DESC (com empate entre dois READY, tiebreak por id)', async () => {
+    const asc = await listDocs('?sortBy=status&sortDir=asc&limit=10');
+    expect(asc.items.map((d) => d['status'])).toEqual(['FAILED', 'PENDING', 'READY', 'READY']);
+    expect(asc.items[0]?.['id']).toBe(DOC_DELTA_ID);
+    expect(asc.items[1]?.['id']).toBe(DOC_BETA_ID);
+    expect([asc.items[2]?.['id'], asc.items[3]?.['id']].sort()).toEqual(
+      [DOC_ALPHA_ID, DOC_GAMMA_ID].sort()
+    );
+
+    const desc = await listDocs('?sortBy=status&sortDir=desc&limit=10');
+    expect(desc.items.map((d) => d['status'])).toEqual(['READY', 'READY', 'PENDING', 'FAILED']);
+    expect(desc.items[2]?.['id']).toBe(DOC_BETA_ID);
+    expect(desc.items[3]?.['id']).toBe(DOC_DELTA_ID);
+  });
+
+  it('ordena por sizeBytes ASC e DESC', async () => {
+    const asc = await listDocs('?sortBy=sizeBytes&sortDir=asc&limit=10');
+    expect(asc.items.map((d) => d['id'])).toEqual([DOC_DELTA_ID, DOC_ALPHA_ID, DOC_BETA_ID, DOC_GAMMA_ID]);
+
+    const desc = await listDocs('?sortBy=sizeBytes&sortDir=desc&limit=10');
+    expect(desc.items.map((d) => d['id'])).toEqual([DOC_GAMMA_ID, DOC_BETA_ID, DOC_ALPHA_ID, DOC_DELTA_ID]);
+  });
+
+  it('ordena por uploadedAt ASC e DESC (default da rota é uploadedAt desc)', async () => {
+    const asc = await listDocs('?sortBy=uploadedAt&sortDir=asc&limit=10');
+    expect(asc.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID, DOC_BETA_ID, DOC_GAMMA_ID, DOC_DELTA_ID]);
+
+    const byDefault = await listDocs('?limit=10');
+    expect(byDefault.items.map((d) => d['id'])).toEqual([DOC_DELTA_ID, DOC_GAMMA_ID, DOC_BETA_ID, DOC_ALPHA_ID]);
+  });
+
+  it('ordena por departmentName ASC e DESC', async () => {
+    const asc = await listDocs('?sortBy=departmentName&sortDir=asc&limit=10');
+    expect(asc.items[0]?.['id']).toBe(DOC_GAMMA_ID); // único doc em "Comercial A"
+    expect(asc.items.slice(1).map((d) => d['id']).sort()).toEqual(
+      [DOC_ALPHA_ID, DOC_BETA_ID, DOC_DELTA_ID].sort()
+    );
+
+    const desc = await listDocs('?sortBy=departmentName&sortDir=desc&limit=10');
+    expect(desc.items[3]?.['id']).toBe(DOC_GAMMA_ID);
+  });
+
+  it('ordena por uploadedByName ASC e DESC', async () => {
+    const asc = await listDocs('?sortBy=uploadedByName&sortDir=asc&limit=10');
+    expect(asc.items[0]?.['uploadedByName']).toBe('Ana Uploader');
+    expect(asc.items[3]?.['uploadedByName']).toBe('Carla Uploader');
+
+    const desc = await listDocs('?sortBy=uploadedByName&sortDir=desc&limit=10');
+    expect(desc.items[0]?.['uploadedByName']).toBe('Carla Uploader');
+    expect(desc.items[3]?.['uploadedByName']).toBe('Ana Uploader');
+  });
+
+  it('ordena por companyName ASC e DESC entre tenants (via MTA)', async () => {
+    const mtaId = newId();
+    await seedUser(testDb.db, {
+      id: mtaId, tenantId: null, email: 'mta-sort@plataforma.com', password: PASSWORD,
+      role: 'MULTI_TENANT_ADMIN', allowedTenantIds: [TENANT_A, TENANT_B],
+    });
+    const mtaToken = await login('mta-sort@plataforma.com');
+
+    const docBId = newId();
+    const hashB = 'e'.repeat(64);
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docBId}, ${TENANT_B}, ${DEPT_B_ID}, NULL,
+        'b-doc.pdf', 'b-doc.pdf', ${hashB}, 700, 'application/pdf',
+        ${`tenants/${TENANT_B}/documents/${hashB}/b-doc.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_B_ID}, ${new Date(BASE_TIME + 240_000)}, ${new Date(BASE_TIME + 240_000)}, 0, false
+      )
+    `;
+
+    const asc = await listDocs('?sortBy=companyName&sortDir=asc&limit=10', mtaToken);
+    expect(asc.total).toBe(5);
+    // "Empresa A" < "Empresa B" — os 4 docs de A vêm antes do único de B
+    expect(asc.items.slice(0, 4).map((d) => d['id']).sort()).toEqual(
+      [DOC_ALPHA_ID, DOC_BETA_ID, DOC_GAMMA_ID, DOC_DELTA_ID].sort()
+    );
+    expect(asc.items[4]?.['id']).toBe(docBId);
+
+    const desc = await listDocs('?sortBy=companyName&sortDir=desc&limit=10', mtaToken);
+    expect(desc.items[0]?.['id']).toBe(docBId);
+  });
+
+  it('ordena por documentTypeName ASC e DESC, com nulos sempre por último', async () => {
+    const asc = await listDocs('?sortBy=documentTypeName&sortDir=asc&limit=10');
+    expect(asc.items[0]?.['id']).toBe(DOC_ALPHA_ID); // "Contrato A"
+    expect(asc.items[1]?.['id']).toBe(DOC_GAMMA_ID); // "Tipo Global"
+    expect(asc.items[2]?.['documentTypeName']).toBeNull();
+    expect(asc.items[3]?.['documentTypeName']).toBeNull();
+    expect(asc.items.slice(2).map((d) => d['id']).sort()).toEqual([DOC_BETA_ID, DOC_DELTA_ID].sort());
+
+    const desc = await listDocs('?sortBy=documentTypeName&sortDir=desc&limit=10');
+    expect(desc.items[0]?.['id']).toBe(DOC_GAMMA_ID);
+    expect(desc.items[1]?.['id']).toBe(DOC_ALPHA_ID);
+    expect(desc.items[2]?.['documentTypeName']).toBeNull();
+    expect(desc.items[3]?.['documentTypeName']).toBeNull();
+  });
+
+  it('paginação keyset: 2 páginas por filename ASC sem pular/duplicar itens', async () => {
+    const page1 = await listDocs('?sortBy=filename&sortDir=asc&limit=2');
+    expect(page1.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID, DOC_BETA_ID]);
+    expect(page1.nextCursor).not.toBeNull();
+    expect(page1.total).toBe(4);
+
+    const page2 = await listDocs(
+      `?sortBy=filename&sortDir=asc&limit=2&cursor=${encodeURIComponent(page1.nextCursor as string)}`
+    );
+    expect(page2.items.map((d) => d['id'])).toEqual([DOC_DELTA_ID, DOC_GAMMA_ID]);
+    expect(page2.nextCursor).toBeNull();
+
+    const allIds = [...page1.items, ...page2.items].map((d) => d['id']);
+    expect(new Set(allIds).size).toBe(4);
+  });
+
+  it('paginação keyset: 2 páginas por sizeBytes DESC sem pular/duplicar itens', async () => {
+    const page1 = await listDocs('?sortBy=sizeBytes&sortDir=desc&limit=3');
+    expect(page1.items.map((d) => d['id'])).toEqual([DOC_GAMMA_ID, DOC_BETA_ID, DOC_ALPHA_ID]);
+    expect(page1.nextCursor).not.toBeNull();
+
+    const page2 = await listDocs(
+      `?sortBy=sizeBytes&sortDir=desc&limit=3&cursor=${encodeURIComponent(page1.nextCursor as string)}`
+    );
+    expect(page2.items.map((d) => d['id'])).toEqual([DOC_DELTA_ID]);
+    expect(page2.nextCursor).toBeNull();
+
+    const allIds = [...page1.items, ...page2.items].map((d) => d['id']);
+    expect(new Set(allIds).size).toBe(4);
+  });
+
+  it('paginação keyset: 2 páginas por documentTypeName ASC preserva nulos por último ao virar página', async () => {
+    const page1 = await listDocs('?sortBy=documentTypeName&sortDir=asc&limit=3');
+    expect(page1.items).toHaveLength(3);
+    expect(page1.items[0]?.['id']).toBe(DOC_ALPHA_ID);
+    expect(page1.items[1]?.['id']).toBe(DOC_GAMMA_ID);
+    expect(page1.nextCursor).not.toBeNull();
+
+    const page2 = await listDocs(
+      `?sortBy=documentTypeName&sortDir=asc&limit=3&cursor=${encodeURIComponent(page1.nextCursor as string)}`
+    );
+    expect(page2.items).toHaveLength(1);
+    expect(page2.nextCursor).toBeNull();
+
+    const allIds = [...page1.items, ...page2.items].map((d) => d['id']);
+    expect(new Set(allIds).size).toBe(4);
+    expect(allIds.slice(0, 2)).toEqual([DOC_ALPHA_ID, DOC_GAMMA_ID]);
+    expect(allIds.slice(2).sort()).toEqual([DOC_BETA_ID, DOC_DELTA_ID].sort());
+  });
+
+  it('filtra por uploadedById', async () => {
+    const res = await listDocs(`?uploadedById=${USER_ANA_ID}&limit=10`);
+    expect(res.items.map((d) => d['id']).sort()).toEqual([DOC_ALPHA_ID, DOC_DELTA_ID].sort());
+    expect(res.total).toBe(2);
+  });
+
+  it('filtra por departmentIds com múltiplos ids', async () => {
+    const both = await listDocs(`?departmentIds=${DEPT_A_ID},${DEPT_A2_ID}&limit=10`);
+    expect(both.total).toBe(4);
+
+    const onlyA2 = await listDocs(`?departmentIds=${DEPT_A2_ID}&limit=10`);
+    expect(onlyA2.items.map((d) => d['id'])).toEqual([DOC_GAMMA_ID]);
+    expect(onlyA2.total).toBe(1);
+  });
+
+  it('departmentIds com id de outro tenant → 404 (nunca vaza)', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents?departmentIds=${DEPT_B_ID}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+  });
+
+  it('cursor malformado (base64/JSON inválido) → 422', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/documents?sortBy=filename&sortDir=asc&cursor=not-a-valid-cursor-at-all',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('cursor malformado (payload decodificado sem {v,id}) → 422', async () => {
+    const badCursor = Buffer.from(JSON.stringify({ foo: 'bar' })).toString('base64');
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents?cursor=${encodeURIComponent(badCursor)}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('trocar sortBy/filtros nunca retorna documento de outro tenant ou fora do ACL do usuário', async () => {
+    // UPLOADER A só tem permissão concedida na raiz DEPT_A_ID (fixture global do
+    // arquivo) — nunca deve enxergar DEPT_A2_ID (gamma) nem documentos do tenant B.
+    const queries = [
+      '?sortBy=filename&sortDir=asc',
+      '?sortBy=uploadedByName&sortDir=desc',
+      '?sortBy=documentTypeName&sortDir=asc',
+      `?sortBy=sizeBytes&sortDir=desc&uploadedById=${USER_CARLA_ID}`,
+    ];
+    for (const q of queries) {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/documents${q}`,
+        headers: { authorization: `Bearer ${tokenUploaderA}` },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { items: Array<{ id: string; tenantId: string }> };
+      expect(body.items.every((d) => d.tenantId === TENANT_A)).toBe(true);
+      expect(body.items.some((d) => d.id === DOC_GAMMA_ID)).toBe(false);
+    }
   });
 });
