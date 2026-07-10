@@ -20,6 +20,12 @@ const PatchTenantBodySchema = z.object({
   diskQuotaBytes: z.number().int().nonnegative().optional(),
   userQuota: z.number().int().nonnegative().optional(),
   active: z.boolean().optional(),
+  // Toggles por empresa das features de IA de sugestão (Fases 7/8/8.1) — plus
+  // comercial gerido exclusivamente pelo SUPER_ADMIN, no mesmo fluxo de
+  // edição de empresa usado para cotas. Ver `packages/shared-types/src/tenant.ts`.
+  aiClassificationEnabled: z.boolean().optional(),
+  aiTitleSuggestionEnabled: z.boolean().optional(),
+  aiIndexSuggestionEnabled: z.boolean().optional(),
 });
 
 const ListTenantsQuerySchema = z.object({
@@ -87,12 +93,23 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
     const { limit, cursor } = ListTenantsQuerySchema.parse(request.query);
     const sql = app.db;
 
-    type TenantRow = { id: string; name: string; disk_quota_bytes: string; user_quota: number; active: boolean; created_at: Date };
+    type TenantRow = {
+      id: string;
+      name: string;
+      disk_quota_bytes: string;
+      user_quota: number;
+      active: boolean;
+      created_at: Date;
+      ai_classification_enabled: boolean;
+      ai_title_suggestion_enabled: boolean;
+      ai_index_suggestion_enabled: boolean;
+    };
 
     let rows: TenantRow[];
     if (cursor !== undefined) {
       rows = await sql<TenantRow[]>`
-        SELECT id, name, disk_quota_bytes, user_quota, active, created_at
+        SELECT id, name, disk_quota_bytes, user_quota, active, created_at,
+               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
         FROM tenants
         WHERE deleted = false AND id > ${cursor}
         ORDER BY id ASC
@@ -100,7 +117,8 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       `;
     } else {
       rows = await sql<TenantRow[]>`
-        SELECT id, name, disk_quota_bytes, user_quota, active, created_at
+        SELECT id, name, disk_quota_bytes, user_quota, active, created_at,
+               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
         FROM tenants
         WHERE deleted = false
         ORDER BY id ASC
@@ -120,6 +138,9 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       userQuota: r.user_quota,
       active: r.active,
       createdAt: r.created_at,
+      aiClassificationEnabled: r.ai_classification_enabled,
+      aiTitleSuggestionEnabled: r.ai_title_suggestion_enabled,
+      aiIndexSuggestionEnabled: r.ai_index_suggestion_enabled,
     }));
 
     return reply.status(200).send({ items, nextCursor });
@@ -135,16 +156,70 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
     const updates = PatchTenantBodySchema.parse(request.body);
     const sql = app.db;
 
+    type TenantRow = {
+      id: string;
+      name: string;
+      disk_quota_bytes: string;
+      user_quota: number;
+      active: boolean;
+      created_at: Date;
+      ai_classification_enabled: boolean;
+      ai_title_suggestion_enabled: boolean;
+      ai_index_suggestion_enabled: boolean;
+    };
+
+    const toResponse = (r: TenantRow) => ({
+      id: r.id,
+      name: r.name,
+      diskQuotaBytes: Number(r.disk_quota_bytes),
+      userQuota: r.user_quota,
+      active: r.active,
+      createdAt: r.created_at,
+      aiClassificationEnabled: r.ai_classification_enabled,
+      aiTitleSuggestionEnabled: r.ai_title_suggestion_enabled,
+      aiIndexSuggestionEnabled: r.ai_index_suggestion_enabled,
+    });
+
     if (Object.keys(updates).length === 0) {
-      const rows = await sql<Array<{ id: string; name: string; disk_quota_bytes: string; user_quota: number; active: boolean; created_at: Date }>>`
-        SELECT id, name, disk_quota_bytes, user_quota, active, created_at
+      const rows = await sql<TenantRow[]>`
+        SELECT id, name, disk_quota_bytes, user_quota, active, created_at,
+               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
         FROM tenants
         WHERE id = ${id}
         LIMIT 1
       `;
       if (rows.length === 0) throw new NotFoundError();
-      const r = rows[0]!;
-      return reply.status(200).send({ id: r.id, name: r.name, diskQuotaBytes: Number(r.disk_quota_bytes), userQuota: r.user_quota, active: r.active, createdAt: r.created_at });
+      return reply.status(200).send(toResponse(rows[0]!));
+    }
+
+    // As 3 flags de IA são um plus comercial gerido exclusivamente pelo
+    // SUPER_ADMIN — capturamos o estado ANTES da atualização apenas quando
+    // pelo menos uma delas é enviada, para registrar o diff antes/depois no
+    // AuditLog (mesmo padrão de `PATCH /admin/platform-settings`). Os demais
+    // campos (name, cotas, active) nunca tiveram auditoria e não passam a ter
+    // aqui — apenas as flags de IA.
+    const touchesAiFlags =
+      updates.aiClassificationEnabled !== undefined ||
+      updates.aiTitleSuggestionEnabled !== undefined ||
+      updates.aiIndexSuggestionEnabled !== undefined;
+
+    let beforeAi: Pick<
+      TenantRow,
+      'ai_classification_enabled' | 'ai_title_suggestion_enabled' | 'ai_index_suggestion_enabled'
+    > | undefined;
+    if (touchesAiFlags) {
+      const beforeRows = await sql<
+        Array<Pick<TenantRow, 'ai_classification_enabled' | 'ai_title_suggestion_enabled' | 'ai_index_suggestion_enabled'>>
+      >`
+        SELECT ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
+        FROM tenants
+        WHERE id = ${id}
+        LIMIT 1
+      `;
+      beforeAi = beforeRows[0];
+      // Se o tenant não existe, não interrompe aqui: o UPDATE abaixo também
+      // não afeta nenhuma linha e cai no NotFoundError já existente, mantendo
+      // uma única fonte de verdade para o 404.
     }
 
     // Monta SET dinâmico apenas com os campos fornecidos
@@ -168,15 +243,26 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       setParts.push(`active = $${paramIdx++}`);
       values.push(updates.active);
     }
+    if (updates.aiClassificationEnabled !== undefined) {
+      setParts.push(`ai_classification_enabled = $${paramIdx++}`);
+      values.push(updates.aiClassificationEnabled);
+    }
+    if (updates.aiTitleSuggestionEnabled !== undefined) {
+      setParts.push(`ai_title_suggestion_enabled = $${paramIdx++}`);
+      values.push(updates.aiTitleSuggestionEnabled);
+    }
+    if (updates.aiIndexSuggestionEnabled !== undefined) {
+      setParts.push(`ai_index_suggestion_enabled = $${paramIdx++}`);
+      values.push(updates.aiIndexSuggestionEnabled);
+    }
 
     const query = `
       UPDATE tenants
       SET ${setParts.join(', ')}
       WHERE id = $1
-      RETURNING id, name, disk_quota_bytes, user_quota, active, created_at
+      RETURNING id, name, disk_quota_bytes, user_quota, active, created_at,
+                ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
     `;
-
-    type TenantRow = { id: string; name: string; disk_quota_bytes: string; user_quota: number; active: boolean; created_at: Date };
 
     let rows: TenantRow[];
     try {
@@ -192,8 +278,52 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
     if (rows.length === 0) throw new NotFoundError();
     const r = rows[0]!;
 
+    // AuditLog — só para as 3 flags de IA (plus comercial por empresa, ver
+    // `packages/shared-types/src/tenant.ts`). Registra o ator (userId + role),
+    // o tenant afetado, e o diff antes/depois apenas dos campos de IA
+    // efetivamente informados no PATCH. Ver spec §10, invariante 7.
+    if (beforeAi !== undefined) {
+      const changes: Record<string, { before: boolean; after: boolean }> = {};
+      if (updates.aiClassificationEnabled !== undefined) {
+        changes['aiClassificationEnabled'] = {
+          before: beforeAi.ai_classification_enabled,
+          after: r.ai_classification_enabled,
+        };
+      }
+      if (updates.aiTitleSuggestionEnabled !== undefined) {
+        changes['aiTitleSuggestionEnabled'] = {
+          before: beforeAi.ai_title_suggestion_enabled,
+          after: r.ai_title_suggestion_enabled,
+        };
+      }
+      if (updates.aiIndexSuggestionEnabled !== undefined) {
+        changes['aiIndexSuggestionEnabled'] = {
+          before: beforeAi.ai_index_suggestion_enabled,
+          after: r.ai_index_suggestion_enabled,
+        };
+      }
+
+      if (Object.keys(changes).length > 0) {
+        const auditLogger = new AuditLogger(sql);
+        try {
+          await auditLogger.record({
+            tenantId: id,
+            userId: request.user?.sub ?? null,
+            action: 'tenant.ai_settings.update',
+            resource: `tenants/${id}`,
+            metadata: { actorRole: request.user?.role ?? null, changes },
+          });
+        } catch (auditError) {
+          request.log.error(
+            { err: auditError, tenantId: id, userId: request.user?.sub ?? null },
+            'falha ao registrar audit log de atualização de configuração de IA do tenant',
+          );
+        }
+      }
+    }
+
     request.log.info({ tenantId: id }, 'tenant atualizado');
-    return reply.status(200).send({ id: r.id, name: r.name, diskQuotaBytes: Number(r.disk_quota_bytes), userQuota: r.user_quota, active: r.active, createdAt: r.created_at });
+    return reply.status(200).send(toResponse(r));
   });
 
   /**

@@ -45,6 +45,7 @@ function createScriptLogger(name: string) {
  *   → department_permissions → departments → users
  *   → global_type_tenant_depts → document_type_index_fields
  *   → document_types → tenants → department_templates → audit_logs
+ *   → platform_settings (singleton, sem dependências — re-seedado abaixo)
  */
 export async function dbFresh(sql: postgres.Sql): Promise<void> {
   await sql`
@@ -61,8 +62,17 @@ export async function dbFresh(sql: postgres.Sql): Promise<void> {
       document_types,
       tenants,
       department_templates,
-      audit_logs
+      audit_logs,
+      platform_settings
     RESTART IDENTITY CASCADE
+  `;
+
+  // platform_settings é singleton — TRUNCATE remove a linha, então ela é
+  // recriada aqui com os defaults (todas as features de IA habilitadas).
+  await sql`
+    INSERT INTO platform_settings (
+      ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
+    ) VALUES (true, true, true)
   `;
 }
 

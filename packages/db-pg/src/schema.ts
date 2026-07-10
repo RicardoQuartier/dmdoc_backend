@@ -80,6 +80,36 @@ export const tenants = pgTable('tenants', {
     .default(sql`now()`),
   deleted: boolean('deleted').notNull().default(false),
   deletedAt: timestamp('deleted_at', { withTimezone: true, mode: 'date' }),
+  // Toggles por empresa das features de IA de sugestão (Fases 7/8/8.1) — plus
+  // comercial por empresa, geridos EXCLUSIVAMENTE pelo SUPER_ADMIN via
+  // PATCH /admin/tenants/:id (mesmo fluxo de edição de cotas). O TENANT_ADMIN
+  // não tem acesso de leitura nem escrita a estas flags. Valor efetivo de
+  // cada feature = platformSettings.<feature> AND tenants.<feature>.
+  aiClassificationEnabled: boolean('ai_classification_enabled').notNull().default(true),
+  aiTitleSuggestionEnabled: boolean('ai_title_suggestion_enabled').notNull().default(true),
+  aiIndexSuggestionEnabled: boolean('ai_index_suggestion_enabled').notNull().default(true),
+});
+
+// ---------------------------------------------------------------------------
+// platform_settings
+// ---------------------------------------------------------------------------
+
+/**
+ * Configuração global de plataforma — registro SINGLETON (linha única, sem
+ * tenantId), gerido exclusivamente pelo SUPER_ADMIN via
+ * `PATCH /admin/platform-settings`. Kill switch das mesmas 3 features de IA
+ * de sugestão presentes em `tenants`: quando desligada aqui, nenhum tenant
+ * consegue usá-la, independente da própria configuração (ver migration
+ * 0004_ai_feature_flags.sql — índice único parcial garante singleton).
+ */
+export const platformSettings = pgTable('platform_settings', {
+  id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
+  aiClassificationEnabled: boolean('ai_classification_enabled').notNull().default(true),
+  aiTitleSuggestionEnabled: boolean('ai_title_suggestion_enabled').notNull().default(true),
+  aiIndexSuggestionEnabled: boolean('ai_index_suggestion_enabled').notNull().default(true),
+  updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' })
+    .notNull()
+    .default(sql`now()`),
 });
 
 // ---------------------------------------------------------------------------
@@ -468,6 +498,9 @@ export const auditLogs = pgTable(
 
 export type Tenant = typeof tenants.$inferSelect;
 export type NewTenant = typeof tenants.$inferInsert;
+
+export type PlatformSettings = typeof platformSettings.$inferSelect;
+export type NewPlatformSettings = typeof platformSettings.$inferInsert;
 
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;

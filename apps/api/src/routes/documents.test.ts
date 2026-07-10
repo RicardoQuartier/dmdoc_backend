@@ -1389,3 +1389,217 @@ describe('GET /documents — ordenação, filtros e paginação por cursor', () 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// POST /documents/bulk-reassign-uploader — reatribuição em massa (SUPER_ADMIN)
+// ---------------------------------------------------------------------------
+describe('POST /documents/bulk-reassign-uploader', () => {
+  const SUPER_ADMIN_ID = newId();
+  const TARGET_USER_A_ID = newId();
+
+  let tokenSuperAdmin: string;
+
+  /**
+   * Insere um documento diretamente via SQL (sem passar pelo upload
+   * multipart) — atalho para montar fixtures desta suíte.
+   */
+  async function seedBulkDoc(opts: {
+    id: string;
+    tenantId: string;
+    departmentId: string;
+    uploadedById: string;
+    hash: string;
+    deleted?: boolean;
+  }): Promise<void> {
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${opts.id}, ${opts.tenantId}, ${opts.departmentId}, NULL,
+        'doc.pdf', 'doc.pdf', ${opts.hash}, 1000, 'application/pdf',
+        ${`tenants/${opts.tenantId}/documents/${opts.hash}/doc.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${opts.uploadedById}, NOW(), NOW(), 0, ${opts.deleted ?? false}
+      )
+    `;
+  }
+
+  /** Insere um evento de upload diretamente, apontando para um documento já existente. */
+  async function seedBulkEvent(opts: {
+    tenantId: string;
+    documentId: string;
+    uploadedById: string;
+  }): Promise<void> {
+    await testDb.db`
+      INSERT INTO document_events (
+        id, tenant_id, document_id, uploaded_by_id, event_type,
+        mime_type, document_type_id, document_type_name,
+        size_bytes, page_count, deduplicated, created_at
+      ) VALUES (
+        ${newId()}, ${opts.tenantId}, ${opts.documentId}, ${opts.uploadedById}, 'upload',
+        'application/pdf', NULL, NULL, 1000, NULL, false, NOW()
+      )
+    `;
+  }
+
+  beforeEach(async () => {
+    await seedUser(testDb.db, {
+      id: SUPER_ADMIN_ID,
+      tenantId: null,
+      email: 'super-bulk@dmdoc.com',
+      password: PASSWORD,
+      role: 'SUPER_ADMIN',
+    });
+    await seedUser(testDb.db, {
+      id: TARGET_USER_A_ID,
+      tenantId: TENANT_A,
+      email: 'target-a@empresa.com',
+      password: PASSWORD,
+      role: 'USER',
+    });
+
+    tokenSuperAdmin = await login('super-bulk@dmdoc.com');
+  });
+
+  it('sucesso: reatribui documents e document_events atomicamente', async () => {
+    const doc1 = newId();
+    const doc2 = newId();
+    await seedBulkDoc({ id: doc1, tenantId: TENANT_A, departmentId: DEPT_A_ID, uploadedById: ADMIN_A_ID, hash: 'e1'.repeat(32) });
+    await seedBulkDoc({ id: doc2, tenantId: TENANT_A, departmentId: DEPT_A_ID, uploadedById: UPLOADER_A_ID, hash: 'e2'.repeat(32) });
+    await seedBulkEvent({ tenantId: TENANT_A, documentId: doc1, uploadedById: ADMIN_A_ID });
+    await seedBulkEvent({ tenantId: TENANT_A, documentId: doc2, uploadedById: UPLOADER_A_ID });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents/bulk-reassign-uploader',
+      headers: { authorization: `Bearer ${tokenSuperAdmin}` },
+      payload: { documentIds: [doc1, doc2], toUserId: TARGET_USER_A_ID },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ updatedDocuments: 2, updatedEvents: 2 });
+
+    const docs = await testDb.db<Array<{ id: string; uploaded_by_id: string }>>`
+      SELECT id, uploaded_by_id FROM documents WHERE id = ANY(${[doc1, doc2]}::uuid[])
+    `;
+    expect(docs.every((d) => d.uploaded_by_id === TARGET_USER_A_ID)).toBe(true);
+
+    const events = await testDb.db<Array<{ document_id: string; uploaded_by_id: string }>>`
+      SELECT document_id, uploaded_by_id FROM document_events WHERE document_id = ANY(${[doc1, doc2]}::uuid[])
+    `;
+    expect(events).toHaveLength(2);
+    expect(events.every((e) => e.uploaded_by_id === TARGET_USER_A_ID)).toBe(true);
+  });
+
+  it('documentos de tenants diferentes → 422 ValidationError', async () => {
+    const docA = newId();
+    const docB = newId();
+    await seedBulkDoc({ id: docA, tenantId: TENANT_A, departmentId: DEPT_A_ID, uploadedById: ADMIN_A_ID, hash: 'f1'.repeat(32) });
+    await seedBulkDoc({ id: docB, tenantId: TENANT_B, departmentId: DEPT_B_ID, uploadedById: ADMIN_B_ID, hash: 'f2'.repeat(32) });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents/bulk-reassign-uploader',
+      headers: { authorization: `Bearer ${tokenSuperAdmin}` },
+      payload: { documentIds: [docA, docB], toUserId: TARGET_USER_A_ID },
+    });
+
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('usuário destino de outro tenant → 404', async () => {
+    const doc1 = newId();
+    await seedBulkDoc({ id: doc1, tenantId: TENANT_A, departmentId: DEPT_A_ID, uploadedById: ADMIN_A_ID, hash: 'a1'.repeat(32) });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents/bulk-reassign-uploader',
+      headers: { authorization: `Bearer ${tokenSuperAdmin}` },
+      payload: { documentIds: [doc1], toUserId: ADMIN_B_ID }, // ADMIN_B_ID pertence a TENANT_B
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+  });
+
+  it('documento inexistente ou soft-deleted → 404 (nunca revela qual)', async () => {
+    const doc1 = newId();
+    const deletedDoc = newId();
+    await seedBulkDoc({ id: doc1, tenantId: TENANT_A, departmentId: DEPT_A_ID, uploadedById: ADMIN_A_ID, hash: 'b1'.repeat(32) });
+    await seedBulkDoc({
+      id: deletedDoc, tenantId: TENANT_A, departmentId: DEPT_A_ID, uploadedById: ADMIN_A_ID,
+      hash: 'b2'.repeat(32), deleted: true,
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents/bulk-reassign-uploader',
+      headers: { authorization: `Bearer ${tokenSuperAdmin}` },
+      payload: { documentIds: [doc1, deletedDoc], toUserId: TARGET_USER_A_ID },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+  });
+
+  it('mais de 500 documentIds → 422 (rejeita antes de tocar o banco)', async () => {
+    const documentIds = Array.from({ length: 501 }, () => newId());
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents/bulk-reassign-uploader',
+      headers: { authorization: `Bearer ${tokenSuperAdmin}` },
+      payload: { documentIds, toUserId: TARGET_USER_A_ID },
+    });
+
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('usuário não-SUPER_ADMIN recebe 403', async () => {
+    const doc1 = newId();
+    await seedBulkDoc({ id: doc1, tenantId: TENANT_A, departmentId: DEPT_A_ID, uploadedById: ADMIN_A_ID, hash: 'c1'.repeat(32) });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents/bulk-reassign-uploader',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { documentIds: [doc1], toUserId: TARGET_USER_A_ID },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+  });
+
+  it('registra audit log com action document.bulk_reassign_uploader', async () => {
+    const doc1 = newId();
+    await seedBulkDoc({ id: doc1, tenantId: TENANT_A, departmentId: DEPT_A_ID, uploadedById: ADMIN_A_ID, hash: 'd1'.repeat(32) });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents/bulk-reassign-uploader',
+      headers: { authorization: `Bearer ${tokenSuperAdmin}` },
+      payload: { documentIds: [doc1], toUserId: TARGET_USER_A_ID },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const logs = await testDb.db<Array<{ action: string; user_id: string; tenant_id: string; metadata: string | Record<string, unknown> }>>`
+      SELECT action, user_id, tenant_id, metadata FROM audit_logs WHERE action = 'document.bulk_reassign_uploader'
+    `;
+    expect(logs).toHaveLength(1);
+    // `metadata` (jsonb) chega como string pelo driver nesta consulta crua —
+    // normaliza antes de inspecionar o conteúdo (mesmo formato inserido pelo
+    // AuditLogger via JSON.stringify).
+    const metadata: Record<string, unknown> =
+      typeof logs[0]!.metadata === 'string' ? JSON.parse(logs[0]!.metadata) : logs[0]!.metadata;
+
+    expect(logs[0]!.user_id).toBe(SUPER_ADMIN_ID);
+    expect(logs[0]!.tenant_id).toBe(TENANT_A);
+    expect(metadata['toUserId']).toBe(TARGET_USER_A_ID);
+    expect(metadata['count']).toBe(1);
+    expect(metadata['fromUserIds']).toEqual([ADMIN_A_ID]);
+  });
+});
