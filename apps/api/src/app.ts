@@ -13,6 +13,7 @@ import { authRoutes } from './routes/auth.js';
 import { adminTenantsRoutes } from './routes/admin/tenants.js';
 import { multiTenantAdminsRoutes } from './routes/admin/multi-tenant-admins.js';
 import { adminDepartmentTemplatesRoutes } from './routes/admin/department-templates.js';
+import { adminPlatformSettingsRoutes } from './routes/admin/platform-settings.js';
 import { usersRoutes } from './routes/users.js';
 import { departmentsRoutes } from './routes/departments.js';
 import { documentTypesRoutes } from './routes/document-types.js';
@@ -22,6 +23,7 @@ import { searchRoutes, type SearchRoutesOptions } from './routes/search.js';
 import { auditLogsRoutes } from './routes/audit-logs.js';
 import { usageRoutes } from './routes/usage.js';
 import { reportsRoutes } from './routes/reports.js';
+import { tenantAiSettingsRoutes } from './routes/tenant-ai-settings.js';
 import { createS3Service, type S3Service, type S3Config } from './services/s3.js';
 
 declare module 'fastify' {
@@ -151,6 +153,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(adminTenantsRoutes);
   await app.register(multiTenantAdminsRoutes);
   await app.register(adminDepartmentTemplatesRoutes);
+  await app.register(adminPlatformSettingsRoutes);
   await app.register(usersRoutes);
   await app.register(departmentsRoutes);
   await app.register(documentTypesRoutes);
@@ -160,6 +163,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(auditLogsRoutes);
   await app.register(usageRoutes);
   await app.register(reportsRoutes);
+  await app.register(tenantAiSettingsRoutes);
 
   // Fecha a fila BullMQ no shutdown (deve ser antes de ready())
   if (options.queue) {
