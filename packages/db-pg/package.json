@@ -12,7 +12,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').cpSync('src/data','dist/data',{recursive:true})\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src --max-warnings=0",
     "test": "vitest run",
@@ -21,7 +21,8 @@
     "seed": "tsx src/seed.ts",
     "db:fresh": "tsx src/db-fresh.ts",
     "migrate:fresh": "tsx src/migrate-fresh.ts",
-    "backfill:event-document-type": "tsx src/backfill-event-document-type.ts"
+    "backfill:event-document-type": "tsx src/backfill-event-document-type.ts",
+    "backfill:missing-document-events": "tsx src/backfill-missing-document-events.ts"
   },
   "dependencies": {
     "@dmdoc/shared-types": "workspace:*",

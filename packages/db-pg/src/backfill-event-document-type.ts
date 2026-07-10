@@ -1,7 +1,14 @@
 import { pathToFileURL } from 'node:url';
 import postgres from 'postgres';
 
-async function run(sql: postgres.Sql): Promise<void> {
+/**
+ * Preenche `document_events.document_type_id`/`document_type_name` ausentes
+ * a partir do estado atual de `documents`.
+ *
+ * Uso standalone: `pnpm --filter @dmdoc/db-pg backfill:event-document-type`
+ * Uso via artisan: `pnpm run artisan backfill:event-document-type`
+ */
+export async function run(sql: postgres.Sql): Promise<void> {
   const result = await sql`
     UPDATE document_events de
     SET

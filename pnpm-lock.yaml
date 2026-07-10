@@ -164,6 +164,25 @@ importers:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@22.19.20)
 
+  packages/artisan:
+    dependencies:
+      '@dmdoc/db-pg':
+        specifier: workspace:*
+        version: link:../db-pg
+      postgres:
+        specifier: ^3.4.5
+        version: 3.4.9
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.20
+      tsx:
+        specifier: ^4.19.2
+        version: 4.22.4
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
   packages/db-pg:
     dependencies:
       '@dmdoc/shared-types':
