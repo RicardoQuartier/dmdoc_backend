@@ -80,8 +80,10 @@ export const tenants = pgTable('tenants', {
     .default(sql`now()`),
   deleted: boolean('deleted').notNull().default(false),
   deletedAt: timestamp('deleted_at', { withTimezone: true, mode: 'date' }),
-  // Toggles por empresa das features de IA de sugestão (Fases 7/8/8.1),
-  // geridos pelo TENANT_ADMIN via PATCH /tenant/ai-settings. Valor efetivo de
+  // Toggles por empresa das features de IA de sugestão (Fases 7/8/8.1) — plus
+  // comercial por empresa, geridos EXCLUSIVAMENTE pelo SUPER_ADMIN via
+  // PATCH /admin/tenants/:id (mesmo fluxo de edição de cotas). O TENANT_ADMIN
+  // não tem acesso de leitura nem escrita a estas flags. Valor efetivo de
   // cada feature = platformSettings.<feature> AND tenants.<feature>.
   aiClassificationEnabled: boolean('ai_classification_enabled').notNull().default(true),
   aiTitleSuggestionEnabled: boolean('ai_title_suggestion_enabled').notNull().default(true),

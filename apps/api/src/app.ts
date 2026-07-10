@@ -23,7 +23,6 @@ import { searchRoutes, type SearchRoutesOptions } from './routes/search.js';
 import { auditLogsRoutes } from './routes/audit-logs.js';
 import { usageRoutes } from './routes/usage.js';
 import { reportsRoutes } from './routes/reports.js';
-import { tenantAiSettingsRoutes } from './routes/tenant-ai-settings.js';
 import { createS3Service, type S3Service, type S3Config } from './services/s3.js';
 
 declare module 'fastify' {
@@ -163,7 +162,6 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(auditLogsRoutes);
   await app.register(usageRoutes);
   await app.register(reportsRoutes);
-  await app.register(tenantAiSettingsRoutes);
 
   // Fecha a fila BullMQ no shutdown (deve ser antes de ready())
   if (options.queue) {

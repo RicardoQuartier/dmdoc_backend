@@ -37,8 +37,9 @@ function toResponse(r: PlatformSettingsRow) {
  * Funciona como um kill switch global das 3 features de IA de sugestão
  * (classificação de tipo, título sugerido, sugestão de índices — Fases
  * 7/8/8.1): o valor efetivo de cada feature para um tenant é
- * `platform_settings.<feature> AND tenants.<feature>` (ver
- * `PATCH /tenant/ai-settings`, controlado pelo TENANT_ADMIN de cada empresa).
+ * `platform_settings.<feature> AND tenants.<feature>` (o toggle por empresa é
+ * um plus comercial gerido exclusivamente pelo SUPER_ADMIN via
+ * `PATCH /admin/tenants/:id` — ver `apps/api/src/routes/admin/tenants.ts`).
  */
 export const adminPlatformSettingsRoutes: FastifyPluginAsync = async (app) => {
   /**

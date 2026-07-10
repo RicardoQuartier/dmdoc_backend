@@ -297,6 +297,160 @@ describe('POST /admin/tenants com templateId inválido', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 4b. Flags de IA por empresa — plus comercial exclusivo do SUPER_ADMIN
+//     (GET /admin/tenants e PATCH /admin/tenants/:id)
+// ---------------------------------------------------------------------------
+describe('GET /admin/tenants — flags de IA (plus comercial por empresa)', () => {
+  it('lista tenants incluindo as 3 flags de IA, default true', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/admin/tenants',
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { name: 'Empresa Flags IA Listagem' },
+    });
+    expect(created.statusCode).toBe(201);
+
+    const list = await app.inject({
+      method: 'GET',
+      url: '/admin/tenants',
+      headers: { authorization: `Bearer ${superAdminToken}` },
+    });
+    expect(list.statusCode).toBe(200);
+
+    const items = list.json().items as Array<Record<string, unknown>>;
+    const item = items.find((i) => i['name'] === 'Empresa Flags IA Listagem');
+    expect(item).toMatchObject({
+      aiClassificationEnabled: true,
+      aiTitleSuggestionEnabled: true,
+      aiIndexSuggestionEnabled: true,
+    });
+  });
+});
+
+describe('PATCH /admin/tenants/:id — flags de IA (plus comercial, exclusivo do SUPER_ADMIN)', () => {
+  it('aceita subconjunto de campos incluindo flags de IA e persiste', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/admin/tenants',
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { name: 'Empresa PATCH Flags IA' },
+    });
+    const tenantId = (created.json() as Record<string, unknown>)['id'] as string;
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { userQuota: 30, aiClassificationEnabled: false, aiIndexSuggestionEnabled: false },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Record<string, unknown>;
+    expect(body).toMatchObject({
+      userQuota: 30,
+      aiClassificationEnabled: false,
+      aiTitleSuggestionEnabled: true,
+      aiIndexSuggestionEnabled: false,
+    });
+
+    const rows = await testDb.db<
+      Array<{
+        ai_classification_enabled: boolean;
+        ai_title_suggestion_enabled: boolean;
+        ai_index_suggestion_enabled: boolean;
+      }>
+    >`
+      SELECT ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
+      FROM tenants WHERE id = ${tenantId}
+    `;
+    expect(rows[0]).toMatchObject({
+      ai_classification_enabled: false,
+      ai_title_suggestion_enabled: true,
+      ai_index_suggestion_enabled: false,
+    });
+  });
+
+  it('registra um AuditLog com ator, e diff antes/depois apenas das flags de IA informadas', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/admin/tenants',
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { name: 'Empresa Audit Flags IA' },
+    });
+    const tenantId = (created.json() as Record<string, unknown>)['id'] as string;
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { name: 'Empresa Audit Flags IA Renomeada', aiTitleSuggestionEnabled: false },
+    });
+    expect(res.statusCode).toBe(200);
+
+    // `metadata` é jsonb, mas o cliente postgres.js usado aqui não registra um
+    // parser automático para json/jsonb — a coluna volta como string bruta e
+    // precisa de JSON.parse manual (mesmo comportamento de outras rotas).
+    const rows = await testDb.db<
+      Array<{
+        tenant_id: string | null;
+        user_id: string | null;
+        action: string;
+        resource: string | null;
+        metadata: string;
+      }>
+    >`
+      SELECT tenant_id, user_id, action, resource, metadata
+      FROM audit_logs
+      WHERE action = 'tenant.ai_settings.update' AND tenant_id = ${tenantId}
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+
+    expect(rows).toHaveLength(1);
+    const log = rows[0]!;
+    const metadata = JSON.parse(log.metadata) as {
+      actorRole?: string;
+      changes?: Record<string, { before: boolean; after: boolean }>;
+    };
+    expect(log.tenant_id).toBe(tenantId);
+    expect(log.user_id).toBe(SUPER_ADMIN_ID);
+    expect(log.resource).toBe(`tenants/${tenantId}`);
+    expect(metadata.actorRole).toBe('SUPER_ADMIN');
+    expect(metadata.changes).toMatchObject({
+      aiTitleSuggestionEnabled: { before: true, after: false },
+    });
+    // Só a flag de IA informada entra no diff — `name` nunca foi auditado
+    // nesta rota e não deve aparecer no diff de flags de IA.
+    expect(metadata.changes).not.toHaveProperty('aiClassificationEnabled');
+    expect(metadata.changes).not.toHaveProperty('aiIndexSuggestionEnabled');
+    expect(metadata.changes).not.toHaveProperty('name');
+  });
+
+  it('PATCH sem flags de IA não registra AuditLog de tenant.ai_settings.update', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/admin/tenants',
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { name: 'Empresa Sem Flags IA' },
+    });
+    const tenantId = (created.json() as Record<string, unknown>)['id'] as string;
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { userQuota: 55 },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const rows = await testDb.db`
+      SELECT id FROM audit_logs WHERE action = 'tenant.ai_settings.update' AND tenant_id = ${tenantId}
+    `;
+    expect(rows).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5. DELETE /admin/tenants/:id — exclusão (soft-delete) + enfileiramento
 // ---------------------------------------------------------------------------
 describe('DELETE /admin/tenants/:id', () => {
