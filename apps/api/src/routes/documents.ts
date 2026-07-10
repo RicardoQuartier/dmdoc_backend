@@ -11,7 +11,12 @@ import {
 } from '@dmdoc/db-pg';
 import type { TenantDocument } from '@dmdoc/db-pg';
 import type { Sql } from '@dmdoc/db-pg';
-import type { DocumentProcessingJobData } from '@dmdoc/shared-types';
+import type {
+  DocumentProcessingJobData,
+  ExtractionResult,
+  IndexSuggestion,
+  CostBreakdown,
+} from '@dmdoc/shared-types';
 import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
 import { NotFoundError, QuotaExceededError, ValidationError } from '../errors/index.js';
@@ -71,6 +76,41 @@ interface IndexFieldRow {
   show_on_search: boolean;
   deleted: boolean;
 }
+
+/**
+ * Linha crua de `document_content` como armazenada no PostgreSQL — usada
+ * exclusivamente pelo `GET /documents/:id/debug`.
+ *
+ * Os campos JSONB (`extraction`, `index_suggestion`, `cost_breakdown`) já
+ * chegam desserializados pelo driver `postgres.js`, mas os campos de data
+ * embutidos neles (`extractedAt`/`suggestedAt`) chegam como string ISO, e não
+ * `Date` (JSON não tem tipo Date nativo) — por isso divergem de
+ * `ExtractionResult`/`IndexSuggestion` de `@dmdoc/shared-types` só nesse
+ * campo. Convertidos de volta para `Date` ao montar a resposta do debug.
+ */
+interface DocumentContentRow {
+  document_id: string;
+  tenant_id: string;
+  full_text: string;
+  extraction: Omit<ExtractionResult, 'extractedAt'> & { extractedAt: string };
+  index_suggestion: (Omit<IndexSuggestion, 'suggestedAt'> & { suggestedAt: string }) | null;
+  cost_breakdown: CostBreakdown | null;
+}
+
+/**
+ * Amostra de `chunks` (até 3, ordenados por `chunk_index`) retornada pelo
+ * `GET /documents/:id/debug`. `text` já vem truncado pelo `LEFT(...)` da
+ * query — evita puxar o texto completo dos chunks pela rede.
+ */
+interface ChunkSampleRow {
+  chunk_index: number;
+  page_number: number | null;
+  token_count: number;
+  text: string;
+}
+
+/** Tamanho máximo (em caracteres) do trecho de texto exibido por chunk na amostra de debug. */
+const DEBUG_CHUNK_TEXT_SAMPLE_LENGTH = 300;
 
 // ---------------------------------------------------------------------------
 // Schemas para novas rotas
@@ -1297,6 +1337,94 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       .header('Content-Type', 'application/pdf')
       .header('Content-Disposition', `inline; filename="${doc.id}.pdf"`)
       .send(pdfBuffer);
+  });
+
+  // =========================================================================
+  // GET /documents/:id/debug — dados de extração/processamento (SUPER_ADMIN)
+  // =========================================================================
+  /**
+   * Ferramenta de operação da plataforma: expõe texto extraído, metadados de
+   * extração, sugestão de índices e custo de um documento sem precisar
+   * consultar o banco diretamente. Exclusiva do SUPER_ADMIN — nem
+   * TENANT_ADMIN nem MULTI_TENANT_ADMIN têm acesso (intencional: não é
+   * ferramenta de gestão de empresa, é de suporte/depuração da plataforma).
+   *
+   * O SUPER_ADMIN já tem acesso cross-tenant nativo (`findDocumentGlobally`)
+   * — não há filtro por tenant, só verificação de existência.
+   */
+  app.get('/documents/:id/debug', { preHandler: app.authenticate }, async (request, reply) => {
+    requireRole(request, 'SUPER_ADMIN');
+
+    const userId = request.user!.sub;
+    const sql = app.db;
+
+    const { id } = request.params as { id: string };
+
+    const doc = await findDocumentGlobally(sql, id);
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    // document_content pode não existir ainda (PENDING/PROCESSING/FAILED
+    // antes da extração terminar) — estado válido, não é erro.
+    const [contentRows, chunkCountRows, chunkSampleRows] = await Promise.all([
+      sql<DocumentContentRow[]>`
+        SELECT document_id, tenant_id, full_text, extraction, index_suggestion, cost_breakdown
+        FROM document_content
+        WHERE document_id = ${doc.id}
+          AND tenant_id = ${doc.tenant_id}
+        LIMIT 1
+      `,
+      sql<Array<{ count: string }>>`
+        SELECT COUNT(*) AS count
+        FROM chunks
+        WHERE document_id = ${doc.id}
+      `,
+      sql<ChunkSampleRow[]>`
+        SELECT chunk_index, page_number, token_count,
+          LEFT(text, ${DEBUG_CHUNK_TEXT_SAMPLE_LENGTH}) AS text
+        FROM chunks
+        WHERE document_id = ${doc.id}
+        ORDER BY chunk_index ASC
+        LIMIT 3
+      `,
+    ]);
+
+    const content = contentRows[0] ?? null;
+
+    const extraction: ExtractionResult | null =
+      content !== null
+        ? { ...content.extraction, extractedAt: new Date(content.extraction.extractedAt) }
+        : null;
+
+    const indexSuggestion: IndexSuggestion | null =
+      content?.index_suggestion != null
+        ? { ...content.index_suggestion, suggestedAt: new Date(content.index_suggestion.suggestedAt) }
+        : null;
+
+    request.log.info(
+      { tenantId: doc.tenant_id, userId, documentId: doc.id },
+      'debug de documento consultado por SUPER_ADMIN'
+    );
+
+    return reply.status(200).send({
+      documentId: doc.id,
+      status: doc.status,
+      failureReason: doc.failure_reason,
+      extraction,
+      fullText: content?.full_text ?? null,
+      fullTextLength: content?.full_text.length ?? 0,
+      indexSuggestion,
+      costBreakdown: content?.cost_breakdown ?? null,
+      costUsdCents: doc.cost_usd_cents,
+      chunkCount: parseInt(chunkCountRows[0]?.count ?? '0', 10),
+      chunkSample: chunkSampleRows.map((c) => ({
+        chunkIndex: c.chunk_index,
+        pageNumber: c.page_number,
+        tokenCount: c.token_count,
+        text: c.text,
+      })),
+    });
   });
 
   // =========================================================================
