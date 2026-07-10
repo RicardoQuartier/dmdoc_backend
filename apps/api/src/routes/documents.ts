@@ -190,6 +190,17 @@ const PatchDocumentBodySchema = z.object({
   tags: z.array(z.string()).optional(),
 });
 
+/**
+ * Schema do body do POST /documents/bulk-reassign-uploader.
+ *
+ * `documentIds` usa o mesmo teto de 500 do `limit` de `GET /documents`
+ * (`ListDocumentsQuerySchema.limit`).
+ */
+const BulkReassignUploaderBodySchema = z.object({
+  documentIds: z.array(z.string().uuid()).min(1).max(500),
+  toUserId: z.string().uuid(),
+});
+
 // ---------------------------------------------------------------------------
 // Utilitários
 // ---------------------------------------------------------------------------
@@ -586,10 +597,17 @@ function buildKeysetCondition(params: {
   return `(${expr} IS NULL OR ${expr} ${dirCmp} ${valuePlaceholder} OR (${expr} = ${valuePlaceholder} AND d.id ${dirCmp} ${idPlaceholder}))`;
 }
 
+/** Número total de tentativas de `emitUploadEvent` (1 original + 1 retry). */
+const EMIT_UPLOAD_EVENT_MAX_ATTEMPTS = 2;
+
 /**
  * Emite um evento de upload na tabela append-only `document_events`.
  *
- * Falha de emissão NUNCA derruba a operação de upload.
+ * Tenta até `EMIT_UPLOAD_EVENT_MAX_ATTEMPTS` vezes (1 tentativa original + 1
+ * retry síncrono, sem backoff) antes de desistir — absorve falhas transitórias
+ * de pool/conexão sem adicionar complexidade de fila/backoff assíncrono.
+ *
+ * Falha de emissão (mesmo após o retry) NUNCA derruba a operação de upload.
  */
 async function emitUploadEvent(
   sql: Sql,
@@ -597,21 +615,28 @@ async function emitUploadEvent(
   tenantId: string,
   input: CreateDocumentEventPgInput
 ): Promise<void> {
-  try {
-    const eventsRepo = new DocumentEventsRepository(sql, { tenantId });
-    await eventsRepo.insertOne(input);
-  } catch (eventError) {
-    log.error(
-      {
-        err: eventError,
-        tenantId,
-        documentId: input.documentId,
-        userId: input.uploadedById,
-        deduplicated: input.deduplicated,
-      },
-      'falha ao emitir evento de upload (document_events)'
-    );
+  const eventsRepo = new DocumentEventsRepository(sql, { tenantId });
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= EMIT_UPLOAD_EVENT_MAX_ATTEMPTS; attempt++) {
+    try {
+      await eventsRepo.insertOne(input);
+      return;
+    } catch (eventError) {
+      lastError = eventError;
+    }
   }
+
+  log.error(
+    {
+      err: lastError,
+      tenantId,
+      documentId: input.documentId,
+      userId: input.uploadedById,
+      deduplicated: input.deduplicated,
+    },
+    'falha ao emitir evento de upload (document_events)'
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1570,6 +1595,129 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     return reply.status(200).send(rowToDocument(updated as DocumentRow));
   });
+
+  // =========================================================================
+  // POST /documents/bulk-reassign-uploader — reatribuição em massa de
+  // "quem fez upload" (SUPER_ADMIN)
+  // =========================================================================
+  /**
+   * Reatribui em massa `uploaded_by_id` de um lote de documentos para outro
+   * usuário da mesma empresa — atualiza tanto `documents` (estado atual)
+   * quanto `document_events` (histórico usado pelos relatórios), numa única
+   * transação atômica.
+   *
+   * Diferente do precedente fire-and-forget de `syncDocumentType` (metadado
+   * secundário), aqui a consistência entre as duas tabelas é o requisito
+   * central da feature: falha em qualquer uma das duas reverte a operação
+   * inteira (erro 500 propagado, não silenciado).
+   *
+   * Exclusivo de SUPER_ADMIN. Todos os documentos selecionados precisam
+   * pertencer à mesma empresa — isso é validação de uso da API (o SUPER_ADMIN
+   * já tem acesso cross-tenant nativo), não vazamento entre empresas, então a
+   * semântica "404-nunca-403" do resto do arquivo não se aplica a essa
+   * validação específica (usa `ValidationError` → 422).
+   */
+  app.post(
+    '/documents/bulk-reassign-uploader',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      requireRole(request, 'SUPER_ADMIN');
+
+      const userId = request.user!.sub;
+      const sql = app.db;
+
+      const { documentIds, toUserId } = BulkReassignUploaderBodySchema.parse(request.body);
+
+      // ------------------------------------------------------------------
+      // 1. Busca os documentos selecionados (sem filtro de tenant — SUPER_ADMIN)
+      // ------------------------------------------------------------------
+      const foundDocs = await sql<Array<{ id: string; tenant_id: string; uploaded_by_id: string | null }>>`
+        SELECT id, tenant_id, uploaded_by_id
+        FROM documents
+        WHERE id = ANY(${documentIds}::uuid[])
+          AND deleted = false
+      `;
+
+      if (foundDocs.length !== documentIds.length) {
+        // Nunca revela qual id falhou — mesmo padrão 404-genérico do resto do arquivo.
+        throw new NotFoundError('Documento não encontrado');
+      }
+
+      // ------------------------------------------------------------------
+      // 2. Todos os documentos precisam pertencer à mesma empresa
+      // ------------------------------------------------------------------
+      const distinctTenantIds = [...new Set(foundDocs.map((d) => d.tenant_id))];
+      if (distinctTenantIds.length > 1) {
+        throw new ValidationError('Todos os documentos devem pertencer à mesma empresa');
+      }
+      const tenantId = distinctTenantIds[0]!;
+
+      // ------------------------------------------------------------------
+      // 3. Valida usuário destino: existe, não deletado, mesmo tenant
+      // ------------------------------------------------------------------
+      const toUserRows = await sql<Array<{ id: string }>>`
+        SELECT id FROM users
+        WHERE id = ${toUserId}
+          AND tenant_id = ${tenantId}
+          AND deleted = false
+        LIMIT 1
+      `;
+      if (toUserRows.length === 0) {
+        throw new NotFoundError('Usuário destino não encontrado');
+      }
+
+      // ------------------------------------------------------------------
+      // 4. Transação atômica: documents + document_events
+      // ------------------------------------------------------------------
+      const { updatedDocuments, updatedEvents } = await sql.begin(async (tx) => {
+        const docsResult = await tx`
+          UPDATE documents
+          SET uploaded_by_id = ${toUserId}
+          WHERE id = ANY(${documentIds}::uuid[])
+            AND tenant_id = ${tenantId}
+        `;
+        const eventsResult = await tx`
+          UPDATE document_events
+          SET uploaded_by_id = ${toUserId}
+          WHERE document_id = ANY(${documentIds}::uuid[])
+            AND tenant_id = ${tenantId}
+        `;
+        return { updatedDocuments: docsResult.count, updatedEvents: eventsResult.count };
+      });
+
+      // ------------------------------------------------------------------
+      // 5. AuditLog (não-bloqueante)
+      // ------------------------------------------------------------------
+      const fromUserIds = [...new Set(foundDocs.map((d) => d.uploaded_by_id).filter((id): id is string => id !== null))];
+      const auditLogger = new AuditLogger(sql);
+      try {
+        await auditLogger.record({
+          tenantId,
+          userId,
+          action: 'document.bulk_reassign_uploader',
+          resource: 'documents/bulk-reassign',
+          metadata: {
+            documentIds,
+            fromUserIds,
+            toUserId,
+            count: documentIds.length,
+          },
+        });
+      } catch (auditError) {
+        request.log.error(
+          { err: auditError, tenantId, userId, toUserId, count: documentIds.length },
+          'falha ao registrar audit log de reatribuição em massa de uploader'
+        );
+      }
+
+      request.log.info(
+        { tenantId, userId, count: documentIds.length, toUserId, traceId: request.id },
+        'uploader reatribuído em massa'
+      );
+
+      return reply.status(200).send({ updatedDocuments, updatedEvents });
+    }
+  );
 
   // =========================================================================
   // DELETE /documents/:id — exclusão lógica + limpeza de chunks/S3
