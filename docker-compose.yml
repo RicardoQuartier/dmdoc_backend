@@ -120,6 +120,33 @@ services:
         pnpm --filter @dmdoc/db-pg build &&
         pnpm --filter @dmdoc/db-mongo build"
 
+  # ---------- Migrations (one-shot, roda no boot) ----------
+  # Aplica as migrations pendentes do Postgres via o mecanismo oficial do
+  # projeto (drizzle-kit migrate — usa migrations/meta/_journal.json e a tabela
+  # de controle drizzle.__drizzle_migrations). Roda após a instalação de deps e
+  # com o Postgres saudável; api/worker só sobem depois dela concluir. Isso
+  # evita schema drift (banco atrás do repo) — causa do 500 em /admin/tenants
+  # quando a migração 0004_ai_feature_flags não havia sido aplicada.
+  backend-migrate:
+    image: node:22-slim
+    container_name: dmdoc-backend-migrate
+    working_dir: /app
+    command: sh -c "corepack enable && pnpm --filter @dmdoc/db-pg migrate"
+    environment:
+      DATABASE_URL: postgresql://dmdoc:dmdoc@postgres:5432/dmdoc
+    volumes:
+      - .:/app
+      - backend_root_nm:/app/node_modules
+      - backend_api_nm:/app/apps/api/node_modules
+      - backend_worker_nm:/app/apps/worker/node_modules
+      - backend_shared_nm:/app/packages/shared-types/node_modules
+    restart: 'no'
+    depends_on:
+      backend-install:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
   # ---------------- API (hot-reload via tsx watch) ----------------
   api:
     image: node:22-slim
@@ -152,6 +179,8 @@ services:
       - backend_shared_nm:/app/packages/shared-types/node_modules
     depends_on:
       backend-install:
+        condition: service_completed_successfully
+      backend-migrate:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
@@ -186,6 +215,8 @@ services:
       - backend_shared_nm:/app/packages/shared-types/node_modules
     depends_on:
       backend-install:
+        condition: service_completed_successfully
+      backend-migrate:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
