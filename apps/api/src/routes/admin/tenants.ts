@@ -192,31 +192,31 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       return reply.status(200).send(toResponse(rows[0]!));
     }
 
-    // As 3 flags de IA são um plus comercial gerido exclusivamente pelo
-    // SUPER_ADMIN — capturamos o estado ANTES da atualização apenas quando
-    // pelo menos uma delas é enviada, para registrar o diff antes/depois no
-    // AuditLog (mesmo padrão de `PATCH /admin/platform-settings`). Os demais
-    // campos (name, cotas, active) nunca tiveram auditoria e não passam a ter
-    // aqui — apenas as flags de IA.
+    // Todos os campos deste endpoint são administrados exclusivamente pelo
+    // SUPER_ADMIN e são dados sensíveis da empresa (nome, cotas, ativa/inativa e
+    // as 3 flags de IA). Capturamos o estado ANTES da atualização sempre que ao
+    // menos um campo auditável é enviado, para registrar o diff antes/depois no
+    // AuditLog (mesmo padrão de `PATCH /admin/platform-settings`). Ver spec §10.
     const touchesAiFlags =
       updates.aiClassificationEnabled !== undefined ||
       updates.aiTitleSuggestionEnabled !== undefined ||
       updates.aiIndexSuggestionEnabled !== undefined;
+    const touchesSettings =
+      updates.name !== undefined ||
+      updates.diskQuotaBytes !== undefined ||
+      updates.userQuota !== undefined ||
+      updates.active !== undefined;
 
-    let beforeAi: Pick<
-      TenantRow,
-      'ai_classification_enabled' | 'ai_title_suggestion_enabled' | 'ai_index_suggestion_enabled'
-    > | undefined;
-    if (touchesAiFlags) {
-      const beforeRows = await sql<
-        Array<Pick<TenantRow, 'ai_classification_enabled' | 'ai_title_suggestion_enabled' | 'ai_index_suggestion_enabled'>>
-      >`
-        SELECT ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
+    let before: TenantRow | undefined;
+    if (touchesAiFlags || touchesSettings) {
+      const beforeRows = await sql<TenantRow[]>`
+        SELECT id, name, disk_quota_bytes, user_quota, active, created_at,
+               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
         FROM tenants
         WHERE id = ${id}
         LIMIT 1
       `;
-      beforeAi = beforeRows[0];
+      before = beforeRows[0];
       // Se o tenant não existe, não interrompe aqui: o UPDATE abaixo também
       // não afeta nenhuma linha e cai no NotFoundError já existente, mantendo
       // uma única fonte de verdade para o 404.
@@ -278,33 +278,34 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
     if (rows.length === 0) throw new NotFoundError();
     const r = rows[0]!;
 
-    // AuditLog — só para as 3 flags de IA (plus comercial por empresa, ver
+    const auditLogger = new AuditLogger(sql);
+
+    // AuditLog #1 — flags de IA (plus comercial por empresa, ver
     // `packages/shared-types/src/tenant.ts`). Registra o ator (userId + role),
     // o tenant afetado, e o diff antes/depois apenas dos campos de IA
     // efetivamente informados no PATCH. Ver spec §10, invariante 7.
-    if (beforeAi !== undefined) {
+    if (before !== undefined) {
       const changes: Record<string, { before: boolean; after: boolean }> = {};
       if (updates.aiClassificationEnabled !== undefined) {
         changes['aiClassificationEnabled'] = {
-          before: beforeAi.ai_classification_enabled,
+          before: before.ai_classification_enabled,
           after: r.ai_classification_enabled,
         };
       }
       if (updates.aiTitleSuggestionEnabled !== undefined) {
         changes['aiTitleSuggestionEnabled'] = {
-          before: beforeAi.ai_title_suggestion_enabled,
+          before: before.ai_title_suggestion_enabled,
           after: r.ai_title_suggestion_enabled,
         };
       }
       if (updates.aiIndexSuggestionEnabled !== undefined) {
         changes['aiIndexSuggestionEnabled'] = {
-          before: beforeAi.ai_index_suggestion_enabled,
+          before: before.ai_index_suggestion_enabled,
           after: r.ai_index_suggestion_enabled,
         };
       }
 
       if (Object.keys(changes).length > 0) {
-        const auditLogger = new AuditLogger(sql);
         try {
           await auditLogger.record({
             tenantId: id,
@@ -317,6 +318,48 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
           request.log.error(
             { err: auditError, tenantId: id, userId: request.user?.sub ?? null },
             'falha ao registrar audit log de atualização de configuração de IA do tenant',
+          );
+        }
+      }
+    }
+
+    // AuditLog #2 — dados administrativos da empresa (nome, cotas, ativa/inativa).
+    // São dados sensíveis geridos pelo SUPER_ADMIN e, pela mesma invariante de
+    // auditoria de mudanças administrativas (spec §10), passam a ser auditados
+    // com o MESMO padrão de diff antes/depois das flags de IA. Ação separada
+    // (`tenant.settings.update`) para não misturar o diff comercial de IA com o
+    // diff administrativo.
+    if (before !== undefined) {
+      const changes: Record<string, { before: unknown; after: unknown }> = {};
+      if (updates.name !== undefined) {
+        changes['name'] = { before: before.name, after: r.name };
+      }
+      if (updates.diskQuotaBytes !== undefined) {
+        changes['diskQuotaBytes'] = {
+          before: Number(before.disk_quota_bytes),
+          after: Number(r.disk_quota_bytes),
+        };
+      }
+      if (updates.userQuota !== undefined) {
+        changes['userQuota'] = { before: before.user_quota, after: r.user_quota };
+      }
+      if (updates.active !== undefined) {
+        changes['active'] = { before: before.active, after: r.active };
+      }
+
+      if (Object.keys(changes).length > 0) {
+        try {
+          await auditLogger.record({
+            tenantId: id,
+            userId: request.user?.sub ?? null,
+            action: 'tenant.settings.update',
+            resource: `tenants/${id}`,
+            metadata: { actorRole: request.user?.role ?? null, changes },
+          });
+        } catch (auditError) {
+          request.log.error(
+            { err: auditError, tenantId: id, userId: request.user?.sub ?? null },
+            'falha ao registrar audit log de atualização administrativa do tenant',
           );
         }
       }

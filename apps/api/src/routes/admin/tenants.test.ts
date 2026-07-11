@@ -451,6 +451,145 @@ describe('PATCH /admin/tenants/:id — flags de IA (plus comercial, exclusivo do
 });
 
 // ---------------------------------------------------------------------------
+// PATCH /admin/tenants/:id — auditoria de dados administrativos (name/cotas/active)
+// ---------------------------------------------------------------------------
+
+describe('PATCH /admin/tenants/:id — AuditLog de dados administrativos', () => {
+  interface AuditRow {
+    tenant_id: string | null;
+    user_id: string | null;
+    action: string;
+    resource: string | null;
+    metadata: string;
+  }
+
+  async function createTenant(name: string): Promise<string> {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/admin/tenants',
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { name, diskQuotaBytes: 1_000_000, userQuota: 10 },
+    });
+    return (created.json() as Record<string, unknown>)['id'] as string;
+  }
+
+  async function fetchSettingsAudit(tenantId: string): Promise<AuditRow | undefined> {
+    const rows = await testDb.db<AuditRow[]>`
+      SELECT tenant_id, user_id, action, resource, metadata
+      FROM audit_logs
+      WHERE action = 'tenant.settings.update' AND tenant_id = ${tenantId}
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+    return rows[0];
+  }
+
+  it('alterar name gera AuditLog tenant.settings.update com before/after', async () => {
+    const tenantId = await createTenant('Empresa Nome Antigo');
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { name: 'Empresa Nome Novo' },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const log = await fetchSettingsAudit(tenantId);
+    expect(log).toBeDefined();
+    expect(log!.tenant_id).toBe(tenantId);
+    expect(log!.user_id).toBe(SUPER_ADMIN_ID);
+    expect(log!.resource).toBe(`tenants/${tenantId}`);
+    const metadata = JSON.parse(log!.metadata) as {
+      actorRole?: string;
+      changes?: Record<string, { before: unknown; after: unknown }>;
+    };
+    expect(metadata.actorRole).toBe('SUPER_ADMIN');
+    expect(metadata.changes).toMatchObject({
+      name: { before: 'Empresa Nome Antigo', after: 'Empresa Nome Novo' },
+    });
+    // Campos não alterados não entram no diff
+    expect(metadata.changes).not.toHaveProperty('diskQuotaBytes');
+    expect(metadata.changes).not.toHaveProperty('userQuota');
+    expect(metadata.changes).not.toHaveProperty('active');
+  });
+
+  it('alterar diskQuotaBytes e userQuota gera diff numérico correto', async () => {
+    const tenantId = await createTenant('Empresa Cotas');
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { diskQuotaBytes: 5_000_000, userQuota: 42 },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const log = await fetchSettingsAudit(tenantId);
+    expect(log).toBeDefined();
+    const metadata = JSON.parse(log!.metadata) as {
+      changes?: Record<string, { before: unknown; after: unknown }>;
+    };
+    expect(metadata.changes).toMatchObject({
+      diskQuotaBytes: { before: 1_000_000, after: 5_000_000 },
+      userQuota: { before: 10, after: 42 },
+    });
+  });
+
+  it('alterar active gera diff booleano', async () => {
+    const tenantId = await createTenant('Empresa Ativa');
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { active: false },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const log = await fetchSettingsAudit(tenantId);
+    expect(log).toBeDefined();
+    const metadata = JSON.parse(log!.metadata) as {
+      changes?: Record<string, { before: unknown; after: unknown }>;
+    };
+    expect(metadata.changes).toMatchObject({ active: { before: true, after: false } });
+  });
+
+  it('PATCH que só altera flag de IA NÃO gera tenant.settings.update', async () => {
+    const tenantId = await createTenant('Empresa Só IA');
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { aiClassificationEnabled: false },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const rows = await testDb.db`
+      SELECT id FROM audit_logs WHERE action = 'tenant.settings.update' AND tenant_id = ${tenantId}
+    `;
+    expect(rows).toHaveLength(0);
+  });
+
+  it('PATCH com name + flag de IA gera os DOIS logs (settings e ai_settings)', async () => {
+    const tenantId = await createTenant('Empresa Mista');
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/admin/tenants/${tenantId}`,
+      headers: { authorization: `Bearer ${superAdminToken}` },
+      payload: { name: 'Empresa Mista Renomeada', aiTitleSuggestionEnabled: false },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const settings = await testDb.db`
+      SELECT id FROM audit_logs WHERE action = 'tenant.settings.update' AND tenant_id = ${tenantId}
+    `;
+    const aiSettings = await testDb.db`
+      SELECT id FROM audit_logs WHERE action = 'tenant.ai_settings.update' AND tenant_id = ${tenantId}
+    `;
+    expect(settings).toHaveLength(1);
+    expect(aiSettings).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5. DELETE /admin/tenants/:id — exclusão (soft-delete) + enfileiramento
 // ---------------------------------------------------------------------------
 describe('DELETE /admin/tenants/:id', () => {
