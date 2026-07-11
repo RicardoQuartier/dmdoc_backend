@@ -134,7 +134,7 @@ beforeEach(async () => {
   await testDb.db`
     INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
     VALUES (${UPLOADER_A_ID}, ${DEPT_A_ID}, ${TENANT_A}, true, true)
-    ON CONFLICT (user_id, department_id) DO NOTHING
+    ON CONFLICT (user_id, department_id) WHERE deleted = false DO NOTHING
   `;
 
   // Obter tokens
@@ -639,7 +639,7 @@ describe('ACL por raiz — herança dinâmica de acesso à subárvore', () => {
     await testDb.db`
       INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
       VALUES (${uploaderRaizId}, ${DEPT_A_ID}, ${TENANT_A}, true, true)
-      ON CONFLICT (user_id, department_id) DO NOTHING
+      ON CONFLICT (user_id, department_id) WHERE deleted = false DO NOTHING
     `;
     const tokenRaiz = await login('uploader-raiz@empresa.com');
 
@@ -692,7 +692,7 @@ describe('ACL por raiz — herança dinâmica de acesso à subárvore', () => {
     await testDb.db`
       INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
       VALUES (${uploaderListId}, ${DEPT_A_ID}, ${TENANT_A}, true, true)
-      ON CONFLICT (user_id, department_id) DO NOTHING
+      ON CONFLICT (user_id, department_id) WHERE deleted = false DO NOTHING
     `;
     const tokenList = await login('uploader-list@empresa.com');
 

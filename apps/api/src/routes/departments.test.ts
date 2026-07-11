@@ -101,7 +101,7 @@ describe('DELETE /departments/:id — preserva documentos e permissões', () => 
     await testDb.db`
       INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
       VALUES (${permUserId}, ${deptId}, ${TENANT_A}, true, false)
-      ON CONFLICT (user_id, department_id) DO NOTHING
+      ON CONFLICT (user_id, department_id) WHERE deleted = false DO NOTHING
     `;
 
     const res = await app.inject({
@@ -267,7 +267,7 @@ describe('GET /departments?writable=true — filtro de escrita (seletor de uploa
     await testDb.db`
       INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
       VALUES (${userId}, ${departmentId}, ${TENANT_A}, true, true)
-      ON CONFLICT (user_id, department_id) DO UPDATE
+      ON CONFLICT (user_id, department_id) WHERE deleted = false DO UPDATE
         SET can_read = true, can_write = true
     `;
   }
