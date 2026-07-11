@@ -16,9 +16,13 @@ import type {
   DocumentProcessingJobData,
   ExtractionResult,
   IndexSuggestion,
+  TypeSuggestion,
   CostBreakdown,
 } from '@dmdoc/shared-types';
-import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
+import {
+  DocumentProcessingJobDataSchema,
+  PublicTypeSuggestionSchema,
+} from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
 import { createLLMProvider, LLMError } from '@dmdoc/llm-provider';
 import { NotFoundError, QuotaExceededError, ValidationError, ForbiddenError, UpstreamServiceError } from '../errors/index.js';
@@ -99,6 +103,7 @@ interface DocumentContentRow {
   full_text: string;
   extraction: Omit<ExtractionResult, 'extractedAt'> & { extractedAt: string };
   index_suggestion: (Omit<IndexSuggestion, 'suggestedAt'> & { suggestedAt: string }) | null;
+  type_suggestion: (Omit<TypeSuggestion, 'suggestedAt'> & { suggestedAt: string }) | null;
   cost_breakdown: CostBreakdown | null;
 }
 
@@ -1147,9 +1152,14 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
 
     await assertCanReadDepartment(sql, userId, doc.tenant_id, doc.department_id, role);
 
-    // Enriquece com pageCount de document_content
-    const contentRows = await sql<Array<{ extraction: { pageCount?: number } | null }>>`
-      SELECT extraction
+    // Enriquece com pageCount e a sugestão de tipo por IA (Fase 8) de
+    // document_content. A sugestão só aparece para quem já passou pelo
+    // controle de acesso acima (assertCanReadDepartment) — nunca vaza para
+    // fora do escopo do documento.
+    const contentRows = await sql<
+      Array<{ extraction: { pageCount?: number } | null; type_suggestion: unknown }>
+    >`
+      SELECT extraction, type_suggestion
       FROM document_content
       WHERE document_id = ${doc.id}
         AND tenant_id = ${doc.tenant_id}
@@ -1160,12 +1170,20 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         ? contentRows[0].extraction.pageCount
         : null;
 
+    // Subconjunto SEGURO da sugestão: só documentTypeId/documentTypeName/
+    // confidence. O `parse` do PublicTypeSuggestionSchema descarta model,
+    // promptVersion, suggestedAt e rawResponse — esses ficam só no /debug.
+    // Null enquanto o worker de classificação ainda não rodou (coluna nula).
+    const rawTypeSuggestion = contentRows[0]?.type_suggestion ?? null;
+    const typeSuggestion =
+      rawTypeSuggestion !== null ? PublicTypeSuggestionSchema.parse(rawTypeSuggestion) : null;
+
     request.log.info(
       { tenantId: doc.tenant_id, userId, documentId: doc.id },
       'detalhe de documento recuperado'
     );
 
-    return reply.status(200).send({ ...rowToDocument(doc), pageCount });
+    return reply.status(200).send({ ...rowToDocument(doc), pageCount, typeSuggestion });
   });
 
   // =========================================================================
@@ -1368,7 +1386,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     // antes da extração terminar) — estado válido, não é erro.
     const [contentRows, chunkCountRows, chunkSampleRows] = await Promise.all([
       sql<DocumentContentRow[]>`
-        SELECT document_id, tenant_id, full_text, extraction, index_suggestion, cost_breakdown
+        SELECT document_id, tenant_id, full_text, extraction, index_suggestion, type_suggestion, cost_breakdown
         FROM document_content
         WHERE document_id = ${doc.id}
           AND tenant_id = ${doc.tenant_id}
@@ -1401,6 +1419,13 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         ? { ...content.index_suggestion, suggestedAt: new Date(content.index_suggestion.suggestedAt) }
         : null;
 
+    // Sugestão de tipo COMPLETA (Fase 8), incl. campos de auditoria/operação
+    // (model, promptVersion, rawResponse) — exclusiva do /debug do SUPER_ADMIN.
+    const typeSuggestion: TypeSuggestion | null =
+      content?.type_suggestion != null
+        ? { ...content.type_suggestion, suggestedAt: new Date(content.type_suggestion.suggestedAt) }
+        : null;
+
     request.log.info(
       { tenantId: doc.tenant_id, userId, documentId: doc.id },
       'debug de documento consultado por SUPER_ADMIN'
@@ -1414,6 +1439,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       fullText: content?.full_text ?? null,
       fullTextLength: content?.full_text.length ?? 0,
       indexSuggestion,
+      typeSuggestion,
       costBreakdown: content?.cost_breakdown ?? null,
       costUsdCents: doc.cost_usd_cents,
       chunkCount: parseInt(chunkCountRows[0]?.count ?? '0', 10),

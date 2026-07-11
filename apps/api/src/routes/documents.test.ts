@@ -870,6 +870,140 @@ describe('documentos órfãos — departamento soft-deletado preserva acesso', (
 });
 
 // ---------------------------------------------------------------------------
+// GET /documents/:id — sugestão de tipo por IA (Fase 8, Card C)
+// ---------------------------------------------------------------------------
+
+type JsonValue = string | number | boolean | null | JsonValue[] | { [k: string]: JsonValue };
+
+describe('GET /documents/:id — typeSuggestion (Fase 8)', () => {
+  /**
+   * Cria um documento READY em TENANT_A/DEPT_A e, opcionalmente, uma linha de
+   * document_content com uma sugestão de tipo COMPLETA (incluindo os campos
+   * sensíveis model/promptVersion/rawResponse) para verificar que o endpoint
+   * público NÃO os expõe.
+   */
+  async function seedDocWithTypeSuggestion(
+    typeSuggestion: Record<string, JsonValue> | null
+  ): Promise<string> {
+    const docId = newId();
+    const hash = 'c'.repeat(64);
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
+        'sugestao.pdf', 'sugestao.pdf', ${hash}, 2048, 'application/pdf',
+        ${`tenants/${TENANT_A}/documents/${hash}/sugestao.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NOW(), 0, false
+      )
+    `;
+    await testDb.db`
+      INSERT INTO document_content (document_id, tenant_id, full_text, extraction, type_suggestion)
+      VALUES (
+        ${docId}, ${TENANT_A}, 'texto extraido',
+        ${testDb.db.json({ engine: 'native', engineVersion: '1.0.0', durationMs: 10, ocrPages: [], pageCount: 3, extractedAt: new Date().toISOString() })},
+        ${typeSuggestion === null ? null : testDb.db.json(typeSuggestion)}
+      )
+    `;
+    return docId;
+  }
+
+  const FULL_SUGGESTION = {
+    documentTypeId: DOC_TYPE_ID,
+    documentTypeName: 'Contrato A',
+    confidence: 0.87,
+    model: 'gpt-4o-mini',
+    promptVersion: 'type-v1',
+    suggestedAt: new Date().toISOString(),
+    rawResponse: { choices: [{ text: 'segredo interno' }] },
+  };
+
+  it('retorna o subconjunto seguro e NÃO vaza campos sensíveis', async () => {
+    const docId = await seedDocWithTypeSuggestion(FULL_SUGGESTION);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.typeSuggestion).toEqual({
+      documentTypeId: DOC_TYPE_ID,
+      documentTypeName: 'Contrato A',
+      confidence: 0.87,
+    });
+    // Campos sensíveis nunca aparecem no endpoint público
+    expect(body.typeSuggestion).not.toHaveProperty('model');
+    expect(body.typeSuggestion).not.toHaveProperty('promptVersion');
+    expect(body.typeSuggestion).not.toHaveProperty('suggestedAt');
+    expect(body.typeSuggestion).not.toHaveProperty('rawResponse');
+    // Sanidade: o texto sensível do rawResponse não vaza em lugar nenhum
+    expect(res.payload).not.toContain('segredo interno');
+    expect(res.payload).not.toContain('type-v1');
+  });
+
+  it('fallback "nenhum tipo" preserva documentTypeId/Name nulos', async () => {
+    const docId = await seedDocWithTypeSuggestion({
+      documentTypeId: null,
+      documentTypeName: null,
+      confidence: 0.1,
+      model: 'gpt-4o-mini',
+      promptVersion: 'type-v1',
+      suggestedAt: new Date().toISOString(),
+      rawResponse: {},
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().typeSuggestion).toEqual({
+      documentTypeId: null,
+      documentTypeName: null,
+      confidence: 0.1,
+    });
+  });
+
+  it('documento sem sugestão (worker não rodou) → typeSuggestion: null', async () => {
+    const docId = await seedDocWithTypeSuggestion(null);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().typeSuggestion).toBeNull();
+  });
+
+  it('usuário de outro tenant → 404, sem vazar a sugestão', async () => {
+    const docId = await seedDocWithTypeSuggestion(FULL_SUGGESTION);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminB}` },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+    // Nenhum vestígio da sugestão no corpo do 404
+    expect(res.payload).not.toContain('typeSuggestion');
+    expect(res.payload).not.toContain('Contrato A');
+    expect(res.payload).not.toContain('segredo interno');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // document_events — registro imutável de upload (cobrança)
 // ---------------------------------------------------------------------------
 

@@ -360,6 +360,7 @@ export const documentContent = pgTable('document_content', {
   fullText: text('full_text').notNull(),
   extraction: jsonb('extraction').notNull(),
   indexSuggestion: jsonb('index_suggestion'),
+  typeSuggestion: jsonb('type_suggestion'),
   costBreakdown: jsonb('cost_breakdown'),
 });
 
