@@ -448,7 +448,19 @@ describe('GET /reports/uploaders', () => {
     expect(admin).toEqual({ id: ADMIN_A_ID, name: expect.any(String), email: 'admin-a@test.com' });
   });
 
-  it('usuário MULTI_TENANT_ADMIN (tenant_id NULL) com evento no tenant aparece na lista', async () => {
+  it('TENANT_ADMIN continua vendo UPLOADER que subiu documento (nível ≤ 60)', async () => {
+    await insertEvent({ tenantId: TENANT_A, uploadedById: USER_X_ID, mimeType: PDF, documentTypeId: null, documentTypeName: null, sizeBytes: 100, pageCount: 1, documentId: null, createdAt: new Date('2026-03-01') });
+
+    const res = await app.inject({
+      method: 'GET', url: '/reports/uploaders',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Uploader[];
+    expect(body.find((u) => u.id === USER_X_ID)).toBeDefined();
+  });
+
+  it('TENANT_ADMIN NÃO vê MULTI_TENANT_ADMIN mesmo com upload dele no tenant (hierarquia)', async () => {
     const mtaId = newId();
     await seedUser(testDb.db, {
       id: mtaId, tenantId: null, email: 'mta-uploaders@plataforma.com', password: PASSWORD,
@@ -463,8 +475,75 @@ describe('GET /reports/uploaders', () => {
     });
     expect(res.statusCode).toBe(200);
     const body = res.json() as Uploader[];
-    const mta = body.find((u) => u.id === mtaId);
-    expect(mta).toEqual({ id: mtaId, name: 'MTA Uploader', email: 'mta-uploaders@plataforma.com' });
+    // TENANT_ADMIN (60) não enxerga MULTI_TENANT_ADMIN (80): nível acima do ator.
+    expect(body.find((u) => u.id === mtaId)).toBeUndefined();
+  });
+
+  it('SUPER_ADMIN VÊ o MULTI_TENANT_ADMIN uploader (nível ≤ 100)', async () => {
+    const mtaId = newId();
+    await seedUser(testDb.db, {
+      id: mtaId, tenantId: null, email: 'mta-sa@plataforma.com', password: PASSWORD,
+      role: 'MULTI_TENANT_ADMIN', allowedTenantIds: [TENANT_A], name: 'MTA Uploader',
+    });
+
+    await insertEvent({ tenantId: TENANT_A, uploadedById: mtaId, mimeType: PDF, documentTypeId: null, documentTypeName: null, sizeBytes: 100, pageCount: 1, documentId: null, createdAt: new Date('2026-03-01') });
+
+    const res = await app.inject({
+      method: 'GET', url: `/reports/uploaders?tenantId=${TENANT_A}`,
+      headers: { authorization: `Bearer ${tokenSuperAdmin}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Uploader[];
+    expect(body.find((u) => u.id === mtaId)).toEqual({
+      id: mtaId,
+      name: 'MTA Uploader',
+      email: 'mta-sa@plataforma.com',
+    });
+  });
+
+  it('MTA VÊ outro MULTI_TENANT_ADMIN uploader (mesmo nível 80)', async () => {
+    const mtaActorId = newId();
+    await seedUser(testDb.db, {
+      id: mtaActorId, tenantId: null, email: 'mta-actor@plataforma.com', password: PASSWORD,
+      role: 'MULTI_TENANT_ADMIN', allowedTenantIds: [TENANT_A], name: 'MTA Actor',
+    });
+    const mtaUploaderId = newId();
+    await seedUser(testDb.db, {
+      id: mtaUploaderId, tenantId: null, email: 'mta-up@plataforma.com', password: PASSWORD,
+      role: 'MULTI_TENANT_ADMIN', allowedTenantIds: [TENANT_A], name: 'MTA Up',
+    });
+
+    await insertEvent({ tenantId: TENANT_A, uploadedById: mtaUploaderId, mimeType: PDF, documentTypeId: null, documentTypeName: null, sizeBytes: 100, pageCount: 1, documentId: null, createdAt: new Date('2026-03-01') });
+
+    const mtaToken = await login('mta-actor@plataforma.com');
+    const res = await app.inject({
+      method: 'GET', url: `/reports/uploaders?tenantId=${TENANT_A}`,
+      headers: { authorization: `Bearer ${mtaToken}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Uploader[];
+    expect(body.find((u) => u.id === mtaUploaderId)).toBeDefined();
+  });
+
+  it('groupBy=user: TENANT_ADMIN mantém o grupo do MTA mas SEM o nome (label null, hierarquia)', async () => {
+    const mtaId = newId();
+    await seedUser(testDb.db, {
+      id: mtaId, tenantId: null, email: 'mta-group@plataforma.com', password: PASSWORD,
+      role: 'MULTI_TENANT_ADMIN', allowedTenantIds: [TENANT_A], name: 'MTA Group',
+    });
+    await insertEvent({ tenantId: TENANT_A, uploadedById: mtaId, mimeType: PDF, documentTypeId: null, documentTypeName: null, sizeBytes: 300, pageCount: 3, createdAt: new Date('2026-03-01') });
+
+    const res = await app.inject({
+      method: 'GET', url: '/reports/uploads?groupBy=user',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as UploadsReport;
+    const mtaGroup = body.groups.find((g) => g.key === mtaId);
+    // O grupo (contagem) permanece, mas o nome do MTA não é exposto ao TENANT_ADMIN.
+    expect(mtaGroup).toBeDefined();
+    expect(mtaGroup?.files).toBe(1);
+    expect(mtaGroup?.label).toBeNull();
   });
 
   it('usuário sem nenhum evento no tenant não aparece na lista', async () => {

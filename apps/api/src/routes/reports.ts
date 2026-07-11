@@ -1,9 +1,22 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { DocumentEventsRepository } from '@dmdoc/db-pg';
+import { ROLE_LEVEL, type Role } from '@dmdoc/shared-types';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
 import { NotFoundError, ValidationError } from '../errors/index.js';
+
+/**
+ * Papéis visíveis a um ator segundo a regra "inferior ou igual": todos os
+ * papéis cujo nível (`ROLE_LEVEL`) seja MENOR OU IGUAL ao do ator. Usado para
+ * não expor, em relatórios, nome/e-mail de usuários de nível ACIMA do
+ * solicitante (ex.: TENANT_ADMIN não deve ver um MULTI_TENANT_ADMIN que fez
+ * upload no tenant). Ver wiki "Hierarquia de papéis e gestão de usuários".
+ */
+function rolesVisibleTo(actorRole: Role): Role[] {
+  const actorLevel = ROLE_LEVEL[actorRole];
+  return (Object.keys(ROLE_LEVEL) as Role[]).filter((r) => ROLE_LEVEL[r] <= actorLevel);
+}
 
 const TenantIdQuerySchema = z.object({
   tenantId: z.string().uuid().optional(),
@@ -404,10 +417,18 @@ export const reportsRoutes: FastifyPluginAsync = async (app) => {
           .map((r) => r.group_key)
           .filter((id): id is string => id !== null);
 
+        // Rótulos respeitam a hierarquia: um usuário de nível ACIMA do ator
+        // (ex.: MULTI_TENANT_ADMIN visto por um TENANT_ADMIN) não tem o nome
+        // resolvido — o grupo mantém a contagem, mas o label cai para null,
+        // não expondo a identidade de contas de nível superior.
         const userNameMap = new Map<string, string>();
         if (groupUserIds.length > 0) {
+          const visibleRoles = rolesVisibleTo(request.user!.role);
           const userDocs = await sql<Array<{ id: string; name: string }>>`
-            SELECT id, name FROM users WHERE id = ANY(${groupUserIds}::uuid[]) AND deleted = false
+            SELECT id, name FROM users
+            WHERE id = ANY(${groupUserIds}::uuid[])
+              AND deleted = false
+              AND role = ANY(${visibleRoles}::text[])
           `;
           for (const u of userDocs) userNameMap.set(u.id, u.name);
         }
@@ -479,6 +500,12 @@ export const reportsRoutes: FastifyPluginAsync = async (app) => {
    * `document_events.tenant_id`, o que garante que um MULTI_TENANT_ADMIN
    * (tenant_id = NULL) apareça na lista sempre que tiver feito upload neste
    * tenant, mesmo não "pertencendo" a ele.
+   *
+   * A inclusão cross-tenant, porém, RESPEITA a hierarquia (regra "inferior ou
+   * igual"): só entram na lista uploaders cujo nível de papel seja MENOR OU
+   * IGUAL ao do ator. Assim, um TENANT_ADMIN (60) não vê nome/e-mail de um
+   * MULTI_TENANT_ADMIN (80) que subiu documento; um MTA e um SUPER_ADMIN seguem
+   * vendo todos os níveis ≤ ao seu.
    */
   app.get(
     '/reports/uploaders',
@@ -496,12 +523,14 @@ export const reportsRoutes: FastifyPluginAsync = async (app) => {
 
       const tenantId = ctx.tenantId;
       const sql = app.db;
+      const visibleRoles = rolesVisibleTo(request.user!.role);
 
       const uploaders = await sql<UploaderRow[]>`
         SELECT DISTINCT u.id, u.name, u.email
         FROM document_events de
         JOIN users u ON u.id = de.uploaded_by_id
         WHERE de.tenant_id = ${tenantId}
+          AND u.role = ANY(${visibleRoles}::text[])
         ORDER BY u.name
       `;
 
