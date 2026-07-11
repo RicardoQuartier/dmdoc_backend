@@ -26,6 +26,11 @@ interface DepartmentNameDoc {
 
 const ListDocumentTypesQuerySchema = z.object({
   tenantId: z.string().uuid().optional(),
+  // Quando informado, o catálogo é escopado a ESTE departamento para TODOS os
+  // papéis (inclusive admins), reproduzindo `resolveDepartmentDocumentTypeCatalog`
+  // (globais visíveis ao dept + tipos da empresa associados ao dept). Sem ele, o
+  // comportamento por papel documentado é preservado (admin vê todos + globais).
+  departmentId: z.string().uuid().optional(),
 });
 
 const CreateDocumentTypeBodySchema = z
@@ -213,7 +218,9 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
    * GET /document-types — lista tipos de documento.
    */
   app.get('/document-types', { preHandler: app.authenticate }, async (request, reply) => {
-    const { tenantId: tenantIdParam } = ListDocumentTypesQuerySchema.parse(request.query);
+    const { tenantId: tenantIdParam, departmentId } = ListDocumentTypesQuerySchema.parse(
+      request.query
+    );
     const sql = app.db;
 
     const ctx = resolveTenantContext(request, { explicitTenantId: tenantIdParam });
@@ -222,7 +229,73 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
     let rows: DocTypeRow[];
 
-    if (ctx.mode === 'all') {
+    if (departmentId !== undefined) {
+      // Escopo por departamento — mesma regra de `resolveDepartmentDocumentTypeCatalog`
+      // (helper compartilhado com o worker). Vale para TODOS os papéis: fecha o
+      // vazamento em que admins recebiam tipos de qualquer departamento do tenant.
+
+      // Resolve o tenant do departamento, respeitando o isolamento do contexto.
+      let deptRows: Array<{ tenant_id: string }>;
+      if (ctx.mode === 'single') {
+        deptRows = await sql<Array<{ tenant_id: string }>>`
+          SELECT tenant_id FROM departments
+          WHERE id = ${departmentId} AND tenant_id = ${ctx.tenantId} LIMIT 1
+        `;
+      } else if (ctx.mode === 'allowed') {
+        deptRows = await sql<Array<{ tenant_id: string }>>`
+          SELECT tenant_id FROM departments
+          WHERE id = ${departmentId} AND tenant_id = ANY(${ctx.tenantIds}::uuid[]) LIMIT 1
+        `;
+      } else {
+        deptRows = await sql<Array<{ tenant_id: string }>>`
+          SELECT tenant_id FROM departments WHERE id = ${departmentId} LIMIT 1
+        `;
+      }
+
+      // Departamento inexistente ou fora do escopo → 404 (nunca 403).
+      if (deptRows.length === 0) {
+        throw new NotFoundError('Departamento não encontrado');
+      }
+      const scopeTenantId = deptRows[0]!.tenant_id;
+
+      // UPLOADER/USER só podem consultar departamentos dentro da subárvore
+      // concedida a eles — fora dela, 404 (mesmo invariante de ACL).
+      const accessibleDeptIds = await resolveAccessibleDepartmentIds(
+        sql,
+        userId,
+        scopeTenantId,
+        role
+      );
+      if (accessibleDeptIds !== null && !accessibleDeptIds.includes(departmentId)) {
+        throw new NotFoundError('Departamento não encontrado');
+      }
+
+      rows = await sql<DocTypeRow[]>`
+        SELECT DISTINCT dt.id, dt.tenant_id, dt.name, dt.description, dt.is_global,
+                        dt.created_at, dt.department_ids, dt.deleted
+        FROM document_types dt
+        WHERE dt.deleted = false
+          AND (
+            (
+              dt.is_global = true
+              AND dt.tenant_id IS NULL
+              AND EXISTS (
+                SELECT 1
+                FROM global_type_tenant_depts g
+                WHERE g.global_type_id = dt.id
+                  AND g.tenant_id = ${scopeTenantId}
+                  AND g.deleted = false
+                  AND g.department_ids && ${[departmentId]}::uuid[]
+              )
+            )
+            OR (
+              dt.tenant_id = ${scopeTenantId}
+              AND dt.department_ids && ${[departmentId]}::uuid[]
+            )
+          )
+        ORDER BY dt.name ASC
+      `;
+    } else if (ctx.mode === 'all') {
       rows = await sql<DocTypeRow[]>`
         SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
         FROM document_types

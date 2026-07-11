@@ -359,3 +359,89 @@ describe('PATCH /documents/:id — validação de indexValues contra a tabela no
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// GET /document-types?departmentId — escopo por departamento (alinhado ao
+// helper resolveDepartmentDocumentTypeCatalog). Fecha o vazamento em que
+// admins recebiam tipos escopados a qualquer departamento do tenant.
+// ---------------------------------------------------------------------------
+
+describe('GET /document-types?departmentId — escopo por departamento', () => {
+  interface DocTypeItem {
+    id: string;
+    name: string;
+  }
+
+  async function createSecondDept(): Promise<string> {
+    const rows = await testDb.db<Array<{ id: string }>>`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (gen_random_uuid(), ${TENANT_A}, NULL, 'Jurídico A', 0, '{}'::text[], false, NOW())
+      RETURNING id
+    `;
+    return rows[0]!.id;
+  }
+
+  async function listTypes(token: string, departmentId?: string): Promise<DocTypeItem[]> {
+    const qs = departmentId ? `?departmentId=${departmentId}` : '';
+    const res = await app.inject({
+      method: 'GET',
+      url: `/document-types${qs}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(200);
+    return res.json() as DocTypeItem[];
+  }
+
+  it('admin: tipo escopado ao dept A NÃO aparece ao consultar o dept B', async () => {
+    const deptBId = await createSecondDept();
+    const typeId = await createDocType(tokenAdminA); // escopado a [deptAId]
+
+    const inA = await listTypes(tokenAdminA, deptAId);
+    expect(inA.map((t) => t.id)).toContain(typeId);
+
+    const inB = await listTypes(tokenAdminA, deptBId);
+    expect(inB.map((t) => t.id)).not.toContain(typeId);
+    expect(inB).toHaveLength(0);
+  });
+
+  it('admin: sem departmentId mantém o comportamento por papel (vê todos os tipos da empresa)', async () => {
+    const typeId = await createDocType(tokenAdminA);
+    const all = await listTypes(tokenAdminA);
+    expect(all.map((t) => t.id)).toContain(typeId);
+  });
+
+  it('tipo global só aparece no dept configurado em global_type_tenant_depts', async () => {
+    const deptBId = await createSecondDept();
+    // Tipo global (tenant_id NULL) + configuração de visibilidade no dept A do tenant A
+    const globalRows = await testDb.db<Array<{ id: string }>>`
+      INSERT INTO document_types (id, tenant_id, name, description, is_global, index_fields, deleted, created_at)
+      VALUES (gen_random_uuid(), NULL, 'Boleto Global', NULL, true, '[]'::jsonb, false, NOW())
+      RETURNING id
+    `;
+    const globalId = globalRows[0]!.id;
+    await testDb.db`
+      INSERT INTO global_type_tenant_depts (id, global_type_id, tenant_id, department_ids, deleted, created_at, updated_at)
+      VALUES (gen_random_uuid(), ${globalId}, ${TENANT_A}, ${[deptAId]}::uuid[], false, NOW(), NOW())
+    `;
+
+    const inA = await listTypes(tokenAdminA, deptAId);
+    expect(inA.map((t) => t.id)).toContain(globalId);
+
+    const inB = await listTypes(tokenAdminA, deptBId);
+    expect(inB.map((t) => t.id)).not.toContain(globalId);
+  });
+
+  it('departamento de outro tenant → 404 (nunca 403)', async () => {
+    const otherDeptRows = await testDb.db<Array<{ id: string }>>`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (gen_random_uuid(), ${TENANT_B}, NULL, 'Dept B', 0, '{}'::text[], false, NOW())
+      RETURNING id
+    `;
+    const res = await app.inject({
+      method: 'GET',
+      url: `/document-types?departmentId=${otherDeptRows[0]!.id}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+});
