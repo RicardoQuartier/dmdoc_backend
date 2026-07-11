@@ -1159,6 +1159,16 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         ? contentRows[0].extraction.pageCount
         : null;
 
+    // Nome do tipo de documento atribuído (tenant OU global). `resolveDocumentTypeName`
+    // cobre ambos os escopos: tipos da empresa (`tenant_id = doc.tenant_id`) e tipos
+    // globais (`is_global = true`, `tenant_id NULL`). Sem isso, o detalhe não expõe o
+    // nome do tipo e a UI mostra "Sem tipo" mesmo com `document_type_id` preenchido.
+    const documentTypeName = await resolveDocumentTypeName(
+      sql,
+      doc.tenant_id,
+      doc.document_type_id
+    );
+
     // Subconjunto SEGURO da sugestão: só documentTypeId/documentTypeName/
     // confidence. O `parse` do PublicTypeSuggestionSchema descarta model,
     // promptVersion, suggestedAt e rawResponse — esses ficam só no /debug.
@@ -1172,7 +1182,9 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       'detalhe de documento recuperado'
     );
 
-    return reply.status(200).send({ ...rowToDocument(doc), pageCount, typeSuggestion });
+    return reply
+      .status(200)
+      .send({ ...rowToDocument(doc), documentTypeName, pageCount, typeSuggestion });
   });
 
   // =========================================================================

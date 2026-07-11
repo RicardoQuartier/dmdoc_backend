@@ -1005,6 +1005,76 @@ describe('GET /documents/:id — typeSuggestion (Fase 8)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /documents/:id — documentTypeName (tipo da empresa E tipo global)
+// ---------------------------------------------------------------------------
+
+describe('GET /documents/:id — documentTypeName', () => {
+  /** Cria um documento READY em TENANT_A/DEPT_A com o tipo informado (ou nenhum). */
+  async function seedDocWithType(documentTypeId: string | null): Promise<string> {
+    const docId = newId();
+    const hash = crypto.randomBytes(32).toString('hex');
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${TENANT_A}, ${DEPT_A_ID}, ${documentTypeId},
+        'tipo.pdf', 'tipo.pdf', ${hash}, 1024, 'application/pdf',
+        ${`tenants/${TENANT_A}/documents/${hash}/tipo.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NOW(), 0, false
+      )
+    `;
+    return docId;
+  }
+
+  it('resolve o nome de um tipo da empresa', async () => {
+    const docId = await seedDocWithType(DOC_TYPE_ID);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().documentTypeName).toBe('Contrato A');
+  });
+
+  it('resolve o nome de um tipo GLOBAL (tenant_id NULL) — para admin', async () => {
+    const docId = await seedDocWithType(GLOBAL_DOC_TYPE_ID);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().documentTypeName).toBe('Tipo Global');
+  });
+
+  it('resolve o nome de um tipo GLOBAL também para o uploader', async () => {
+    const docId = await seedDocWithType(GLOBAL_DOC_TYPE_ID);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenUploaderA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().documentTypeName).toBe('Tipo Global');
+  });
+
+  it('documento sem tipo → documentTypeName null', async () => {
+    const docId = await seedDocWithType(null);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().documentTypeName).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // document_events — registro imutável de upload (cobrança)
 // ---------------------------------------------------------------------------
 
