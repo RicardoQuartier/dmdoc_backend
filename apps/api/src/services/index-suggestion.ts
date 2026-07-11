@@ -219,6 +219,7 @@ export async function suggestDocumentIndexes(
     extractionUsd: 0,
     embeddingsUsd: 0,
     suggestionUsd: 0,
+    classificationUsd: 0,
     totalUsd: 0,
   };
 
@@ -314,7 +315,12 @@ export async function suggestDocumentIndexes(
     extractionUsd: existingBreakdown.extractionUsd,
     embeddingsUsd: existingBreakdown.embeddingsUsd,
     suggestionUsd: newSuggestionUsd,
-    totalUsd: existingBreakdown.extractionUsd + existingBreakdown.embeddingsUsd + newSuggestionUsd,
+    classificationUsd: existingBreakdown.classificationUsd,
+    totalUsd:
+      existingBreakdown.extractionUsd +
+      existingBreakdown.embeddingsUsd +
+      newSuggestionUsd +
+      existingBreakdown.classificationUsd,
   };
 
   // Payload separado para persistência: `sql.json` exige `JSONValue` (sem

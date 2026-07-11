@@ -75,17 +75,6 @@ interface DocumentRow extends TenantDocument {
   cost_usd_cents: number;
 }
 
-interface IndexFieldRow {
-  id: string;
-  name: string;
-  field_type: 'TEXT' | 'DATE' | 'NUMBER';
-  required: boolean;
-  ai_extraction_hint: string | null;
-  sort_order: number;
-  show_on_search: boolean;
-  deleted: boolean;
-}
-
 /**
  * Linha crua de `document_content` como armazenada no PostgreSQL — usada
  * exclusivamente pelo `GET /documents/:id/debug`.
