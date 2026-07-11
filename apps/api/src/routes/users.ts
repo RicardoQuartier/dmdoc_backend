@@ -3,7 +3,7 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { TenantRepository, assertUserScopeInvariant, validateUserDocument } from '@dmdoc/db-pg';
 import type { User, Role } from '@dmdoc/shared-types';
-import { ADMIN_ROLES, isGlobalRole } from '@dmdoc/shared-types';
+import { ADMIN_ROLES, ROLE_LEVEL, isGlobalRole } from '@dmdoc/shared-types';
 import type { TenantDocument } from '@dmdoc/db-pg';
 import { ConflictError, ForbiddenError, NotFoundError } from '../errors/index.js';
 import { requireRole, requireCanManageRole } from '../auth/role-guard.js';
@@ -245,71 +245,101 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
    * GET /users — lista usuários.
    */
   app.get('/users', { preHandler: app.authenticate }, async (request, reply) => {
+    // Gate de administração: listagem de usuários é exclusiva de papéis admin
+    // (SUPER_ADMIN, MULTI_TENANT_ADMIN, TENANT_ADMIN). UPLOADER/USER nunca
+    // gerenciam nem enumeram contas. Ver wiki "Hierarquia de papéis e gestão
+    // de usuários (quem cria quem)".
+    requireRole(request, ...ADMIN_ROLES);
+
     const { limit, cursor, tenantId: tenantIdParam } = ListUsersQuerySchema.parse(request.query);
     const sql = app.db;
 
     const ctx = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: false });
 
-    let items: ReturnType<typeof safeUser>[];
-    let nextCursor: string | null;
+    // Filtro de hierarquia "inferior ou igual": o ator só enxerga papéis de
+    // nível MENOR OU IGUAL ao seu. SUPER_ADMIN (100) vê todos; TENANT_ADMIN (60)
+    // não vê MULTI_TENANT_ADMIN (80) nem SUPER_ADMIN (100). Reaproveita
+    // ROLE_LEVEL de @dmdoc/shared-types.
+    const visibleRoles = rolesVisibleTo(request.user!.role);
+
+    let rows: UserRow[];
 
     if (ctx.mode === 'single') {
       const tenantId = ctx.tenantId;
-      const usersRepo = new TenantRepository<UserDoc>(sql, 'users', { tenantId });
-      const pagination = cursor !== undefined ? { limit, cursor } : { limit };
-      const page = await usersRepo.findMany({}, pagination);
-      items = page.items.map((r) => safeUser(rowToUserDoc(r as unknown as UserRow)));
-      nextCursor = page.nextCursor;
-    } else {
-      let rows: UserRow[];
-      if (ctx.mode === 'allowed') {
-        if (cursor !== undefined) {
-          rows = await sql<UserRow[]>`
-            SELECT id, tenant_id, email, password_hash, name, role, active, created_at, deleted, allowed_tenant_ids
-            FROM users
-            WHERE tenant_id = ANY(${ctx.tenantIds}::uuid[])
-              AND deleted = false
-              AND id > ${cursor}
-            ORDER BY id ASC
-            LIMIT ${limit + 1}
-          `;
-        } else {
-          rows = await sql<UserRow[]>`
-            SELECT id, tenant_id, email, password_hash, name, role, active, created_at, deleted, allowed_tenant_ids
-            FROM users
-            WHERE tenant_id = ANY(${ctx.tenantIds}::uuid[])
-              AND deleted = false
-            ORDER BY id ASC
-            LIMIT ${limit + 1}
-          `;
-        }
+      if (cursor !== undefined) {
+        rows = await sql<UserRow[]>`
+          SELECT id, tenant_id, email, password_hash, name, role, active, created_at, deleted, allowed_tenant_ids
+          FROM users
+          WHERE tenant_id = ${tenantId}
+            AND deleted = false
+            AND role = ANY(${visibleRoles}::text[])
+            AND id > ${cursor}
+          ORDER BY id ASC
+          LIMIT ${limit + 1}
+        `;
       } else {
-        // mode === 'all' (SUPER_ADMIN)
-        if (cursor !== undefined) {
-          rows = await sql<UserRow[]>`
-            SELECT id, tenant_id, email, password_hash, name, role, active, created_at, deleted, allowed_tenant_ids
-            FROM users
-            WHERE deleted = false
-              AND id > ${cursor}
-            ORDER BY id ASC
-            LIMIT ${limit + 1}
-          `;
-        } else {
-          rows = await sql<UserRow[]>`
-            SELECT id, tenant_id, email, password_hash, name, role, active, created_at, deleted, allowed_tenant_ids
-            FROM users
-            WHERE deleted = false
-            ORDER BY id ASC
-            LIMIT ${limit + 1}
-          `;
-        }
+        rows = await sql<UserRow[]>`
+          SELECT id, tenant_id, email, password_hash, name, role, active, created_at, deleted, allowed_tenant_ids
+          FROM users
+          WHERE tenant_id = ${tenantId}
+            AND deleted = false
+            AND role = ANY(${visibleRoles}::text[])
+          ORDER BY id ASC
+          LIMIT ${limit + 1}
+        `;
       }
-
-      const hasMore = rows.length > limit;
-      const page = hasMore ? rows.slice(0, limit) : rows;
-      nextCursor = hasMore && page.at(-1) ? page.at(-1)!.id : null;
-      items = page.map((r) => safeUser(rowToUserDoc(r)));
+    } else if (ctx.mode === 'allowed') {
+      if (cursor !== undefined) {
+        rows = await sql<UserRow[]>`
+          SELECT id, tenant_id, email, password_hash, name, role, active, created_at, deleted, allowed_tenant_ids
+          FROM users
+          WHERE tenant_id = ANY(${ctx.tenantIds}::uuid[])
+            AND deleted = false
+            AND role = ANY(${visibleRoles}::text[])
+            AND id > ${cursor}
+          ORDER BY id ASC
+          LIMIT ${limit + 1}
+        `;
+      } else {
+        rows = await sql<UserRow[]>`
+          SELECT id, tenant_id, email, password_hash, name, role, active, created_at, deleted, allowed_tenant_ids
+          FROM users
+          WHERE tenant_id = ANY(${ctx.tenantIds}::uuid[])
+            AND deleted = false
+            AND role = ANY(${visibleRoles}::text[])
+          ORDER BY id ASC
+          LIMIT ${limit + 1}
+        `;
+      }
+    } else {
+      // mode === 'all' (SUPER_ADMIN) — nível 100 vê todos os papéis; o filtro
+      // por visibleRoles é mantido por consistência (não exclui ninguém).
+      if (cursor !== undefined) {
+        rows = await sql<UserRow[]>`
+          SELECT id, tenant_id, email, password_hash, name, role, active, created_at, deleted, allowed_tenant_ids
+          FROM users
+          WHERE deleted = false
+            AND role = ANY(${visibleRoles}::text[])
+            AND id > ${cursor}
+          ORDER BY id ASC
+          LIMIT ${limit + 1}
+        `;
+      } else {
+        rows = await sql<UserRow[]>`
+          SELECT id, tenant_id, email, password_hash, name, role, active, created_at, deleted, allowed_tenant_ids
+          FROM users
+          WHERE deleted = false
+            AND role = ANY(${visibleRoles}::text[])
+          ORDER BY id ASC
+          LIMIT ${limit + 1}
+        `;
+      }
     }
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const nextCursor = hasMore && page.at(-1) ? page.at(-1)!.id : null;
+    const items = page.map((r) => safeUser(rowToUserDoc(r)));
 
     return reply.status(200).send({ items, nextCursor });
   });
@@ -576,6 +606,12 @@ async function findUserInScope(
 ): Promise<UserDoc | null> {
   const ctx = resolveTenantContext(request, { explicitTenantId, write: false });
 
+  // Filtro de hierarquia "inferior ou igual": o ator só resolve alvos de nível
+  // MENOR OU IGUAL ao seu — um usuário acima do nível do ator retorna null (404),
+  // preservando a invariante de não expor contas privilegiadas. Ver wiki
+  // "Hierarquia de papéis e gestão de usuários".
+  const visibleRoles = rolesVisibleTo(request.user!.role);
+
   let rows: UserRow[];
 
   if (ctx.mode === 'single') {
@@ -585,6 +621,7 @@ async function findUserInScope(
       WHERE id = ${id}
         AND tenant_id = ${ctx.tenantId}
         AND deleted = false
+        AND role = ANY(${visibleRoles}::text[])
       LIMIT 1
     `;
   } else if (ctx.mode === 'allowed') {
@@ -594,20 +631,33 @@ async function findUserInScope(
       WHERE id = ${id}
         AND tenant_id = ANY(${ctx.tenantIds}::uuid[])
         AND deleted = false
+        AND role = ANY(${visibleRoles}::text[])
       LIMIT 1
     `;
   } else {
-    // mode === 'all' (SUPER_ADMIN)
+    // mode === 'all' (SUPER_ADMIN) — nível 100 resolve qualquer papel.
     rows = await sql<UserRow[]>`
       SELECT id, tenant_id, email, password_hash, name, role, active, created_at, deleted, allowed_tenant_ids
       FROM users
       WHERE id = ${id}
         AND deleted = false
+        AND role = ANY(${visibleRoles}::text[])
       LIMIT 1
     `;
   }
 
   return rows.length > 0 ? rowToUserDoc(rows[0]!) : null;
+}
+
+/**
+ * Papéis visíveis para um ator segundo a regra "inferior ou igual": todos os
+ * papéis cujo nível (`ROLE_LEVEL`) seja MENOR OU IGUAL ao do ator. SUPER_ADMIN
+ * (100) devolve os 5 papéis; TENANT_ADMIN (60) exclui MULTI_TENANT_ADMIN (80) e
+ * SUPER_ADMIN (100).
+ */
+function rolesVisibleTo(actorRole: Role): Role[] {
+  const actorLevel = ROLE_LEVEL[actorRole];
+  return (Object.keys(ROLE_LEVEL) as Role[]).filter((r) => ROLE_LEVEL[r] <= actorLevel);
 }
 
 function safeUser(user: UserDoc): Omit<UserDoc, 'passwordHash'> {

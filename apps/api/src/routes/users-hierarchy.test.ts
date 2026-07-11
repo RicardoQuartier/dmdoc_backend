@@ -403,3 +403,99 @@ describe('PATCH /users/:id — cross-tenant', () => {
     expect(res.json().error.code).toBe('NOT_FOUND');
   });
 });
+
+// ---------------------------------------------------------------------------
+// GET /users — gate de admin + filtro de hierarquia (inferior ou igual)
+// ---------------------------------------------------------------------------
+
+describe('GET /users — gate de admin e hierarquia', () => {
+  it('USER (nível 20) → 403 (gate de admin, não enumera contas)', async () => {
+    const userAToken = await login('user-a@empresa.com');
+    const res = await app.inject({
+      method: 'GET',
+      url: '/users',
+      headers: { authorization: `Bearer ${userAToken}` },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+  });
+
+  it('UPLOADER (nível 40) → 403 (gate de admin)', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/users',
+      headers: { authorization: `Bearer ${uploaderAToken}` },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+  });
+
+  it('TENANT_ADMIN A vê só usuários do tenant A (≤ nível 60); nunca MTA/SUPER_ADMIN/tenant B', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/users?limit=500',
+      headers: { authorization: `Bearer ${tadminAToken}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const items = res.json().items as Array<{ id: string; role: string }>;
+    const ids = items.map((u) => u.id);
+    expect(ids).toContain(TADMIN_A_ID);
+    expect(ids).toContain(UPLOADER_A_ID);
+    expect(ids).toContain(USER_A_ID);
+    // Acima do nível do ator ou fora do tenant não aparecem.
+    expect(ids).not.toContain(SUPER_ADMIN_ID);
+    expect(ids).not.toContain(MTA_ID);
+    expect(ids).not.toContain(TADMIN_B_ID);
+    // Nenhum papel acima de TENANT_ADMIN (60) na resposta.
+    for (const u of items) {
+      expect(['TENANT_ADMIN', 'UPLOADER', 'USER']).toContain(u.role);
+    }
+  });
+
+  it('SUPER_ADMIN (nível 100) vê todos os papéis', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/users?limit=500',
+      headers: { authorization: `Bearer ${superToken}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json().items as Array<{ id: string }>).map((u) => u.id);
+    expect(ids).toContain(SUPER_ADMIN_ID);
+    expect(ids).toContain(MTA_ID);
+    expect(ids).toContain(TADMIN_A_ID);
+    expect(ids).toContain(TADMIN_B_ID);
+    expect(ids).toContain(UPLOADER_A_ID);
+    expect(ids).toContain(USER_A_ID);
+  });
+
+  it('MTA (nível 80) vê usuários dos tenants permitidos; nunca SUPER_ADMIN nem tenant fora da lista', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/users?limit=500',
+      headers: { authorization: `Bearer ${mtaToken}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const items = res.json().items as Array<{ id: string; role: string }>;
+    const ids = items.map((u) => u.id);
+    // Tenant A está na lista do MTA.
+    expect(ids).toContain(TADMIN_A_ID);
+    expect(ids).toContain(UPLOADER_A_ID);
+    expect(ids).toContain(USER_A_ID);
+    // Acima do nível (SUPER_ADMIN) ou fora da lista (tenant B) não aparecem.
+    expect(ids).not.toContain(SUPER_ADMIN_ID);
+    expect(ids).not.toContain(TADMIN_B_ID);
+    for (const u of items) {
+      expect(u.role).not.toBe('SUPER_ADMIN');
+    }
+  });
+
+  it('GET /users/:id — TENANT_ADMIN A não resolve MTA (fora do escopo/nível) → 404', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: `/users/${MTA_ID}`,
+      headers: { authorization: `Bearer ${tadminAToken}` },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+  });
+});
