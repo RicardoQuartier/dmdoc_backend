@@ -36,6 +36,13 @@
       "when": 1784131200000,
       "tag": "0005_type_suggestion",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1784736000000,
+      "tag": "0006_partial_unique_dept_perm",
+      "breakpoints": true
     }
   ]
 }

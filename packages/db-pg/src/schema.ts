@@ -178,7 +178,10 @@ export const departments = pgTable(
 
 /**
  * Permissão de acesso de um usuário a um departamento.
- * Unique: (userId, departmentId).
+ * Unique PARCIAL: (userId, departmentId) apenas para linhas ativas
+ * (`deleted = false`) — soft-deletadas não competem pela unicidade,
+ * permitindo o padrão soft-delete + reinserção sem colisão (ver migration
+ * 0006_partial_unique_dept_perm).
  */
 export const departmentPermissions = pgTable(
   'department_permissions',
@@ -198,7 +201,9 @@ export const departmentPermissions = pgTable(
     deleted: boolean('deleted').notNull().default(false),
   },
   (t) => [
-    unique('uniq_dept_perm_user_dept').on(t.userId, t.departmentId),
+    uniqueIndex('uniq_dept_perm_user_dept')
+      .on(t.userId, t.departmentId)
+      .where(sql`deleted = false`),
     index('dept_perm_by_user_tenant').on(t.userId, t.tenantId),
     index('dept_perm_by_department').on(t.departmentId),
   ],

@@ -30,9 +30,10 @@ try {
   const hash0003 = '4907d794fcf57e16c4ed488c71a7870ec75158cde796fbcbce49330e1fe5a00c';
   const hash0004 = '5ebce9ab53e88ac1d0c2c05a46cdddae1b73293d1906815e50e24ba666297d6e';
   const hash0005 = '07d09f5c97a96958b16d302d79f647932482a6ade9e1053c1ed1a8bba9a6dc42';
+  const hash0006 = 'bf482caa681c5decd6fc7f1d04c0c163ee595c8aa968e52574559cce24f6de71';
 
   const existing = await sql<{ hash: string }[]>`
-    SELECT hash FROM drizzle.__drizzle_migrations WHERE hash = ANY(${[hash0001, hash0002, hash0003, hash0004, hash0005]})
+    SELECT hash FROM drizzle.__drizzle_migrations WHERE hash = ANY(${[hash0001, hash0002, hash0003, hash0004, hash0005, hash0006]})
   `;
   const existingSet = new Set(existing.map((r) => r.hash));
 
@@ -120,12 +121,36 @@ try {
     console.log('– 0005_type_suggestion já registrada');
   }
 
-  // 7. Verify
+  // 7. Apply 0006: torna uniq_dept_perm_user_dept parcial (WHERE deleted = false),
+  //    espelhando o padrão de 0002 para documents. Sem isso, a linha soft-deletada
+  //    de department_permissions ainda ocupa o par (user_id, department_id) e
+  //    colide (23505) na reinserção do padrão soft-delete + reinserção.
+  await sql`DROP INDEX IF EXISTS uniq_dept_perm_user_dept`;
+  await sql`
+    CREATE UNIQUE INDEX uniq_dept_perm_user_dept
+      ON department_permissions (user_id, department_id)
+      WHERE deleted = false
+  `;
+  console.log('✔ índice uniq_dept_perm_user_dept recriado como parcial');
+
+  if (!existingSet.has(hash0006)) {
+    await sql`INSERT INTO drizzle.__drizzle_migrations (hash, created_at) VALUES (${hash0006}, ${1784736000000})`;
+    console.log('✔ 0006_partial_unique_dept_perm marcada como aplicada');
+  } else {
+    console.log('– 0006_partial_unique_dept_perm já registrada');
+  }
+
+  // 8. Verify
   const idx = await sql<{ indexdef: string }[]>`
     SELECT indexdef FROM pg_indexes
     WHERE tablename = 'documents' AND indexname = 'uniq_doc_tenant_content_hash'
   `;
   console.log('\nÍndice final:', idx[0]?.indexdef);
+  const idxDept = await sql<{ indexdef: string }[]>`
+    SELECT indexdef FROM pg_indexes
+    WHERE tablename = 'department_permissions' AND indexname = 'uniq_dept_perm_user_dept'
+  `;
+  console.log('Índice dept_perm:', idxDept[0]?.indexdef);
   console.log('\n✅ Bootstrap concluído. Rode pnpm --filter db-pg migrate para confirmar.');
 } finally {
   await sql.end();
