@@ -76,7 +76,10 @@ type UserRow = {
 function rowToUserDoc(r: UserRow): UserDoc {
   const doc: UserDoc = {
     id: r.id,
-    tenantId: r.tenant_id ?? '',
+    // Papéis globais (SUPER_ADMIN, MULTI_TENANT_ADMIN) têm tenant_id NULL e devem
+    // serializar como `tenantId: null` — mesmo contrato do caminho de criação de
+    // papel global. Usuários locais sempre têm tenant_id não-nulo.
+    tenantId: r.tenant_id as string,
     email: r.email,
     passwordHash: r.password_hash,
     name: r.name,
