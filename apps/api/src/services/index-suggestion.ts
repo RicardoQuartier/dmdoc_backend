@@ -33,9 +33,28 @@ export interface SuggestDocumentIndexesDeps {
   logger: MinimalLogger;
 }
 
+/**
+ * Sugestão por campo já casada contra os campos REAIS do tipo do documento
+ * (`document_type_index_fields`) — nunca contém nomes alucinados pelo LLM. É
+ * exatamente o array `fields` da resposta HTTP de `POST /documents/:id/suggest-indexes`.
+ */
+export interface SuggestedIndexField {
+  /** Nome do campo real do tipo (nunca um nome inventado pelo LLM). */
+  name: string;
+  /** Valor já normalizado/validado, ou `null` quando descartado/ausente. */
+  value: string | null;
+  /** Confiança devolvida pelo LLM para este campo; 0 quando o LLM não o sugeriu. */
+  confidence: number;
+}
+
 export interface SuggestDocumentIndexesResult {
   /** Sugestão persistida em `document_content.index_suggestion`. */
   indexSuggestion: IndexSuggestion;
+  /**
+   * Sugestão por campo, derivada dos campos REAIS do tipo — pronta para a
+   * resposta HTTP. Campos alucinados pelo LLM são descartados aqui, nunca vazam.
+   */
+  fields: SuggestedIndexField[];
   /** `cost_breakdown` completo já atualizado (acumulado) do documento. */
   costBreakdown: CostBreakdown;
   /** Custo em USD APENAS desta chamada (não o acumulado) — para exibição/log do chamador. */
@@ -249,7 +268,7 @@ export async function suggestDocumentIndexes(
       WHERE document_id = ${documentId}
         AND tenant_id = ${tenantId}
     `;
-    return { indexSuggestion, costBreakdown: existingBreakdown, costUsd: 0 };
+    return { indexSuggestion, fields: [], costBreakdown: existingBreakdown, costUsd: 0 };
   }
 
   // 4. Monta prompt e chama o LLM (com retry) --------------------------------
@@ -266,29 +285,46 @@ export async function suggestDocumentIndexes(
   const { parsed, lastResult, totalCostUsd } = await callLlmWithRetry(llmProvider, userMessage, log);
 
   // 5. Normaliza + valida cada campo -----------------------------------------
-  const fieldByName = new Map(indexFieldRows.map((f) => [f.name, f]));
+  // Indexa a resposta do LLM por nome para casar contra os campos REAIS do tipo
+  // (fonte de verdade). Nomes que o LLM inventou (que não existem em
+  // `indexFieldRows`) simplesmente nunca são consultados aqui — não entram em
+  // `values` nem no array `fields` devolvido, portanto nunca vazam para o HTTP.
+  const suggestionByName = new Map(parsed.fields.map((f) => [f.name, f]));
   const values: Record<string, string> = {};
 
+  // Loga (uma vez) os nomes alucinados descartados, para observabilidade.
+  const realNames = new Set(indexFieldRows.map((f) => f.name));
   for (const suggested of parsed.fields) {
-    const field = fieldByName.get(suggested.name);
-    if (!field) {
-      log.warn({ fieldName: suggested.name }, 'IA sugeriu campo que não existe no tipo do documento — ignorado');
-      continue;
+    if (!realNames.has(suggested.name)) {
+      log.warn(
+        { fieldName: suggested.name },
+        'IA sugeriu campo que não existe no tipo do documento — ignorado'
+      );
     }
-
-    const normalized = normalizeAndValidateField(field, suggested.value);
-    if (normalized === null) {
-      if (suggested.value !== null) {
-        log.warn(
-          { fieldName: suggested.name, rawValue: suggested.value },
-          'sugestão de índice descartada — não validou mesmo após normalização pt-BR'
-        );
-      }
-      continue;
-    }
-
-    values[field.name] = normalized;
   }
+
+  // Monta a sugestão por campo a partir dos campos REAIS do tipo (nunca da
+  // resposta crua do LLM). Cada campo carrega o valor normalizado/validado (ou
+  // null) e a confiança casada; campos que o LLM não sugeriu ficam com value
+  // null e confiança 0.
+  const fields: SuggestedIndexField[] = indexFieldRows.map((field) => {
+    const suggested = suggestionByName.get(field.name);
+    const normalized = suggested ? normalizeAndValidateField(field, suggested.value) : null;
+    if (suggested && normalized === null && suggested.value !== null) {
+      log.warn(
+        { fieldName: field.name, rawValue: suggested.value },
+        'sugestão de índice descartada — não validou mesmo após normalização pt-BR'
+      );
+    }
+    if (normalized !== null) {
+      values[field.name] = normalized;
+    }
+    return {
+      name: field.name,
+      value: normalized,
+      confidence: suggested?.confidence ?? 0,
+    };
+  });
 
   log.info(
     {
@@ -352,5 +388,5 @@ export async function suggestDocumentIndexes(
     `;
   }
 
-  return { indexSuggestion, costBreakdown: newCostBreakdown, costUsd: totalCostUsd };
+  return { indexSuggestion, fields, costBreakdown: newCostBreakdown, costUsd: totalCostUsd };
 }

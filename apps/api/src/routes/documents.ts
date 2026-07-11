@@ -33,7 +33,6 @@ import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 import { getConfig, type Config } from '../config.js';
 import { validateIndexValues, type IndexFieldRow } from '../lib/index-fields.js';
 import { suggestDocumentIndexes } from '../services/index-suggestion.js';
-import { SuggestIndexesResponseSchema } from '../prompts/suggest-indexes.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais que mapeiam as tabelas do PostgreSQL (spec §5.3)
@@ -2036,21 +2035,13 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     }
 
     // ------------------------------------------------------------------
-    // 4. Monta a resposta HTTP `{ fields: [{ name, value, confidence }] }`
-    //    (spec §7) combinando a confiança bruta devolvida pelo LLM
-    //    (`rawResponse`, no formato validado por `SuggestIndexesResponseSchema`)
-    //    com o valor JÁ normalizado/validado (`indexSuggestion.values`) — nunca
-    //    expõe o valor cru quando ele foi descartado na normalização/validação
-    //    (campo sem sugestão válida sempre aparece com `value: null`).
+    // 4. Resposta HTTP `{ fields: [{ name, value, confidence }] }` (spec §7).
+    //    O array já vem do service montado a partir dos campos REAIS do tipo
+    //    (`indexFieldRows`), com valor normalizado/validado e confiança casada
+    //    por campo. Nomes de campo alucinados pelo LLM foram descartados no
+    //    service — nunca chegam aqui nem vazam na resposta.
     // ------------------------------------------------------------------
-    const rawParsed = SuggestIndexesResponseSchema.safeParse(result.indexSuggestion.rawResponse);
-    const fields = rawParsed.success
-      ? rawParsed.data.fields.map((f) => ({
-          name: f.name,
-          value: result.indexSuggestion.values[f.name] ?? null,
-          confidence: f.confidence,
-        }))
-      : [];
+    const fields = result.fields;
 
     log.info(
       {
