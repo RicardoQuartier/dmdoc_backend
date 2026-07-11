@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
+import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb } from '../test/helpers.js';
 
 /**
  * Testes E2E da hierarquia de papéis (spec §5.1).
@@ -18,8 +18,9 @@ import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.
  * Cobre também a invariante de escopo bidirecional e o isolamento cross-tenant.
  */
 
-const TENANT_A = '11111111-1111-1111-1111-111111111111';
-const TENANT_B = '22222222-2222-2222-2222-222222222222';
+// UUIDs de tenant por arquivo — evita colisão no `dmdoc_test` compartilhado.
+const TENANT_A = crypto.randomUUID();
+const TENANT_B = crypto.randomUUID();
 
 const SUPER_ADMIN_ID = 'a0000000-0000-0000-0000-000000000001';
 const MTA_ID = 'a0000000-0000-0000-0000-000000000002';
@@ -49,8 +50,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('SUPER_ADMIN','MULTI_TENANT_ADMIN','TENANT_ADMIN','UPLOADER','USER')`;
-  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
+  await resetDomainTables(testDb.db);
 
   await testDb.db`
     INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)

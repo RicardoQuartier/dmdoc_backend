@@ -1,9 +1,13 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
+import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb } from '../test/helpers.js';
+import { randomUUID } from 'node:crypto';
 
-const TENANT_A = '11111111-1111-1111-1111-111111111111';
+// UUIDs de tenant gerados por arquivo — evita colisão com outros arquivos de
+// teste que compartilham o mesmo banco `dmdoc_test`.
+const TENANT_A = randomUUID();
+const TENANT_B = randomUUID();
 const USER_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const PASSWORD = 'senha-super-secreta';
 
@@ -21,8 +25,15 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db`DELETE FROM audit_logs`;
-  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role = 'TENANT_ADMIN'`;
+  await resetDomainTables(testDb.db);
+  // Os usuários semeados referenciam estes tenants (FK users.tenant_id).
+  await testDb.db`
+    INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
+    VALUES
+      (${TENANT_A}, 'Empresa A', ${10 * 1024 ** 3}, 20, true, NOW()),
+      (${TENANT_B}, 'Empresa B', ${10 * 1024 ** 3}, 20, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
 });
 
 async function seedDefaultUser(active = true): Promise<void> {
@@ -118,7 +129,7 @@ describe('POST /auth/login', () => {
     await seedDefaultUser();
     await seedUser(testDb.db, {
       id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
-      tenantId: '22222222-2222-2222-2222-222222222222',
+      tenantId: TENANT_B,
       email: 'admin@empresa.com',
       password: PASSWORD,
     });

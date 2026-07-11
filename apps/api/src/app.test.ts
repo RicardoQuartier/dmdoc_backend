@@ -29,7 +29,7 @@ describe('Error handler central — corpo JSON inválido', () => {
   // Regra: requisição com `Content-Type: application/json` cujo corpo está
   // ausente ou malformado é falha do cliente → 400 BAD_REQUEST, nunca 500.
   // (card mvp-launch: corpo vazio retornava 500, poluindo métricas de erro 5xx)
-  const TENANT = '11111111-1111-1111-1111-111111111111';
+  const TENANT = crypto.randomUUID();
   const ADMIN_ID = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
   const PASSWORD = 'senha-muito-secreta-123';
 

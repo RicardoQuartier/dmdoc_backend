@@ -4,9 +4,10 @@ import { resolveTenantContext, resolveTenantId } from './resolve-tenant.js';
 import { ConflictError } from '../errors/ConflictError.js';
 import { NotFoundError } from '../errors/NotFoundError.js';
 
-const TENANT_A = '11111111-1111-1111-1111-111111111111';
-const TENANT_B = '22222222-2222-2222-2222-222222222222';
-const TENANT_C = '33333333-3333-3333-3333-333333333333';
+// UUIDs de tenant por arquivo — evita colisão no `dmdoc_test` compartilhado.
+const TENANT_A = crypto.randomUUID();
+const TENANT_B = crypto.randomUUID();
+const TENANT_C = crypto.randomUUID();
 const USER_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 
 /**

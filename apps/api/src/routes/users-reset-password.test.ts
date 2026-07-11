@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
+import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb } from '../test/helpers.js';
 import { verifyPassword } from '../auth/password.js';
 
 /**
@@ -15,8 +15,9 @@ import { verifyPassword } from '../auth/password.js';
  *   - audit log da ação registrado
  */
 
-const TENANT_A = '11111111-1111-1111-1111-111111111111';
-const TENANT_B = '22222222-2222-2222-2222-222222222222';
+// UUIDs de tenant por arquivo — evita colisão no `dmdoc_test` compartilhado.
+const TENANT_A = crypto.randomUUID();
+const TENANT_B = crypto.randomUUID();
 
 const TADMIN_A_ID = 'b0000000-0000-0000-0000-000000000001';
 const UPLOADER_A_ID = 'b0000000-0000-0000-0000-000000000002';
@@ -44,9 +45,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db`DELETE FROM audit_logs`;
-  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('SUPER_ADMIN','TENANT_ADMIN','UPLOADER','USER')`;
-  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
+  await resetDomainTables(testDb.db);
 
   await testDb.db`
     INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
@@ -155,7 +154,11 @@ describe('POST /users/:id/reset-password — sucesso', () => {
     expect(log.tenant_id).toBe(TENANT_A);
     expect(log.user_id).toBe(TADMIN_A_ID);
     expect(log.resource).toBe(`users/${USER_A_ID}`);
-    expect((log.metadata as { targetUserId?: string })['targetUserId']).toBe(USER_A_ID);
+    // postgres.js devolve jsonb como string crua — parseia antes de inspecionar.
+    const metadata = (
+      typeof log.metadata === 'string' ? JSON.parse(log.metadata) : log.metadata
+    ) as { targetUserId?: string };
+    expect(metadata['targetUserId']).toBe(USER_A_ID);
   });
 
   it('a nova senha em claro nunca aparece no audit log', async () => {

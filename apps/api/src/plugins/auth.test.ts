@@ -6,7 +6,8 @@ import { AppError } from '../errors/index.js';
 import { TokenService } from '../auth/tokens.js';
 import { startTestDb, testConfig, type TestDb } from '../test/helpers.js';
 
-const TENANT_A = '11111111-1111-1111-1111-111111111111';
+// UUID de tenant por arquivo — evita colisão no `dmdoc_test` compartilhado.
+const TENANT_A = crypto.randomUUID();
 const USER_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const SUPER_ID = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
 

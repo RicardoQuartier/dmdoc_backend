@@ -21,8 +21,9 @@ function createMockS3(): S3Service {
 // ---------------------------------------------------------------------------
 // Constantes de fixture
 // ---------------------------------------------------------------------------
-const TENANT_A = '11111111-1111-1111-1111-111111111111';
-const TENANT_B = '22222222-2222-2222-2222-222222222222';
+// UUIDs de tenant por arquivo — evita colisão no `dmdoc_test` compartilhado.
+const TENANT_A = crypto.randomUUID();
+const TENANT_B = crypto.randomUUID();
 const ADMIN_A_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const UPLOADER_A_ID = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
 const ADMIN_B_ID = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
@@ -481,12 +482,12 @@ describe('POST /documents — verificação de cota', () => {
     await testDb.db`
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
-        original_filename, content_hash, size_bytes, mime_type,
+        filename, original_filename, content_hash, size_bytes, mime_type,
         s3_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${newId()}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
-        'existente.pdf', ${'a'.repeat(64)}, ${halfQuota + 100}, 'application/pdf',
+        'existente.pdf', 'existente.pdf', ${'a'.repeat(64)}, ${halfQuota + 100}, 'application/pdf',
         'test/key', 'READY', NULL, '{}'::text[], '{}'::jsonb,
         ${ADMIN_A_ID}, NOW(), NOW(), 0, false
       )
@@ -706,12 +707,12 @@ describe('ACL por raiz — herança dinâmica de acesso à subárvore', () => {
     await testDb.db`
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
-        original_filename, content_hash, size_bytes, mime_type,
+        filename, original_filename, content_hash, size_bytes, mime_type,
         s3_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${TENANT_A}, ${childId}, NULL,
-        'filho.pdf', ${hashC}, 512, 'application/pdf',
+        'filho.pdf', 'filho.pdf', ${hashC}, 512, 'application/pdf',
         ${`tenants/${TENANT_A}/documents/${hashC}/filho.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
         ${uploaderListId}, NOW(), NOW(), 0, false
       )
@@ -742,12 +743,12 @@ describe('documentos órfãos — departamento soft-deletado preserva acesso', (
     await testDb.db`
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
-        original_filename, content_hash, size_bytes, mime_type,
+        filename, original_filename, content_hash, size_bytes, mime_type,
         s3_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${tenantId}, ${departmentId}, NULL,
-        'orfao.pdf', ${hashB}, 1024, 'application/pdf',
+        'orfao.pdf', 'orfao.pdf', ${hashB}, 1024, 'application/pdf',
         ${`tenants/${tenantId}/documents/${hashB}/orfao.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
         ${ADMIN_A_ID}, NOW(), NOW(), 0, false
       )

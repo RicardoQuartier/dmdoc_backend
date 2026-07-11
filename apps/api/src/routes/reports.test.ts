@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
+import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb } from '../test/helpers.js';
 import type { S3Service } from '../services/s3.js';
 import { newId } from '@dmdoc/db-pg';
 
@@ -19,8 +19,9 @@ function createMockS3(): S3Service {
 // ---------------------------------------------------------------------------
 // Constantes de fixture
 // ---------------------------------------------------------------------------
-const TENANT_A = '11111111-1111-1111-1111-111111111111';
-const TENANT_B = '22222222-2222-2222-2222-222222222222';
+// UUIDs de tenant por arquivo — evita colisão no `dmdoc_test` compartilhado.
+const TENANT_A = crypto.randomUUID();
+const TENANT_B = crypto.randomUUID();
 const ADMIN_A_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const ADMIN_B_ID = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
 const SUPER_ADMIN_ID = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
@@ -58,16 +59,22 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db`DELETE FROM document_events`;
-  await testDb.db`DELETE FROM audit_logs`;
-  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','SUPER_ADMIN','UPLOADER','USER','MULTI_TENANT_ADMIN')`;
-  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
+  await resetDomainTables(testDb.db);
 
   await testDb.db`
     INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
     VALUES
       (${TENANT_A}, 'Empresa A', ${DISK_QUOTA}, ${USER_QUOTA}, true, NOW()),
       (${TENANT_B}, 'Empresa B', ${DISK_QUOTA}, ${USER_QUOTA}, true, NOW())
+    ON CONFLICT (id) DO NOTHING
+  `;
+
+  // Tipos de documento referenciados pelos eventos (FK document_events.document_type_id).
+  await testDb.db`
+    INSERT INTO document_types (id, tenant_id, name, description, is_global, index_fields, deleted, created_at)
+    VALUES
+      (${DOC_TYPE_CONTRATO}, ${TENANT_A}, 'Contrato', NULL, false, '[]'::jsonb, false, NOW()),
+      (${DOC_TYPE_NOTA}, ${TENANT_A}, 'Nota', NULL, false, '[]'::jsonb, false, NOW())
     ON CONFLICT (id) DO NOTHING
   `;
 
@@ -123,7 +130,11 @@ interface EventInput {
 
 async function insertEvent(input: EventInput): Promise<void> {
   const id = newId();
-  const documentId = input.documentId !== undefined ? input.documentId : newId();
+  // `document_events.document_id` é anulável e tem FK para documents. Nos
+  // eventos sintéticos deste relatório não há documento real; o default é NULL
+  // (gerar um id aleatório violaria a FK). Os testes agregam pelos campos
+  // denormalizados do evento, não pelo document_id.
+  const documentId = input.documentId !== undefined ? input.documentId : null;
   await testDb.db`
     INSERT INTO document_events (
       id, tenant_id, document_id, uploaded_by_id, event_type,
@@ -311,6 +322,14 @@ describe('GET /reports/uploads', () => {
 
   it('groupBy=user denormaliza nome do usuário; null quando não encontrado', async () => {
     const GHOST_USER = '99999999-9999-9999-9999-999999999999';
+    // O evento referencia o uploader via FK (users.id). Para simular "usuário
+    // não encontrado" na denormalização do nome, o ghost é um usuário
+    // soft-deletado: a FK do evento é satisfeita, mas o lookup do nome no
+    // relatório filtra `deleted = false`, então o label sai null.
+    await testDb.db`
+      INSERT INTO users (id, tenant_id, email, password_hash, name, role, active, created_at, deleted)
+      VALUES (${GHOST_USER}, ${TENANT_A}, 'ghost@test.com', 'x', 'Ghost', 'USER', true, NOW(), true)
+    `;
     await insertEvent({ tenantId: TENANT_A, uploadedById: USER_X_ID, mimeType: PDF, documentTypeId: null, documentTypeName: null, sizeBytes: 100, pageCount: 1, createdAt: new Date('2026-03-01') });
     await insertEvent({ tenantId: TENANT_A, uploadedById: GHOST_USER, mimeType: PDF, documentTypeId: null, documentTypeName: null, sizeBytes: 200, pageCount: 2, createdAt: new Date('2026-03-02') });
 
