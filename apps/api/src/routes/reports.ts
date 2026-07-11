@@ -42,6 +42,10 @@ const csvStrings = z
     ),
   );
 
+const UploadersQuerySchema = z.object({
+  tenantId: z.string().uuid().optional(),
+});
+
 const UploadsReportQuerySchema = z.object({
   tenantId: z.string().uuid().optional(),
   dateFrom: z.coerce.date().optional(),
@@ -58,6 +62,7 @@ type StatusRow = { status: string; count: string };
 type MimeTypeRow = { group_key: string | null; files: string; pages: string; size_bytes: string };
 type UserIdRow = { group_key: string | null; files: string; pages: string; size_bytes: string };
 type DocTypeRow = { group_key: string | null; files: string; pages: string; size_bytes: string; document_type_name?: string | null };
+type UploaderRow = { id: string; name: string; email: string };
 
 export const reportsRoutes: FastifyPluginAsync = async (app) => {
   /**
@@ -463,6 +468,49 @@ export const reportsRoutes: FastifyPluginAsync = async (app) => {
         byFormat,
         groups,
       });
+    },
+  );
+
+  /**
+   * GET /reports/uploaders — usuários que possuem ao menos um evento de upload
+   * no tenant, usado para popular o filtro "Usuário" do relatório de uploads.
+   *
+   * Propositalmente NÃO filtra por `users.tenant_id` — a fonte de verdade é
+   * `document_events.tenant_id`, o que garante que um MULTI_TENANT_ADMIN
+   * (tenant_id = NULL) apareça na lista sempre que tiver feito upload neste
+   * tenant, mesmo não "pertencendo" a ele.
+   */
+  app.get(
+    '/reports/uploaders',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      requireRole(request, 'TENANT_ADMIN', 'MULTI_TENANT_ADMIN');
+
+      const { tenantId: tenantIdParam } = UploadersQuerySchema.parse(request.query);
+
+      const ctx = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: true });
+
+      if (ctx.mode !== 'single') {
+        throw new NotFoundError('tenantId é obrigatório para esta operação');
+      }
+
+      const tenantId = ctx.tenantId;
+      const sql = app.db;
+
+      const uploaders = await sql<UploaderRow[]>`
+        SELECT DISTINCT u.id, u.name, u.email
+        FROM document_events de
+        JOIN users u ON u.id = de.uploaded_by_id
+        WHERE de.tenant_id = ${tenantId}
+        ORDER BY u.name
+      `;
+
+      request.log.info(
+        { tenantId, userId: request.user?.sub, count: uploaders.length },
+        'lista de uploaders do relatório consultada',
+      );
+
+      return reply.status(200).send(uploaders);
     },
   );
 };
