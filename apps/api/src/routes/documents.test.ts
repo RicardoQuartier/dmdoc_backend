@@ -455,6 +455,117 @@ describe('POST /documents — deduplicação por SHA-256', () => {
     // S3 foi chamado duas vezes (um por tenant)
     expect(mockS3.uploadFile).toHaveBeenCalledTimes(2);
   });
+
+  it('reenvio de conteúdo cujo doc está FAILED cria um NOVO documento (exceção FAILED), nunca 500/dedup', async () => {
+    // Regressão do bug d61a7cc4 (UPLOAD-14): o índice único parcial
+    // (tenant_id, content_hash) WHERE deleted=false colidia ao reenviar um
+    // conteúdo FAILED, vazando como 500. Agora o registro FAILED é
+    // soft-deletado e um novo documento é criado + reenfileirado.
+    const content = Buffer.from('conteudo-que-falhou-na-extracao');
+    const contentHash = crypto.createHash('sha256').update(content).digest('hex');
+
+    // Documento existente com o MESMO hash, em status FAILED.
+    const failedDocId = newId();
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${failedDocId}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
+        'falhou.pdf', 'falhou.pdf', ${contentHash}, ${content.byteLength}, 'application/pdf',
+        'test/key-failed', 'FAILED', 'extração falhou', '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NULL, 0, false
+      )
+    `;
+
+    const { payload, headers } = buildUploadForm({ content, departmentId: DEPT_A_ID });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenAdminA}`, ...headers },
+      payload,
+    });
+
+    // Novo documento (não dedup)
+    expect(res.statusCode).toBe(201);
+    expect(res.headers['x-deduplicated']).toBeUndefined();
+    const newDocId = res.json().id as string;
+    expect(newDocId).not.toBe(failedDocId);
+    expect(res.json().status).toBe('PENDING');
+
+    // O antigo FAILED foi soft-deletado; o novo é o único não-deletado com o hash.
+    const rows = await testDb.db<Array<{ id: string; status: string; deleted: boolean }>>`
+      SELECT id, status, deleted FROM documents
+      WHERE tenant_id = ${TENANT_A} AND content_hash = ${contentHash}
+      ORDER BY uploaded_at
+    `;
+    const oldRow = rows.find((r) => r.id === failedDocId);
+    const newRow = rows.find((r) => r.id === newDocId);
+    expect(oldRow?.deleted).toBe(true);
+    expect(newRow?.deleted).toBe(false);
+    // Invariante do índice único parcial: exatamente um não-deletado com o hash.
+    expect(rows.filter((r) => !r.deleted)).toHaveLength(1);
+  });
+
+  it('uploads concorrentes do mesmo conteúdo novo: um 201 e os demais 409 (nunca 500), um único doc persiste', async () => {
+    // Regressão do bug f67c1f66 (UPLOAD-16): dois (ou mais) uploads simultâneos
+    // do MESMO conteúdo novo passam pela checagem de dedup antes de qualquer um
+    // persistir; o índice único parcial (tenant_id, content_hash) WHERE
+    // deleted=false deixa só um vencer — o perdedor deve receber 409 (wiki
+    // "Deduplicação de documentos por conteúdo", caso de borda de upload
+    // concorrente), nunca 500.
+    const content = Buffer.from('conteudo-corrida-concorrente-unico');
+    const contentHash = crypto.createHash('sha256').update(content).digest('hex');
+
+    // Barreira determinística: a checagem de dedup ocorre ANTES do upload S3.
+    // Ao segurar TODOS os handlers no upload S3 por um instante, garantimos que
+    // todos passem pela checagem de dedup (achando nada) antes de qualquer
+    // insert — forçando a corrida no índice único de forma reproduzível.
+    vi.mocked(mockS3.uploadFile).mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    });
+
+    const N = 3;
+    try {
+      const responses = await Promise.all(
+        Array.from({ length: N }, () => {
+          const { payload, headers } = buildUploadForm({
+            content,
+            departmentId: DEPT_A_ID,
+            filename: 'corrida.pdf',
+          });
+          return app.inject({
+            method: 'POST',
+            url: '/documents',
+            headers: { authorization: `Bearer ${tokenAdminA}`, ...headers },
+            payload,
+          });
+        })
+      );
+
+      const codes = responses.map((r) => r.statusCode);
+      // Nunca 500.
+      expect(codes).not.toContain(500);
+      // Exatamente um vencedor 201.
+      expect(codes.filter((c) => c === 201)).toHaveLength(1);
+      // Os demais são 409 CONFLICT (perdedores da corrida).
+      expect(codes.filter((c) => c === 409)).toHaveLength(N - 1);
+      const loser = responses.find((r) => r.statusCode === 409)!;
+      expect((loser.json() as { error: { code: string } }).error.code).toBe('CONFLICT');
+    } finally {
+      // Restaura o mock (clearAllMocks do beforeEach zera chamadas, não a impl).
+      vi.mocked(mockS3.uploadFile).mockImplementation(async () => undefined);
+    }
+
+    // Integridade preservada: exatamente um documento não-deletado com o hash.
+    const rows = await testDb.db<Array<{ id: string; deleted: boolean }>>`
+      SELECT id, deleted FROM documents
+      WHERE tenant_id = ${TENANT_A} AND content_hash = ${contentHash}
+    `;
+    expect(rows.filter((r) => !r.deleted)).toHaveLength(1);
+  });
 });
 
 describe('POST /documents — verificação de cota', () => {

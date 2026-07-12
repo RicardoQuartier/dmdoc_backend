@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 import rateLimit from '@fastify/rate-limit';
 import type { Config } from '../config.js';
+import { RateLimitError } from '../errors/index.js';
 
 export interface RateLimitPluginOptions {
   config: Config;
@@ -44,16 +45,19 @@ const rateLimitPluginImpl: FastifyPluginAsync<RateLimitPluginOptions> = async (a
     },
 
     /**
-     * Resposta 429 padronizada com o mesmo envelope de erro do projeto.
+     * O @fastify/rate-limit LANÇA (`throw`) o valor devolvido por esta função
+     * quando o limite é atingido. Devolvemos um `RateLimitError` (AppError) para
+     * que o error handler central o mapeie para **429** com o envelope padrão do
+     * projeto. Devolver um objeto simples (sem `statusCode`) fazia o handler
+     * central cair no branch genérico e responder **500** — a causa do bug
+     * QUOTA-7. Os headers `x-ratelimit-*`/`retry-after` já são emitidos pelo
+     * plugin antes do throw.
      */
     errorResponseBuilder: (_request, context) => {
-      return {
-        error: {
-          code: 'RATE_LIMIT_EXCEEDED',
-          message: `Limite de requisições atingido. Tente novamente em ${Math.ceil(context.ttl / 1000)} segundos.`,
-          retryAfterMs: context.ttl,
-        },
-      };
+      return new RateLimitError(
+        `Limite de requisições atingido. Tente novamente em ${Math.ceil(context.ttl / 1000)} segundos.`,
+        context.ttl
+      );
     },
   });
 };

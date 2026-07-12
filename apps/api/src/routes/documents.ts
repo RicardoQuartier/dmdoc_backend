@@ -27,7 +27,7 @@ import {
 } from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
 import { createLLMProvider, LLMError } from '@dmdoc/llm-provider';
-import { NotFoundError, QuotaExceededError, ValidationError, ForbiddenError, UpstreamServiceError } from '../errors/index.js';
+import { NotFoundError, QuotaExceededError, ValidationError, ForbiddenError, UpstreamServiceError, ConflictError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
@@ -855,31 +855,80 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const documentId = newId();
     const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
 
+    // Exceção FAILED da deduplicação (regra "Deduplicação de documentos por
+    // conteúdo"): se já existe um documento com o mesmo `contentHash` neste
+    // tenant mas em status FAILED, a dedup NÃO se aplica — criamos um NOVO
+    // documento e reenfileiramos. O índice único parcial
+    // `uniq_doc_tenant_content_hash (tenant_id, content_hash) WHERE deleted = false`
+    // impede duas linhas não-deletadas com o mesmo hash; por isso, ao reenviar
+    // um conteúdo FAILED, soft-deletamos o registro FAILED (liberando o índice)
+    // e inserimos o novo NA MESMA TRANSAÇÃO — antes disso o insert colidia
+    // (23505) e vazava como 500 (bug UPLOAD-14).
+    const reuploadOfFailed = existingDoc !== null && existingDoc.status === 'FAILED';
+
+    const insertPayload = {
+      id: documentId,
+      department_id: departmentId,
+      document_type_id: documentTypeId ?? null,
+      filename,
+      original_filename: originalFilename,
+      title: null,
+      suggested_title: null,
+      content_hash: contentHash,
+      size_bytes: BigInt(fileSize),
+      mime_type: mimeType,
+      s3_key: s3Key,
+      status: 'PENDING',
+      failure_reason: null,
+      tags: [],
+      index_values: indexValues as Record<string, string | number | null>,
+      uploaded_by_id: userId,
+      uploaded_at: new Date(),
+      processed_at: null,
+      cost_usd_cents: 0,
+    } as Omit<DocumentRow, 'id' | 'tenantId' | 'tenant_id' | 'deleted'>;
+
     let document: DocumentRow;
     try {
-      document = await repo.insertOne({
-        id: documentId,
-        department_id: departmentId,
-        document_type_id: documentTypeId ?? null,
-        filename,
-        original_filename: originalFilename,
-        title: null,
-        suggested_title: null,
-        content_hash: contentHash,
-        size_bytes: BigInt(fileSize),
-        mime_type: mimeType,
-        s3_key: s3Key,
-        status: 'PENDING',
-        failure_reason: null,
-        tags: [],
-        index_values: indexValues as Record<string, string | number | null>,
-        uploaded_by_id: userId,
-        uploaded_at: new Date(),
-        processed_at: null,
-        cost_usd_cents: 0,
-      } as Omit<DocumentRow, 'id' | 'tenantId' | 'tenant_id' | 'deleted'>);
+      if (reuploadOfFailed) {
+        document = await sql.begin(async (tx) => {
+          await tx`
+            UPDATE documents
+            SET deleted = true
+            WHERE tenant_id = ${tenantId}
+              AND content_hash = ${contentHash}
+              AND status = 'FAILED'
+              AND deleted = false
+          `;
+          const txRepo = new TenantRepository<DocumentRow>(tx as unknown as typeof sql, 'documents', { tenantId });
+          return txRepo.insertOne(insertPayload);
+        });
+      } else {
+        document = await repo.insertOne(insertPayload);
+      }
     } catch (insertError) {
-      // Rollback: remove arquivo do S3
+      // Corrida de deduplicação (UPLOAD-16): dois uploads do MESMO conteúdo novo
+      // passam pela checagem de dedup antes de qualquer um persistir; o índice
+      // único parcial `uniq_doc_tenant_content_hash (tenant_id, content_hash)
+      // WHERE deleted = false` garante que só um vença — o perdedor recebe 23505.
+      // Regra "Deduplicação de documentos por conteúdo" (caso de borda "upload
+      // concorrente do mesmo arquivo"): o perdedor é tratado como 409 Conflict
+      // (nunca 500). A integridade é preservada — apenas um documento persiste.
+      if ((insertError as { code?: string }).code === '23505') {
+        // NÃO remover o objeto do S3 aqui: a chave é derivada de
+        // (contentHash, filename) e, quando o vencedor subiu o mesmo arquivo
+        // com o mesmo nome, é a MESMA chave — apagá-la corromperia o documento
+        // vencedor. O conteúdo já está no S3 (upload idempotente). Um eventual
+        // objeto órfão (nomes de arquivo diferentes) é custo aceitável nesta
+        // corrida rara, preferível a arriscar apagar o arquivo do vencedor.
+        request.log.info(
+          { tenantId, userId, contentHash },
+          'colisão de deduplicação por corrida — perdedor tratado como 409'
+        );
+        throw new ConflictError('Conteúdo já existe nesta empresa (conflito de deduplicação por corrida)');
+      }
+
+      // Rollback: remove arquivo do S3 (erro de insert não relacionado à corrida).
       try {
         await app.s3.deleteFile(s3Key);
       } catch (deleteError) {

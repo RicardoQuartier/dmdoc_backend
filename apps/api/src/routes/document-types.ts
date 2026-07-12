@@ -319,40 +319,29 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       const accessibleDeptIds = await resolveAccessibleDepartmentIds(sql, userId, baseTenantId, role);
 
       if (accessibleDeptIds !== null) {
-        // UPLOADER/USER: filtra por departamentos acessíveis
-        // Tipos globais visíveis = aqueles com config cujos depts intersectem com os acessíveis
-        const globalConfigs = await sql<Array<{ global_type_id: string; department_ids: string[] }>>`
-          SELECT global_type_id, department_ids
-          FROM global_type_tenant_depts
-          WHERE tenant_id = ${baseTenantId}
-            AND deleted = false
+        // UPLOADER/USER — regra "Tipos de documento globais e por empresa"
+        // (Visibilidade por papel): SEMPRE veem TODOS os tipos GLOBAIS (que não
+        // têm associação com departamento e são visíveis a todos os papéis, sem
+        // restrição) + os tipos da EMPRESA cujos `departmentIds` intersectem a
+        // subárvore das raízes concedidas. Sem concessão (`accessibleDeptIds`
+        // vazio), a interseção com tipos de empresa é vazia e restam só os
+        // globais — comportamento documentado.
+        //
+        // NB: o escopo de tipos globais por departamento (`global_type_tenant_depts`)
+        // vale apenas para a visão POR DEPARTAMENTO (query param `departmentId`
+        // acima e catálogo de classificação por IA no worker), NÃO para esta
+        // lista geral. Gatear os globais por aquela config aqui era a causa da
+        // lista vazia para papéis não-admin.
+        rows = await sql<DocTypeRow[]>`
+          SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
+          FROM document_types
+          WHERE deleted = false
+            AND (
+              (is_global = true AND tenant_id IS NULL)
+              OR (tenant_id = ${baseTenantId} AND department_ids && ${accessibleDeptIds}::uuid[])
+            )
+          ORDER BY name ASC
         `;
-
-        const visibleGlobalIds = globalConfigs
-          .filter((c) => c.department_ids.some((id) => accessibleDeptIds.includes(id)))
-          .map((c) => c.global_type_id);
-
-        if (visibleGlobalIds.length > 0) {
-          rows = await sql<DocTypeRow[]>`
-            SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
-            FROM document_types
-            WHERE deleted = false
-              AND (
-                (is_global = true AND tenant_id IS NULL AND id = ANY(${visibleGlobalIds}::uuid[]))
-                OR (tenant_id = ${baseTenantId} AND department_ids && ${accessibleDeptIds}::uuid[])
-              )
-            ORDER BY name ASC
-          `;
-        } else {
-          rows = await sql<DocTypeRow[]>`
-            SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
-            FROM document_types
-            WHERE deleted = false
-              AND tenant_id = ${baseTenantId}
-              AND department_ids && ${accessibleDeptIds}::uuid[]
-            ORDER BY name ASC
-          `;
-        }
       } else {
         // Admins: veem todos os tipos do tenant + globais
         rows = await sql<DocTypeRow[]>`
@@ -412,6 +401,16 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
     const body = CreateDocumentTypeBodySchema.parse(request.body);
     const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
+
+    // Criar tipo GLOBAL é exclusivo do SUPER_ADMIN. Sem este gate, um
+    // TENANT_ADMIN com `isGlobal: true` escapava da validação de `departmentIds`
+    // (não exigida para globais) e caía adiante com `departmentIds` undefined,
+    // estourando a query → 500. Autorização deve responder 403 explícito antes
+    // de qualquer persistência (nenhum tipo global é criado por não-SA).
+    if (body.isGlobal && !isSuperAdmin) {
+      throw new ForbiddenError('Apenas SUPER_ADMIN pode criar tipos de documento globais');
+    }
+
     const { name, description, departmentIds } = body;
     const sql = app.db;
 
@@ -421,10 +420,17 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     if (isSuperAdmin && body.isGlobal) {
       const id = newId();
       const now = new Date();
-      await sql`
-        INSERT INTO document_types (id, tenant_id, name, description, is_global, created_at, department_ids, deleted)
-        VALUES (${id}, NULL, ${name}, ${description ?? null}, true, ${now}, NULL, false)
-      `;
+      try {
+        await sql`
+          INSERT INTO document_types (id, tenant_id, name, description, is_global, created_at, department_ids, deleted)
+          VALUES (${id}, NULL, ${name}, ${description ?? null}, true, ${now}, NULL, false)
+        `;
+      } catch (err: unknown) {
+        if ((err as { code?: string }).code === '23505') {
+          throw new ConflictError(`Já existe um tipo de documento global chamado "${name}"`);
+        }
+        throw err;
+      }
       request.log.info({ documentTypeId: id }, 'tipo de documento global criado');
       const enrichedGlobal = await enrichWithDepartments(
         { id, tenantId: null as unknown as string, name, description: description ?? null, isGlobal: true, createdAt: now, indexFields: [], deleted: false },
@@ -454,14 +460,25 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
     const repo = new TenantRepository<DocumentTypeDoc>(sql, 'document_types', { tenantId });
 
-    const inserted = (await repo.insertOne({
-      name,
-      description: description ?? null,
-      isGlobal: false,
-      createdAt: new Date(),
-      indexFields: [],
-      departmentIds: resolvedDeptIds,
-    })) as unknown as DocTypeRow;
+    let inserted: DocTypeRow;
+    try {
+      inserted = (await repo.insertOne({
+        name,
+        description: description ?? null,
+        isGlobal: false,
+        createdAt: new Date(),
+        indexFields: [],
+        departmentIds: resolvedDeptIds,
+      })) as unknown as DocTypeRow;
+    } catch (err: unknown) {
+      // Índice único (tenant_id, name) — nome do tipo é único dentro da empresa
+      // (regra "Tipos de documento globais e por empresa"). Mapeia a violação
+      // para 409 tratado em vez de vazar como 500.
+      if ((err as { code?: string }).code === '23505') {
+        throw new ConflictError(`Já existe um tipo de documento chamado "${name}" nesta empresa`);
+      }
+      throw err;
+    }
     const docType = rowToDocType(inserted, []);
 
     request.log.info({ tenantId, documentTypeId: docType.id }, 'tipo de documento criado');

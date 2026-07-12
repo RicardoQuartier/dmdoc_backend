@@ -445,3 +445,172 @@ describe('GET /document-types?departmentId — escopo por departamento', () => {
     expect(res.statusCode).toBe(404);
   });
 });
+
+// ---------------------------------------------------------------------------
+// GET /document-types — visibilidade por papel para UPLOADER/USER.
+// Regressão do bug b49115da (DOCTYPE-6/7): papéis não-admin recebiam lista
+// VAZIA — os tipos globais (sem associação de departamento, visíveis a todos
+// os papéis sem restrição) sumiam. Também cobre a interseção de tipos de
+// empresa pela subárvore concedida.
+// ---------------------------------------------------------------------------
+
+describe('GET /document-types — visibilidade para UPLOADER/USER', () => {
+  interface DocTypeItem {
+    id: string;
+    name: string;
+    isGlobal: boolean;
+  }
+
+  async function seedGlobalType(name: string): Promise<string> {
+    const rows = await testDb.db<Array<{ id: string }>>`
+      INSERT INTO document_types (id, tenant_id, name, description, is_global, index_fields, deleted, created_at)
+      VALUES (gen_random_uuid(), NULL, ${name}, NULL, true, '[]'::jsonb, false, NOW())
+      RETURNING id
+    `;
+    return rows[0]!.id;
+  }
+
+  async function grantRoot(userId: string, departmentId: string): Promise<void> {
+    await testDb.db`
+      INSERT INTO department_permissions (id, tenant_id, user_id, department_id, can_read, can_write, deleted)
+      VALUES (gen_random_uuid(), ${TENANT_A}, ${userId}, ${departmentId}, true, true, false)
+    `;
+  }
+
+  async function listTypes(token: string): Promise<DocTypeItem[]> {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/document-types',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(200);
+    return res.json() as DocTypeItem[];
+  }
+
+  it('USER sem concessão vê APENAS os tipos globais (nunca lista vazia)', async () => {
+    const globalId = await seedGlobalType('Boleto Global');
+    // Tipo de empresa existe, mas o USER não tem concessão de departamento.
+    await createDocType(tokenAdminA);
+
+    const userId = '11111111-1111-1111-1111-111111111101';
+    await seedUser(testDb.db, {
+      id: userId,
+      tenantId: TENANT_A,
+      email: 'user-a@doctypes.com',
+      password: PASSWORD,
+      role: 'USER',
+    });
+    const token = await login('user-a@doctypes.com');
+
+    const types = await listTypes(token);
+    expect(types.map((t) => t.id)).toEqual([globalId]);
+    expect(types.every((t) => t.isGlobal)).toBe(true);
+  });
+
+  it('UPLOADER com raiz concedida vê globais + tipos de empresa com interseção', async () => {
+    const globalId = await seedGlobalType('Contrato Global');
+    const companyTypeId = await createDocType(tokenAdminA); // escopado a [deptAId]
+
+    const uploaderId = '11111111-1111-1111-1111-111111111102';
+    await seedUser(testDb.db, {
+      id: uploaderId,
+      tenantId: TENANT_A,
+      email: 'uploader-a@doctypes.com',
+      password: PASSWORD,
+      role: 'UPLOADER',
+    });
+    await grantRoot(uploaderId, deptAId);
+    const token = await login('uploader-a@doctypes.com');
+
+    const types = await listTypes(token);
+    const ids = types.map((t) => t.id);
+    expect(ids).toContain(globalId);
+    expect(ids).toContain(companyTypeId);
+  });
+
+  it('UPLOADER sem concessão vê os globais mas NÃO tipos de empresa', async () => {
+    const globalId = await seedGlobalType('Nota Fiscal Global');
+    const companyTypeId = await createDocType(tokenAdminA);
+
+    const uploaderId = '11111111-1111-1111-1111-111111111103';
+    await seedUser(testDb.db, {
+      id: uploaderId,
+      tenantId: TENANT_A,
+      email: 'uploader-b@doctypes.com',
+      password: PASSWORD,
+      role: 'UPLOADER',
+    });
+    const token = await login('uploader-b@doctypes.com');
+
+    const types = await listTypes(token);
+    const ids = types.map((t) => t.id);
+    expect(ids).toContain(globalId);
+    expect(ids).not.toContain(companyTypeId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /document-types — autorização e conflito de nome.
+// Regressão dos bugs c138ef7c (nome duplicado → 500) e 7322a256 (TENANT_ADMIN
+// criando tipo global → 500). Ambos devem ser erros de domínio tratados.
+// ---------------------------------------------------------------------------
+
+describe('POST /document-types — autorização e unicidade de nome', () => {
+  it('nome duplicado no mesmo tenant → 409 CONFLICT (nunca 500)', async () => {
+    const first = await app.inject({
+      method: 'POST',
+      url: '/document-types',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { name: 'Recibo', isGlobal: false, departmentIds: [deptAId] },
+    });
+    expect(first.statusCode).toBe(201);
+
+    const dup = await app.inject({
+      method: 'POST',
+      url: '/document-types',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { name: 'Recibo', isGlobal: false, departmentIds: [deptAId] },
+    });
+    expect(dup.statusCode).toBe(409);
+    expect((dup.json() as { error: { code: string } }).error.code).toBe('CONFLICT');
+  });
+
+  it('TENANT_ADMIN criando tipo global (isGlobal:true) → 403, sem persistir nada', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/document-types',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { name: 'Tipo Global Ilegal', isGlobal: true },
+    });
+    expect(res.statusCode).toBe(403);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('FORBIDDEN');
+
+    // Nenhum tipo global foi criado (sem escalonamento de privilégio).
+    const rows = await testDb.db<Array<{ count: string }>>`
+      SELECT COUNT(*) AS count FROM document_types
+      WHERE is_global = true AND name = 'Tipo Global Ilegal'
+    `;
+    expect(parseInt(rows[0]!.count, 10)).toBe(0);
+  });
+
+  it('SUPER_ADMIN pode criar tipo global (controle) → 201', async () => {
+    const superId = '11111111-1111-1111-1111-1111111111ff';
+    await seedUser(testDb.db, {
+      id: superId,
+      tenantId: null,
+      email: 'super@doctypes.com',
+      password: PASSWORD,
+      role: 'SUPER_ADMIN',
+    });
+    const token = await login('super@doctypes.com');
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/document-types',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { name: 'Tipo Global Legítimo', isGlobal: true },
+    });
+    expect(res.statusCode).toBe(201);
+    expect((res.json() as { isGlobal: boolean }).isGlobal).toBe(true);
+  });
+});

@@ -4,5 +4,6 @@ export { UnauthorizedError } from './UnauthorizedError.js';
 export { ForbiddenError } from './ForbiddenError.js';
 export { ConflictError } from './ConflictError.js';
 export { QuotaExceededError } from './QuotaExceededError.js';
+export { RateLimitError } from './RateLimitError.js';
 export { ValidationError } from './ValidationError.js';
 export { UpstreamServiceError } from './UpstreamServiceError.js';

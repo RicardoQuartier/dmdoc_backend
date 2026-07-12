@@ -6,7 +6,7 @@ import type { Queue } from 'bullmq';
 import { baseLoggerOptions } from '@dmdoc/logger';
 import { createPgClient, type Sql } from '@dmdoc/db-pg';
 import { getConfig, type Config } from './config.js';
-import { AppError } from './errors/index.js';
+import { AppError, RateLimitError } from './errors/index.js';
 import { authPlugin } from './plugins/auth.js';
 import { rateLimitPlugin } from './plugins/rate-limit.js';
 import { authRoutes } from './routes/auth.js';
@@ -231,6 +231,13 @@ function registerErrorHandler(app: FastifyInstance): void {
   app.setErrorHandler((error: FastifyError, request, reply) => {
     if (error instanceof AppError) {
       request.log.info({ err: error, code: error.code }, 'erro de domínio tratado');
+      // Rate limit (429): expõe `retryAfterMs` no corpo, complementando os
+      // headers `x-ratelimit-*`/`retry-after` do @fastify/rate-limit.
+      if (error instanceof RateLimitError) {
+        return reply.status(error.statusCode).send({
+          error: { code: error.code, message: error.message, retryAfterMs: error.retryAfterMs },
+        });
+      }
       return reply.status(error.statusCode).send({
         error: { code: error.code, message: error.message },
       });
