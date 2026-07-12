@@ -5,7 +5,7 @@ import { TenantRepository, assertUserScopeInvariant, validateUserDocument } from
 import type { User, Role } from '@dmdoc/shared-types';
 import { ADMIN_ROLES, ROLE_LEVEL, isGlobalRole } from '@dmdoc/shared-types';
 import type { TenantDocument } from '@dmdoc/db-pg';
-import { ConflictError, ForbiddenError, NotFoundError } from '../errors/index.js';
+import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../errors/index.js';
 import { requireRole, requireCanManageRole } from '../auth/role-guard.js';
 import { hashPassword } from '../auth/password.js';
 import { resolveTenantContext, resolveTenantId } from '../auth/resolve-tenant.js';
@@ -21,30 +21,43 @@ interface UserDoc extends TenantDocument {
   allowedTenantIds?: string[];
 }
 
-const CreateUserBodySchema = z.object({
-  email: z.string().email(),
-  name: z.string().min(1).max(200),
-  role: z.enum(['SUPER_ADMIN', 'MULTI_TENANT_ADMIN', 'TENANT_ADMIN', 'UPLOADER', 'USER']),
-  password: z.string().min(8),
-  active: z.boolean().default(true),
-  tenantId: z.string().uuid().optional(),
-  allowedTenantIds: z
-    .array(z.string().uuid())
-    .max(20, 'MULTI_TENANT_ADMIN suporta no máximo 20 tenants no MVP')
-    .optional(),
-});
+// `.strict()`: POST /users rejeita qualquer chave desconhecida no corpo, em vez
+// de descartá-la silenciosamente — mesmo tratamento fail-loud do PATCH. Isso
+// fecha a porta a perda silenciosa de dados na criação (ex.: `departmentPermissions`,
+// que não é gerido na criação — ver guarda explícita no handler POST e o caminho
+// canônico PUT /users/:id/permissions).
+const CreateUserBodySchema = z
+  .object({
+    email: z.string().email(),
+    name: z.string().min(1).max(200),
+    role: z.enum(['SUPER_ADMIN', 'MULTI_TENANT_ADMIN', 'TENANT_ADMIN', 'UPLOADER', 'USER']),
+    password: z.string().min(8),
+    active: z.boolean().default(true),
+    tenantId: z.string().uuid().optional(),
+    allowedTenantIds: z
+      .array(z.string().uuid())
+      .max(20, 'MULTI_TENANT_ADMIN suporta no máximo 20 tenants no MVP')
+      .optional(),
+  })
+  .strict();
 
-const PatchUserBodySchema = z.object({
-  name: z.string().min(1).max(200).optional(),
-  role: z
-    .enum(['SUPER_ADMIN', 'MULTI_TENANT_ADMIN', 'TENANT_ADMIN', 'UPLOADER', 'USER'])
-    .optional(),
-  active: z.boolean().optional(),
-  allowedTenantIds: z
-    .array(z.string().uuid())
-    .max(20, 'MULTI_TENANT_ADMIN suporta no máximo 20 tenants no MVP')
-    .optional(),
-});
+// `.strict()`: PATCH /users rejeita qualquer chave desconhecida no corpo, em vez
+// de descartá-la silenciosamente. Isso fecha a porta a perda silenciosa de dados
+// (ex.: `departmentPermissions`, que não é gerido por esta rota — ver guarda
+// explícita no handler PATCH e o caminho canônico PUT /users/:id/permissions).
+const PatchUserBodySchema = z
+  .object({
+    name: z.string().min(1).max(200).optional(),
+    role: z
+      .enum(['SUPER_ADMIN', 'MULTI_TENANT_ADMIN', 'TENANT_ADMIN', 'UPLOADER', 'USER'])
+      .optional(),
+    active: z.boolean().optional(),
+    allowedTenantIds: z
+      .array(z.string().uuid())
+      .max(20, 'MULTI_TENANT_ADMIN suporta no máximo 20 tenants no MVP')
+      .optional(),
+  })
+  .strict();
 
 const ResetPasswordBodySchema = z.object({
   newPassword: z.string().min(8),
@@ -103,6 +116,17 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
    */
   app.post('/users', { preHandler: app.authenticate }, async (request, reply) => {
     requireRole(request, ...ADMIN_ROLES);
+
+    // Guarda explícita: permissões de departamento NÃO são geridas na criação.
+    // Sem ela, o `.strict()` daria apenas a mensagem genérica "Unrecognized key(s)".
+    // O caminho canônico para conceder/revogar raízes é PUT /users/:id/permissions,
+    // aplicado APÓS a criação. Ver wiki "Permissões por departamento (ACL)".
+    const rawBody = request.body as Record<string, unknown> | null;
+    if (rawBody && 'departmentPermissions' in rawBody) {
+      throw new ValidationError(
+        'Permissões de departamento não são geridas na criação de usuário. Use PUT /users/:id/permissions após criar.',
+      );
+    }
 
     const body = CreateUserBodySchema.parse(request.body);
     const sql = app.db;
@@ -367,6 +391,18 @@ export const usersRoutes: FastifyPluginAsync = async (app) => {
     requireRole(request, ...ADMIN_ROLES);
 
     const { id } = z.object({ id: z.string() }).parse(request.params);
+
+    // Guarda explícita: permissões de departamento NÃO são geridas por esta rota.
+    // Sem ela, o `.strict()` daria apenas a mensagem genérica "Unrecognized key(s)".
+    // O caminho canônico e único para conceder/revogar raízes é
+    // PUT /users/:id/permissions. Ver wiki "Permissões por departamento (ACL)".
+    const rawBody = request.body as Record<string, unknown> | null;
+    if (rawBody && 'departmentPermissions' in rawBody) {
+      throw new ValidationError(
+        'Permissões de departamento não são geridas por PATCH /users. Use PUT /users/:id/permissions.',
+      );
+    }
+
     const updates = PatchUserBodySchema.parse(request.body);
     const sql = app.db;
 
