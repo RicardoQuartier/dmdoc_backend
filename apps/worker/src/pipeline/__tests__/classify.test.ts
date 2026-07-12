@@ -89,7 +89,11 @@ describe('classifyDocument — decisão da etapa de classificação (Fase 8)', (
 
     const outcome = await classifyDocument(makeParams(), makeDeps());
 
-    expect(outcome).toEqual({ typeSuggestion: null, classificationUsd: 0 });
+    expect(outcome).toEqual({
+      typeSuggestion: null,
+      suggestedTitle: null,
+      classificationUsd: 0,
+    });
     // Não resolve catálogo nem chama o LLM quando pulada.
     expect(resolveDepartmentDocumentTypeCatalogMock).not.toHaveBeenCalled();
     expect(classifyDocumentTypeMock).not.toHaveBeenCalled();
@@ -132,6 +136,63 @@ describe('classifyDocument — decisão da etapa de classificação (Fase 8)', (
     );
   });
 
+  it('propaga o suggestedTitle do service para o outcome (Fase 8.1)', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValue({
+      classificationEnabled: true,
+      titleSuggestionEnabled: true,
+      indexSuggestionEnabled: false,
+    });
+    resolveDepartmentDocumentTypeCatalogMock.mockResolvedValue([
+      { id: 'type-1', name: 'Contrato', description: null },
+    ]);
+    // O service já aplica a máscara de flags — aqui devolve um título.
+    classifyDocumentTypeMock.mockResolvedValue({
+      documentTypeId: 'type-1',
+      documentTypeName: 'Contrato',
+      confidence: 0.9,
+      suggestedTitle: 'Contrato de Prestação de Serviços — Empresa X',
+      model: 'gpt-4o-mini',
+      promptVersion: 'classify-document-type-v1',
+      usage: { promptTokens: 500, completionTokens: 20, totalTokens: 520, costUsd: 0.001 },
+      rawResponse: {},
+    });
+
+    const outcome = await classifyDocument(makeParams(), makeDeps());
+
+    // O outcome carrega o título sugerido tal como o service o devolveu.
+    expect(outcome.suggestedTitle).toBe('Contrato de Prestação de Serviços — Empresa X');
+    // Tipo e título viajam juntos no mesmo outcome.
+    expect(outcome.typeSuggestion?.documentTypeId).toBe('type-1');
+  });
+
+  it('propaga suggestedTitle null quando a feature de título está desligada', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValue({
+      classificationEnabled: true,
+      titleSuggestionEnabled: false,
+      indexSuggestionEnabled: false,
+    });
+    resolveDepartmentDocumentTypeCatalogMock.mockResolvedValue([
+      { id: 'type-1', name: 'Contrato', description: null },
+    ]);
+    // Com titleSuggestionEnabled=false o service já mascara o título para null.
+    classifyDocumentTypeMock.mockResolvedValue({
+      documentTypeId: 'type-1',
+      documentTypeName: 'Contrato',
+      confidence: 0.9,
+      suggestedTitle: null,
+      model: 'gpt-4o-mini',
+      promptVersion: 'classify-document-type-v1',
+      usage: { promptTokens: 500, completionTokens: 20, totalTokens: 520, costUsd: 0.001 },
+      rawResponse: {},
+    });
+
+    const outcome = await classifyDocument(makeParams(), makeDeps());
+
+    expect(outcome.suggestedTitle).toBeNull();
+    // Tipo continua sugerido — só o título foi mascarado.
+    expect(outcome.typeSuggestion?.documentTypeId).toBe('type-1');
+  });
+
   it('persiste "nenhum tipo" (id null, confiança baixa) quando o LLM não identifica tipo', async () => {
     resolveAiFeatureFlagsMock.mockResolvedValue({
       classificationEnabled: true,
@@ -158,6 +219,7 @@ describe('classifyDocument — decisão da etapa de classificação (Fase 8)', (
     expect(outcome.typeSuggestion).not.toBeNull();
     expect(outcome.typeSuggestion?.documentTypeId).toBeNull();
     expect(outcome.typeSuggestion?.confidence).toBe(0);
+    expect(outcome.suggestedTitle).toBeNull();
     expect(outcome.classificationUsd).toBe(0.0008);
   });
 
@@ -199,7 +261,11 @@ describe('classifyDocument — decisão da etapa de classificação (Fase 8)', (
 
     const outcome = await classifyDocument(makeParams(), makeDeps());
 
-    expect(outcome).toEqual({ typeSuggestion: null, classificationUsd: 0 });
+    expect(outcome).toEqual({
+      typeSuggestion: null,
+      suggestedTitle: null,
+      classificationUsd: 0,
+    });
   });
 
   it('é best-effort: erro ao resolver flags não relança e devolve sem sugestão', async () => {
@@ -207,7 +273,11 @@ describe('classifyDocument — decisão da etapa de classificação (Fase 8)', (
 
     const outcome = await classifyDocument(makeParams(), makeDeps());
 
-    expect(outcome).toEqual({ typeSuggestion: null, classificationUsd: 0 });
+    expect(outcome).toEqual({
+      typeSuggestion: null,
+      suggestedTitle: null,
+      classificationUsd: 0,
+    });
     expect(classifyDocumentTypeMock).not.toHaveBeenCalled();
   });
 });

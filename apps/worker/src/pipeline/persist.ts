@@ -16,6 +16,16 @@ export interface PersistParams {
    * `null` quando a etapa de classificação foi pulada (features off) ou falhou.
    */
   typeSuggestion: TypeSuggestion | null;
+  /**
+   * Título de exibição sugerido pela IA (Fase 8.1) a gravar em
+   * `documents.suggested_title`. `null` quando a classificação foi pulada/falhou,
+   * quando a feature de título está desligada ou quando o LLM não inferiu título.
+   *
+   * INVARIANTE: o worker grava APENAS `suggested_title` — NUNCA toca a coluna
+   * `title` (o título confirmado pelo usuário). Reprocessar sobrescreve a
+   * sugestão (inclusive para `null`), mas jamais altera o título confirmado.
+   */
+  suggestedTitle: string | null;
   /** Custo em USD da(s) chamada(s) de LLM da classificação (0 se não houve). */
   classificationUsd: number;
   pipelineStartedAt: Date;
@@ -51,6 +61,7 @@ export async function persistProcessingResult(
     embeddedChunks,
     totalEmbeddingsUsd,
     typeSuggestion,
+    suggestedTitle,
     classificationUsd,
     pipelineStartedAt,
   } = params;
@@ -158,12 +169,19 @@ export async function persistProcessingResult(
 
   log.debug('document_content atualizado');
 
-  // 4. Atualizar documento para READY
+  // 4. Atualizar documento para READY.
+  //    INVARIANTE (wiki "Título de exibição sugerido por IA"): o worker grava
+  //    APENAS `suggested_title` — a coluna `title` (título confirmado pelo
+  //    usuário) NUNCA é tocada aqui. `suggested_title` é text simples (não
+  //    jsonb): interpolado direto, sem `sql.json`/`JSON.stringify`. `null`
+  //    sobrescreve qualquer sugestão anterior no reprocessamento (idempotência
+  //    coerente com `type_suggestion`).
   await sql`
     UPDATE documents
-    SET status         = 'READY',
-        processed_at   = now(),
-        cost_usd_cents = ${costUsdCents}
+    SET status          = 'READY',
+        processed_at    = now(),
+        cost_usd_cents  = ${costUsdCents},
+        suggested_title = ${suggestedTitle}
     WHERE id        = ${documentId}
       AND tenant_id = ${tenantId}
   `;
@@ -200,6 +218,7 @@ export async function persistProcessingResult(
       totalEmbeddingsUsd: totalEmbeddingsUsd.toFixed(6),
       classificationUsd: classificationUsd.toFixed(6),
       typeSuggestionPersisted: typeSuggestion !== null,
+      suggestedTitlePersisted: suggestedTitle !== null,
       durationMs,
     },
     'pipeline concluído — documento READY'

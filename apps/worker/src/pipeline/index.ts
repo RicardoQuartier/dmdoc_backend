@@ -110,15 +110,16 @@ export async function runPipeline(
     // Roda logo após a extração (usa `extractResult.fullText`) e NUNCA derruba
     // o pipeline: erro/skip retornam sugestão null sem interromper as etapas
     // seguintes. NÃO toca em `documents.document_type_id` (escolha manual).
-    const { typeSuggestion, classificationUsd } = await classifyDocument(
-      {
-        tenantId,
-        documentId,
-        departmentId,
-        fullText: extractResult.fullText,
-      },
-      { sql, llmProvider, chatModel, logger: log }
-    );
+    const { typeSuggestion, suggestedTitle, classificationUsd } =
+      await classifyDocument(
+        {
+          tenantId,
+          documentId,
+          departmentId,
+          fullText: extractResult.fullText,
+        },
+        { sql, llmProvider, chatModel, logger: log }
+      );
 
     // Etapa 3: Chunking semântico
     log.info({ fullTextLength: extractResult.fullText.length }, 'iniciando chunking');
@@ -149,6 +150,7 @@ export async function runPipeline(
         embeddedChunks,
         totalEmbeddingsUsd,
         typeSuggestion,
+        suggestedTitle,
         classificationUsd,
         pipelineStartedAt,
       },

@@ -44,11 +44,20 @@ export interface ClassifyDocumentDeps {
  */
 export interface ClassifyDocumentOutcome {
   typeSuggestion: TypeSuggestion | null;
+  /**
+   * Título de exibição sugerido pela IA (Fase 8.1), já mascarado por
+   * `titleSuggestionEnabled` dentro do service. `null` quando a etapa foi
+   * pulada/falhou, quando a feature de título está desligada ou quando o LLM
+   * não conseguiu inferir um título. Persistido em `documents.suggested_title`
+   * — CONSULTIVO: exige confirmação do usuário e nunca sobrescreve o `title`.
+   */
+  suggestedTitle: string | null;
   classificationUsd: number;
 }
 
 const NO_SUGGESTION: ClassifyDocumentOutcome = {
   typeSuggestion: null,
+  suggestedTitle: null,
   classificationUsd: 0,
 };
 
@@ -142,11 +151,16 @@ export async function classifyDocument(
         promptTokens: result.usage.promptTokens,
         completionTokens: result.usage.completionTokens,
         classificationUsd: result.usage.costUsd.toFixed(6),
+        hasSuggestedTitle: result.suggestedTitle !== null,
       },
       'classificação concluída'
     );
 
-    return { typeSuggestion, classificationUsd: result.usage.costUsd };
+    return {
+      typeSuggestion,
+      suggestedTitle: result.suggestedTitle,
+      classificationUsd: result.usage.costUsd,
+    };
   } catch (err: unknown) {
     // Best-effort: classificação NUNCA derruba o pipeline. Loga e segue sem
     // sugestão — o documento ainda vira READY com extração e embeddings.

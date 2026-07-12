@@ -20,6 +20,13 @@ export type DocumentStatus = z.infer<typeof DocumentStatusSchema>;
  * Invariantes:
  * - `(tenantId, contentHash)` é único (deduplicação por SHA-256 do arquivo).
  * - `documentTypeId` é nulo quando o usuário não classificou o documento ainda.
+ * - `title` é o título de exibição CONFIRMADO/editado pelo usuário (Fase 8.1).
+ *   Nulo até haver confirmação; enquanto nulo, listagens e telas exibem
+ *   `originalFilename` como fallback. Independente de `originalFilename`.
+ * - `suggestedTitle` é a sugestão BRUTA de título gerada pela IA — consultiva,
+ *   nunca exibida como título oficial. Reprocessar sobrescreve `suggestedTitle`,
+ *   mas NUNCA toca o `title` já confirmado. `originalFilename` permanece
+ *   imutável (atrelado ao arquivo físico) e nenhuma sugestão de IA o substitui.
  * - `mongoContentId` aponta para o `_id` do documento na coleção
  *   `document_content` — preenchido após a extração de texto pelo worker.
  * - `indexValues` é um mapa aberto: chaves correspondem ao `name` dos campos
@@ -36,6 +43,8 @@ export const DocumentSchema = z.object({
   documentTypeId: z.string().uuid().nullable(),
   filename: z.string().min(1).max(500),
   originalFilename: z.string().min(1).max(500),
+  title: z.string().nullable(),
+  suggestedTitle: z.string().nullable(),
   contentHash: z.string().length(64), // SHA-256 hex
   sizeBytes: z.number().int().nonnegative(),
   mimeType: z.string().min(1).max(200),

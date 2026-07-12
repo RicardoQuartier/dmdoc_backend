@@ -319,6 +319,12 @@ export const documents = pgTable(
     documentTypeId: uuid('document_type_id').references(() => documentTypes.id),
     filename: text('filename').notNull(),
     originalFilename: text('original_filename').notNull(),
+    // Título de exibição confirmado/editado pelo usuário (Fase 8.1). Nulo até a
+    // confirmação; enquanto nulo, o fallback de exibição é `originalFilename`.
+    title: text('title'),
+    // Sugestão bruta de título gerada pela IA (Fase 8.1). Consultiva: nunca é
+    // exibida como título oficial. Reprocessar sobrescreve; nunca toca `title`.
+    suggestedTitle: text('suggested_title'),
     contentHash: text('content_hash').notNull(), // SHA-256 hex, 64 chars
     sizeBytes: bigint('size_bytes', { mode: 'bigint' }).notNull(),
     mimeType: text('mime_type').notNull(),

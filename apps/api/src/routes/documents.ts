@@ -22,6 +22,8 @@ import type {
 import {
   DocumentProcessingJobDataSchema,
   PublicTypeSuggestionSchema,
+  ROLE_LEVEL,
+  RoleSchema,
 } from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
 import { createLLMProvider, LLMError } from '@dmdoc/llm-provider';
@@ -60,6 +62,8 @@ interface DocumentRow extends TenantDocument {
   document_type_id: string | null;
   filename: string;
   original_filename: string;
+  title: string | null;
+  suggested_title: string | null;
   content_hash: string;
   size_bytes: bigint;
   mime_type: string;
@@ -184,6 +188,10 @@ const ListDocumentsQuerySchema = z.object({
 /** Schema do body do PATCH /documents/:id. */
 const PatchDocumentBodySchema = z.object({
   documentTypeId: z.string().uuid().nullable().optional(),
+  // Título de exibição confirmado/editado pelo usuário (Fase 8.1).
+  // string = confirma/edita o título; `null` explícito = limpa o título
+  // confirmado (volta ao fallback `originalFilename`); ausente = não mexe.
+  title: z.string().min(1).max(500).nullable().optional(),
   indexValues: z.record(z.union([z.string(), z.number(), z.null()])).optional(),
   tags: z.array(z.string()).optional(),
 });
@@ -320,7 +328,20 @@ async function assertCanReadDepartment(
 /**
  * Valida se o usuário pode ESCREVER em um departamento específico.
  *
- * Lança `NotFoundError` se sem permissão.
+ * Duas camadas de controle, nesta ordem:
+ *   1. GATE POR PAPEL — a CAPACIDADE de escrita exige nível >= UPLOADER (40).
+ *      USER (20) é somente leitura por definição (wiki "Papéis de acesso
+ *      (roles)"): mesmo com uma raiz concedida ativa (que lhe dá leitura da
+ *      subárvore), NUNCA pode escrever. Papel desconhecido/inválido cai como
+ *      SEM escrita (fail-closed). Cobre uniformemente PATCH/DELETE/reprocess/
+ *      suggest-indexes — todos passam por este choke point.
+ *   2. ACL POR DEPARTAMENTO — para papéis com capacidade de escrita, o
+ *      departamento precisa estar no conjunto acessível (subárvore concedida)
+ *      ou o papel ser admin (sem restrição de ACL).
+ *
+ * Lança `NotFoundError` (nunca 403 — spec §10, invariante 4) se sem permissão,
+ * com a mesma mensagem em ambas as camadas para não vazar a existência do
+ * recurso a quem não pode escrever nele.
  */
 async function assertCanWriteDepartment(
   sql: Sql,
@@ -329,6 +350,15 @@ async function assertCanWriteDepartment(
   departmentId: string,
   role: string
 ): Promise<void> {
+  // Camada 1: gate por nível de papel (fail-closed).
+  // O role vem do JWT já validado, mas mantemos a checagem type-safe: um papel
+  // não reconhecido resolve para nível 0 e é negado, nunca liberado.
+  const parsedRole = RoleSchema.safeParse(role);
+  const roleLevel = parsedRole.success ? ROLE_LEVEL[parsedRole.data] : 0;
+  if (roleLevel < ROLE_LEVEL.UPLOADER) {
+    throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
+  }
+
   const accessible = await resolveAccessibleDepartmentIds(sql, userId, tenantId, role);
   if (accessible === null) {
     // Admin sem restrição de ACL: verifica apenas que o dept pertence ao tenant.
@@ -378,6 +408,8 @@ function rowToDocument(r: DocumentRow): Record<string, unknown> {
     documentTypeId: r.document_type_id,
     filename: r.filename,
     originalFilename: r.original_filename,
+    title: r.title,
+    suggestedTitle: r.suggested_title,
     contentHash: r.content_hash,
     sizeBytes: Number(r.size_bytes),
     mimeType: r.mime_type,
@@ -831,6 +863,8 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         document_type_id: documentTypeId ?? null,
         filename,
         original_filename: originalFilename,
+        title: null,
+        suggested_title: null,
         content_hash: contentHash,
         size_bytes: BigInt(fileSize),
         mime_type: mimeType,
@@ -1541,6 +1575,9 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
 
     if ('documentTypeId' in body) {
       updateData.document_type_id = body.documentTypeId ?? null;
+    }
+    if ('title' in body) {
+      updateData.title = body.title ?? null;
     }
     if (body.indexValues !== undefined) {
       updateData.index_values = body.indexValues as Record<string, string | number | null>;

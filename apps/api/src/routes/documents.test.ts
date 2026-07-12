@@ -730,6 +730,386 @@ describe('ACL por raiz — herança dinâmica de acesso à subárvore', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Regressão de SEGURANÇA: concessão de departamento REVOGADA (soft-deletada)
+// não pode mais conceder acesso de leitura NEM de escrita a documentos.
+// Ver bug 0b4b4345: o resolvedor de acesso ignorava `department_permissions.deleted`.
+// ---------------------------------------------------------------------------
+describe('ACL — concessão revogada (department_permissions.deleted=true) não dá acesso', () => {
+  /** Cria um documento READY no departamento/tenant informado. Retorna o id. */
+  async function seedReadyDoc(departmentId: string, tenantId: string): Promise<string> {
+    const docId = newId();
+    const hash = crypto.randomBytes(32).toString('hex');
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${tenantId}, ${departmentId}, NULL,
+        'acl.pdf', 'acl.pdf', ${hash}, 1024, 'application/pdf',
+        ${`tenants/${tenantId}/documents/${hash}/acl.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NOW(), 0, false
+      )
+    `;
+    return docId;
+  }
+
+  /**
+   * Cria um usuário no TENANT_A e devolve id + token. Papel `USER` por padrão;
+   * aceita `UPLOADER` para os casos que exercitam a capacidade de escrita.
+   */
+  async function seedUserWithToken(
+    email: string,
+    role: 'USER' | 'UPLOADER' = 'USER'
+  ): Promise<{ id: string; token: string }> {
+    const id = newId();
+    await seedUser(testDb.db, {
+      id,
+      tenantId: TENANT_A,
+      email,
+      password: PASSWORD,
+      role,
+    });
+    const token = await login(email);
+    return { id, token };
+  }
+
+  it('USER com concessão SOFT-DELETED: GET /documents → 200 com lista VAZIA', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const { id: userId, token } = await seedUserWithToken('user-revogado-list@empresa.com');
+
+    // Concessão na raiz DEPT_A_ID, porém REVOGADA (deleted=true).
+    await testDb.db`
+      INSERT INTO department_permissions (id, tenant_id, user_id, department_id, can_read, can_write, deleted)
+      VALUES (${newId()}, ${TENANT_A}, ${userId}, ${DEPT_A_ID}, true, true, true)
+    `;
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/documents',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json().items as Array<{ id: string }>).map((d) => d.id);
+    expect(ids).not.toContain(docId);
+    expect(ids).toHaveLength(0);
+  });
+
+  it('USER com concessão SOFT-DELETED: GET /documents/:id → 404', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const { id: userId, token } = await seedUserWithToken('user-revogado-get@empresa.com');
+
+    await testDb.db`
+      INSERT INTO department_permissions (id, tenant_id, user_id, department_id, can_read, can_write, deleted)
+      VALUES (${newId()}, ${TENANT_A}, ${userId}, ${DEPT_A_ID}, true, true, true)
+    `;
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+  });
+
+  it('USER com concessão SOFT-DELETED: PATCH /documents/:id → 404 e NÃO persiste', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const { id: userId, token } = await seedUserWithToken('user-revogado-patch@empresa.com');
+
+    await testDb.db`
+      INSERT INTO department_permissions (id, tenant_id, user_id, department_id, can_read, can_write, deleted)
+      VALUES (${newId()}, ${TENANT_A}, ${userId}, ${DEPT_A_ID}, true, true, true)
+    `;
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { title: 'USER revogado nao deveria editar' },
+    });
+
+    expect(res.statusCode).toBe(404);
+
+    // O título NÃO foi persistido no banco.
+    const rows = await testDb.db<Array<{ title: string | null }>>`
+      SELECT title FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]?.title ?? null).toBeNull();
+  });
+
+  it('CONTRASTE: USER com concessão ATIVA LÊ normalmente (leitura preservada)', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const { id: userId, token } = await seedUserWithToken('user-ativo@empresa.com');
+
+    // Concessão ATIVA na raiz DEPT_A_ID (deleted=false).
+    await testDb.db`
+      INSERT INTO department_permissions (id, tenant_id, user_id, department_id, can_read, can_write, deleted)
+      VALUES (${newId()}, ${TENANT_A}, ${userId}, ${DEPT_A_ID}, true, true, false)
+    `;
+
+    // GET lista contém o documento
+    const listRes = await app.inject({
+      method: 'GET',
+      url: '/documents',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(listRes.statusCode).toBe(200);
+    const ids = (listRes.json().items as Array<{ id: string }>).map((d) => d.id);
+    expect(ids).toContain(docId);
+
+    // GET detalhe → 200
+    const getRes = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(getRes.statusCode).toBe(200);
+  });
+
+  it('INVARIANTE: concessão ATIVA + DEPARTAMENTO soft-deletado → órfão continua acessível/gravável para UPLOADER', async () => {
+    // Prova que os dois `deleted` são distintos: revogar a CONCESSÃO tira acesso,
+    // mas soft-deletar o DEPARTAMENTO preserva o acesso de quem tem a raiz concedida.
+    // A capacidade de ESCRITA aqui exige >= UPLOADER (USER seria somente leitura).
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const { id: userId, token } = await seedUserWithToken(
+      'uploader-ativo-dept-excluido@empresa.com',
+      'UPLOADER'
+    );
+
+    await testDb.db`
+      INSERT INTO department_permissions (id, tenant_id, user_id, department_id, can_read, can_write, deleted)
+      VALUES (${newId()}, ${TENANT_A}, ${userId}, ${DEPT_A_ID}, true, true, false)
+    `;
+
+    // Soft-delete do DEPARTAMENTO (não da concessão).
+    await testDb.db`UPDATE departments SET deleted = true WHERE id = ${DEPT_A_ID}`;
+
+    // Documento órfão continua acessível para quem tem a raiz concedida ativa.
+    const getRes = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(getRes.statusCode).toBe(200);
+    expect(getRes.json().id).toBe(docId);
+
+    const patchRes = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { title: 'orfao editavel' },
+    });
+    expect(patchRes.statusCode).toBe(200);
+  });
+
+  it('SANITY: USER sem NENHUMA concessão no departamento → GET/:id 404 (segue passando)', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const { token } = await seedUserWithToken('user-sem-concessao@empresa.com');
+    // Nenhuma linha em department_permissions para este usuário.
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Papel USER é SOMENTE LEITURA — gate de escrita por nível de papel.
+//
+// Wiki "Papéis de acesso (roles)": USER = apenas leitura e busca. Mesmo com uma
+// raiz concedida ATIVA (que lhe dá leitura da subárvore), o USER NUNCA pode
+// escrever: PATCH/DELETE/reprocess/suggest-indexes → 404 (mesma mensagem/erro
+// de "sem permissão de escrita", nunca 403 — spec §10, invariante 4). A escrita
+// exige nível >= UPLOADER. Ver assertCanWriteDepartment (routes/documents.ts).
+// ---------------------------------------------------------------------------
+describe('Papel USER é somente leitura — gate de escrita de documentos por papel', () => {
+  /** Cria um documento READY no departamento/tenant informado. Retorna o id. */
+  async function seedReadyDoc(departmentId: string, tenantId: string): Promise<string> {
+    const docId = newId();
+    const hash = crypto.randomBytes(32).toString('hex');
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${tenantId}, ${departmentId}, NULL,
+        'ro.pdf', 'ro.pdf', ${hash}, 1024, 'application/pdf',
+        ${`tenants/${tenantId}/documents/${hash}/ro.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NOW(), 0, false
+      )
+    `;
+    return docId;
+  }
+
+  /**
+   * Cria um usuário no TENANT_A com uma concessão ATIVA na raiz DEPT_A_ID e
+   * devolve o token. Papel `USER` por padrão; `UPLOADER` para os casos de escrita.
+   */
+  async function seedUserWithGrant(
+    email: string,
+    role: 'USER' | 'UPLOADER'
+  ): Promise<string> {
+    const id = newId();
+    await seedUser(testDb.db, {
+      id,
+      tenantId: TENANT_A,
+      email,
+      password: PASSWORD,
+      role,
+    });
+    await testDb.db`
+      INSERT INTO department_permissions (id, tenant_id, user_id, department_id, can_read, can_write, deleted)
+      VALUES (${newId()}, ${TENANT_A}, ${id}, ${DEPT_A_ID}, true, true, false)
+    `;
+    return login(email);
+  }
+
+  it('USER com raiz ATIVA: GET /documents lista o doc e GET/:id → 200 (leitura preservada)', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const token = await seedUserWithGrant('user-ro-read@empresa.com', 'USER');
+
+    const listRes = await app.inject({
+      method: 'GET',
+      url: '/documents',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(listRes.statusCode).toBe(200);
+    const ids = (listRes.json().items as Array<{ id: string }>).map((d) => d.id);
+    expect(ids).toContain(docId);
+
+    const getRes = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(getRes.statusCode).toBe(200);
+  });
+
+  it('USER com raiz ATIVA: PATCH /documents/:id → 404 e NÃO persiste', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const token = await seedUserWithGrant('user-ro-patch@empresa.com', 'USER');
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { title: 'USER nao pode editar' },
+    });
+    expect(res.statusCode).toBe(404);
+
+    const rows = await testDb.db<Array<{ title: string | null }>>`
+      SELECT title FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]?.title ?? null).toBeNull();
+  });
+
+  it('USER com raiz ATIVA: DELETE /documents/:id → 404 e o doc continua não-deletado', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const token = await seedUserWithGrant('user-ro-delete@empresa.com', 'USER');
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(404);
+
+    const rows = await testDb.db<Array<{ deleted: boolean }>>`
+      SELECT deleted FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]?.deleted).toBe(false);
+  });
+
+  it('USER com raiz ATIVA: POST /documents/:id/reprocess → 404', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const token = await seedUserWithGrant('user-ro-reprocess@empresa.com', 'USER');
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/reprocess`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('USER com raiz ATIVA: POST /documents/:id/suggest-indexes → 404 (guard antes de qualquer custo de IA)', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const token = await seedUserWithGrant('user-ro-suggest@empresa.com', 'USER');
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/suggest-indexes`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    // 404 vem do gate por papel em assertCanWriteDepartment, executado ANTES de
+    // resolveAiFeatureFlags e da chamada ao LLM — nenhum custo de IA é disparado.
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('UPLOADER com raiz ATIVA: PATCH /documents/:id → 200 e persiste (não regrediu)', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const token = await seedUserWithGrant('uploader-ro-patch@empresa.com', 'UPLOADER');
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { title: 'editado por uploader' },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const rows = await testDb.db<Array<{ title: string | null }>>`
+      SELECT title FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]?.title).toBe('editado por uploader');
+  });
+
+  it('UPLOADER com raiz ATIVA: DELETE /documents/:id → 204 e soft-delete efetivado (não regrediu)', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const token = await seedUserWithGrant('uploader-ro-delete@empresa.com', 'UPLOADER');
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(204);
+
+    const rows = await testDb.db<Array<{ deleted: boolean }>>`
+      SELECT deleted FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]?.deleted).toBe(true);
+  });
+
+  it('ADMIN (TENANT_ADMIN): PATCH /documents/:id → 200 (escrita sem restrição, inalterada)', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: 'editado por admin' },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const rows = await testDb.db<Array<{ title: string | null }>>`
+      SELECT title FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]?.title).toBe('editado por admin');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Regressão: departamento excluído preserva acesso aos documentos órfãos.
 // ---------------------------------------------------------------------------
 describe('documentos órfãos — departamento soft-deletado preserva acesso', () => {
@@ -1806,5 +2186,186 @@ describe('POST /documents/bulk-reassign-uploader', () => {
     expect(metadata['toUserId']).toBe(TARGET_USER_A_ID);
     expect(metadata['count']).toBe(1);
     expect(metadata['fromUserIds']).toEqual([ADMIN_A_ID]);
+  });
+});
+
+describe('PATCH /documents/:id — título de exibição (Fase 8.1)', () => {
+  /** Faz upload de um documento no departamento informado e retorna o id. */
+  async function uploadDoc(token: string, departmentId: string): Promise<string> {
+    const { payload, headers } = buildUploadForm({ departmentId });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${token}`, ...headers },
+      payload,
+    });
+    expect(res.statusCode).toBe(201);
+    return res.json().id as string;
+  }
+
+  it('no upload, title e suggestedTitle nascem null (fallback é originalFilename)', async () => {
+    const docId = await uploadDoc(tokenAdminA, DEPT_A_ID);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Record<string, unknown>;
+    expect(body.title).toBeNull();
+    expect(body.suggestedTitle).toBeNull();
+    expect(body.originalFilename).toBe('teste.pdf');
+  });
+
+  it('confirma um título → 200 e GET reflete o title', async () => {
+    const docId = await uploadDoc(tokenAdminA, DEPT_A_ID);
+
+    const patchRes = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: 'Contrato X' },
+    });
+    expect(patchRes.statusCode).toBe(200);
+    expect(patchRes.json().title).toBe('Contrato X');
+
+    const getRes = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(getRes.statusCode).toBe(200);
+    expect(getRes.json().title).toBe('Contrato X');
+  });
+
+  it('corrige o título com um novo PATCH → GET reflete o valor mais recente', async () => {
+    const docId = await uploadDoc(tokenAdminA, DEPT_A_ID);
+
+    await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: 'Contrato X' },
+    });
+
+    const patchRes = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: 'Contrato de Prestação de Serviços' },
+    });
+    expect(patchRes.statusCode).toBe(200);
+    expect(patchRes.json().title).toBe('Contrato de Prestação de Serviços');
+
+    const getRes = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(getRes.json().title).toBe('Contrato de Prestação de Serviços');
+  });
+
+  it('title: null limpa o título confirmado (volta ao fallback)', async () => {
+    const docId = await uploadDoc(tokenAdminA, DEPT_A_ID);
+
+    await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: 'Contrato X' },
+    });
+
+    const clearRes = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: null },
+    });
+    expect(clearRes.statusCode).toBe(200);
+    expect(clearRes.json().title).toBeNull();
+
+    const getRes = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(getRes.json().title).toBeNull();
+    expect(getRes.json().originalFilename).toBe('teste.pdf');
+  });
+
+  it('PATCH ausente de title NÃO altera o título já confirmado', async () => {
+    const docId = await uploadDoc(tokenAdminA, DEPT_A_ID);
+
+    await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: 'Contrato X' },
+    });
+
+    // PATCH que mexe só em tags — title deve permanecer inalterado
+    const patchRes = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { tags: ['revisado'] },
+    });
+    expect(patchRes.statusCode).toBe(200);
+    expect(patchRes.json().title).toBe('Contrato X');
+    expect(patchRes.json().tags).toContain('revisado');
+  });
+
+  it('title vazio ("") é rejeitado com 422 (min 1)', async () => {
+    const docId = await uploadDoc(tokenAdminA, DEPT_A_ID);
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: '' },
+    });
+    expect(res.statusCode).toBe(422);
+  });
+
+  it('isolamento multi-tenant: PATCH de título em doc de outro tenant → 404', async () => {
+    const docBId = await uploadDoc(tokenAdminB, DEPT_B_ID);
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docBId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: 'Título indevido' },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+
+    // O documento do tenant B permanece intacto (title ainda null)
+    const rows = await testDb.db<Array<{ title: string | null }>>`
+      SELECT title FROM documents WHERE id = ${docBId}
+    `;
+    expect(rows[0]?.title).toBeNull();
+  });
+
+  it('title também aparece na listagem GET /documents', async () => {
+    const docId = await uploadDoc(tokenAdminA, DEPT_A_ID);
+    await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: 'Contrato Listado' },
+    });
+
+    const listRes = await app.inject({
+      method: 'GET',
+      url: '/documents',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(listRes.statusCode).toBe(200);
+    const items = listRes.json().items as Array<Record<string, unknown>>;
+    const found = items.find((i) => i.id === docId);
+    expect(found).toBeDefined();
+    expect(found!.title).toBe('Contrato Listado');
+    expect(found!.suggestedTitle).toBeNull();
   });
 });
