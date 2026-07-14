@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
+import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb } from '../test/helpers.js';
 import { newId } from '@dmdoc/db-pg';
 
 /**
@@ -12,7 +12,8 @@ import { newId } from '@dmdoc/db-pg';
  * conceder um id que existe mas NÃO é raiz retorna 422 VALIDATION_ERROR.
  */
 
-const TENANT_ID = '11111111-1111-1111-1111-111111111111';
+// UUID de tenant por arquivo — evita colisão no `dmdoc_test` compartilhado.
+const TENANT_ID = crypto.randomUUID();
 const ADMIN_ID = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
 const USER_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 
@@ -33,11 +34,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db`DELETE FROM audit_logs`;
-  await testDb.db`DELETE FROM department_permissions`;
-  await testDb.db`DELETE FROM departments`;
-  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','USER')`;
-  await testDb.db`DELETE FROM tenants WHERE id = ${TENANT_ID}`;
+  await resetDomainTables(testDb.db);
 
   await testDb.db`
     INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)

@@ -35,6 +35,12 @@ export class AuditLogger {
    */
   async record(entry: Omit<AuditLogDocument, 'createdAt'>): Promise<void> {
     const id = newId();
+    // `metadata` é jsonb. Gravamos com JSON.stringify (texto → jsonb, armazenado
+    // como objeto single-encoded). Com esse cliente postgres.js, ler a coluna
+    // devolve a STRING JSON crua (não um objeto) — todos os consumidores tratam
+    // isso: o SELECT da rota GET /audit-logs faz parse (parseMetadata) e os
+    // testes usam JSON.parse. Trocar por `sql.json()` mudaria a forma de leitura
+    // para objeto e quebraria esses consumidores.
     await this.sql`
       INSERT INTO audit_logs (id, tenant_id, user_id, action, resource, metadata, created_at)
       VALUES (

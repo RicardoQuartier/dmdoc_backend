@@ -178,7 +178,10 @@ export const departments = pgTable(
 
 /**
  * Permissão de acesso de um usuário a um departamento.
- * Unique: (userId, departmentId).
+ * Unique PARCIAL: (userId, departmentId) apenas para linhas ativas
+ * (`deleted = false`) — soft-deletadas não competem pela unicidade,
+ * permitindo o padrão soft-delete + reinserção sem colisão (ver migration
+ * 0006_partial_unique_dept_perm).
  */
 export const departmentPermissions = pgTable(
   'department_permissions',
@@ -198,7 +201,9 @@ export const departmentPermissions = pgTable(
     deleted: boolean('deleted').notNull().default(false),
   },
   (t) => [
-    unique('uniq_dept_perm_user_dept').on(t.userId, t.departmentId),
+    uniqueIndex('uniq_dept_perm_user_dept')
+      .on(t.userId, t.departmentId)
+      .where(sql`deleted = false`),
     index('dept_perm_by_user_tenant').on(t.userId, t.tenantId),
     index('dept_perm_by_department').on(t.departmentId),
   ],
@@ -314,6 +319,12 @@ export const documents = pgTable(
     documentTypeId: uuid('document_type_id').references(() => documentTypes.id),
     filename: text('filename').notNull(),
     originalFilename: text('original_filename').notNull(),
+    // Título de exibição confirmado/editado pelo usuário (Fase 8.1). Nulo até a
+    // confirmação; enquanto nulo, o fallback de exibição é `originalFilename`.
+    title: text('title'),
+    // Sugestão bruta de título gerada pela IA (Fase 8.1). Consultiva: nunca é
+    // exibida como título oficial. Reprocessar sobrescreve; nunca toca `title`.
+    suggestedTitle: text('suggested_title'),
     contentHash: text('content_hash').notNull(), // SHA-256 hex, 64 chars
     sizeBytes: bigint('size_bytes', { mode: 'bigint' }).notNull(),
     mimeType: text('mime_type').notNull(),
@@ -360,6 +371,7 @@ export const documentContent = pgTable('document_content', {
   fullText: text('full_text').notNull(),
   extraction: jsonb('extraction').notNull(),
   indexSuggestion: jsonb('index_suggestion'),
+  typeSuggestion: jsonb('type_suggestion'),
   costBreakdown: jsonb('cost_breakdown'),
 });
 

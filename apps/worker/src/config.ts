@@ -47,6 +47,16 @@ const EnvSchema = z.object({
   OPENAI_API_KEY: z.string().min(1).optional(),
   EMBEDDING_MODEL: z.string().min(1).default('text-embedding-3-small'),
 
+  // LLM de chat — usado na classificação automática de tipo (Fase 8) no
+  // pipeline do worker. Espelha EXATAMENTE os nomes de env da API
+  // (apps/api/src/config.ts): o worker compartilha o mesmo `.env` no compose,
+  // então os mesmos valores valem para API e worker sem divergência.
+  // Funciona com OpenAI e OpenRouter só trocando baseURL/apiKey/model.
+  LLM_PROVIDER: z.enum(['openai', 'openrouter']).default('openrouter'),
+  LLM_BASE_URL: z.string().url().default('https://openrouter.ai/api/v1'),
+  LLM_API_KEY: z.string().default(''),
+  LLM_MODEL: z.string().min(1).default('google/gemma-3-27b-it:free'),
+
   // Limites de chunking (spec §12)
   CHUNK_TARGET_TOKENS: z.coerce.number().int().positive().default(500),
   CHUNK_OVERLAP_TOKENS: z.coerce.number().int().nonnegative().default(50),

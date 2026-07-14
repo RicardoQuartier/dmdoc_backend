@@ -3,6 +3,7 @@ import { Redis } from 'ioredis';
 import OpenAI from 'openai';
 import { createPgClient } from '@dmdoc/db-pg';
 import { createExtractor } from '@dmdoc/extractor';
+import { createLLMProvider } from '@dmdoc/llm-provider';
 import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
 import { config } from './config.js';
 import { logger } from './logger.js';
@@ -95,6 +96,22 @@ async function main(): Promise<void> {
   });
   logger.info({ model: config.EMBEDDING_MODEL }, 'OpenAI client criado');
 
+  // LLM de chat — classificação automática de tipo (Fase 8). Funciona com
+  // OpenAI e OpenRouter só trocando baseURL/apiKey/model (mesmas envs da API).
+  const llmProvider = createLLMProvider(
+    {
+      provider: config.LLM_PROVIDER,
+      baseURL: config.LLM_BASE_URL,
+      apiKey: config.LLM_API_KEY || 'placeholder',
+      model: config.LLM_MODEL,
+    },
+    logger
+  );
+  logger.info(
+    { provider: config.LLM_PROVIDER, model: config.LLM_MODEL },
+    'LLM provider de chat criado (classificação)'
+  );
+
   // Conexão Redis dedicada para RPUSH de pedidos de extração.
   // Separada da conexão BullMQ para não interferir com os comandos bloqueantes do Worker.
   const extractionPushConn = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null });
@@ -117,6 +134,8 @@ async function main(): Promise<void> {
     extractor,
     openai,
     embeddingModel: config.EMBEDDING_MODEL,
+    llmProvider,
+    chatModel: config.LLM_MODEL,
     sql,
     logger,
     chunkTargetTokens: config.CHUNK_TARGET_TOKENS,

@@ -1,6 +1,6 @@
-import type { Sql } from 'postgres';
+import type { Sql, JSONValue } from 'postgres';
 import type { Logger } from 'pino';
-import type { DocumentProcessingJobData } from '@dmdoc/shared-types';
+import type { DocumentProcessingJobData, TypeSuggestion } from '@dmdoc/shared-types';
 import { DocumentEventsRepository } from '@dmdoc/db-pg';
 import { newId } from '@dmdoc/db-pg';
 import type { ExtractResult } from './extract.js';
@@ -11,6 +11,23 @@ export interface PersistParams {
   extractResult: ExtractResult;
   embeddedChunks: EmbeddedChunkDraft[];
   totalEmbeddingsUsd: number;
+  /**
+   * Sugestão de tipo (Fase 8) a gravar em `document_content.type_suggestion`.
+   * `null` quando a etapa de classificação foi pulada (features off) ou falhou.
+   */
+  typeSuggestion: TypeSuggestion | null;
+  /**
+   * Título de exibição sugerido pela IA (Fase 8.1) a gravar em
+   * `documents.suggested_title`. `null` quando a classificação foi pulada/falhou,
+   * quando a feature de título está desligada ou quando o LLM não inferiu título.
+   *
+   * INVARIANTE: o worker grava APENAS `suggested_title` — NUNCA toca a coluna
+   * `title` (o título confirmado pelo usuário). Reprocessar sobrescreve a
+   * sugestão (inclusive para `null`), mas jamais altera o título confirmado.
+   */
+  suggestedTitle: string | null;
+  /** Custo em USD da(s) chamada(s) de LLM da classificação (0 se não houve). */
+  classificationUsd: number;
   pipelineStartedAt: Date;
 }
 
@@ -38,15 +55,24 @@ export async function persistProcessingResult(
   params: PersistParams,
   deps: PersistDeps
 ): Promise<void> {
-  const { job, extractResult, embeddedChunks, totalEmbeddingsUsd, pipelineStartedAt } =
-    params;
+  const {
+    job,
+    extractResult,
+    embeddedChunks,
+    totalEmbeddingsUsd,
+    typeSuggestion,
+    suggestedTitle,
+    classificationUsd,
+    pipelineStartedAt,
+  } = params;
   const { tenantId, documentId } = job;
   const { sql, logger: baseLogger } = deps;
 
   const log = baseLogger.child({ tenantId, documentId, step: 'persist' });
 
   const totalTokens = embeddedChunks.reduce((sum, c) => sum + c.tokenCount, 0);
-  const costUsdCents = Math.ceil(totalEmbeddingsUsd * 100);
+  // Custo total do documento = embeddings + classificação (Fase 8), em centavos.
+  const costUsdCents = Math.ceil((totalEmbeddingsUsd + classificationUsd) * 100);
 
   // 1. Idempotência: remover chunks anteriores do mesmo documento
   const deleteResult = await sql`
@@ -102,34 +128,60 @@ export async function persistProcessingResult(
     extractionUsd: 0,
     embeddingsUsd: totalEmbeddingsUsd,
     suggestionUsd: 0,
-    totalUsd: totalEmbeddingsUsd,
+    classificationUsd,
+    totalUsd: totalEmbeddingsUsd + classificationUsd,
   };
 
+  // jsonb: sempre via `sql.json(...)` — NUNCA `JSON.stringify` (evita
+  // double-encoding no postgres.js). `type_suggestion` é `null` quando a
+  // classificação foi pulada/falhou; caso contrário grava o objeto (a `Date`
+  // `suggestedAt` é serializada como ISO string pelo JSON, como a API espera).
+  // Idempotência: no reprocessamento o ON CONFLICT sobrescreve `type_suggestion`
+  // — mas `documents.document_type_id` (escolha manual) NUNCA é tocado aqui.
+  const typeSuggestionJson =
+    typeSuggestion === null
+      ? null
+      : sql.json(
+          {
+            ...typeSuggestion,
+            suggestedAt: typeSuggestion.suggestedAt.toISOString(),
+          } as unknown as JSONValue
+        );
+
   await sql`
-    INSERT INTO document_content (document_id, tenant_id, full_text, extraction, index_suggestion, cost_breakdown)
+    INSERT INTO document_content (document_id, tenant_id, full_text, extraction, index_suggestion, type_suggestion, cost_breakdown)
     VALUES (
       ${documentId},
       ${tenantId},
       ${extractResult.fullText},
       ${sql.json(extraction)},
       ${null},
+      ${typeSuggestionJson},
       ${sql.json(costBreakdown)}
     )
     ON CONFLICT (document_id) DO UPDATE
-      SET full_text       = EXCLUDED.full_text,
-          extraction      = EXCLUDED.extraction,
+      SET full_text        = EXCLUDED.full_text,
+          extraction       = EXCLUDED.extraction,
           index_suggestion = EXCLUDED.index_suggestion,
-          cost_breakdown  = EXCLUDED.cost_breakdown
+          type_suggestion  = EXCLUDED.type_suggestion,
+          cost_breakdown   = EXCLUDED.cost_breakdown
   `;
 
   log.debug('document_content atualizado');
 
-  // 4. Atualizar documento para READY
+  // 4. Atualizar documento para READY.
+  //    INVARIANTE (wiki "Título de exibição sugerido por IA"): o worker grava
+  //    APENAS `suggested_title` — a coluna `title` (título confirmado pelo
+  //    usuário) NUNCA é tocada aqui. `suggested_title` é text simples (não
+  //    jsonb): interpolado direto, sem `sql.json`/`JSON.stringify`. `null`
+  //    sobrescreve qualquer sugestão anterior no reprocessamento (idempotência
+  //    coerente com `type_suggestion`).
   await sql`
     UPDATE documents
-    SET status         = 'READY',
-        processed_at   = now(),
-        cost_usd_cents = ${costUsdCents}
+    SET status          = 'READY',
+        processed_at    = now(),
+        cost_usd_cents  = ${costUsdCents},
+        suggested_title = ${suggestedTitle}
     WHERE id        = ${documentId}
       AND tenant_id = ${tenantId}
   `;
@@ -164,6 +216,9 @@ export async function persistProcessingResult(
       totalTokens,
       costUsdCents,
       totalEmbeddingsUsd: totalEmbeddingsUsd.toFixed(6),
+      classificationUsd: classificationUsd.toFixed(6),
+      typeSuggestionPersisted: typeSuggestion !== null,
+      suggestedTitlePersisted: suggestedTitle !== null,
       durationMs,
     },
     'pipeline concluído — documento READY'

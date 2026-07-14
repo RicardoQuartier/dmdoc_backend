@@ -171,6 +171,9 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
         extractResult: makeExtractResult(7),
         embeddedChunks: [],
         totalEmbeddingsUsd: 0,
+        typeSuggestion: null,
+        suggestedTitle: null,
+        classificationUsd: 0,
         pipelineStartedAt: new Date(),
       },
       { sql, logger: makeSilentLogger() }
@@ -192,6 +195,9 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
         extractResult: makeExtractResult(12),
         embeddedChunks: [],
         totalEmbeddingsUsd: 0,
+        typeSuggestion: null,
+        suggestedTitle: null,
+        classificationUsd: 0,
         pipelineStartedAt: new Date(),
       },
       { sql, logger: makeSilentLogger() }
@@ -216,6 +222,9 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
           extractResult: makeExtractResult(5),
           embeddedChunks: [],
           totalEmbeddingsUsd: 0,
+          typeSuggestion: null,
+          suggestedTitle: null,
+          classificationUsd: 0,
           pipelineStartedAt: new Date(),
         },
         { sql, logger: makeSilentLogger() }
@@ -225,5 +234,159 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
     await run();
 
     expect(events[0]?.pageCount).toBe(5);
+  });
+});
+
+/**
+ * Testes da INVARIANTE mais importante da Fase 8.1 (wiki "Título de exibição
+ * sugerido por IA"):
+ *
+ * O worker grava APENAS `documents.suggested_title` — a coluna `title` (o
+ * título CONFIRMADO pelo usuário) NUNCA é tocada no pipeline. Reprocessar
+ * sobrescreve a sugestão (inclusive para `null`), mas jamais altera o título
+ * confirmado.
+ *
+ * Modelamos uma linha da tabela `documents` (com `title` e `suggested_title`)
+ * num stub que aplica o UPDATE do persist e captura a query emitida, para
+ * verificar tanto o efeito nos dados quanto que a coluna `title` não aparece
+ * no SET.
+ */
+interface DocumentRow {
+  id: string;
+  tenantId: string;
+  title: string | null;
+  suggestedTitle: string | null;
+}
+
+function makeDocumentsSqlStub(
+  doc: DocumentRow,
+  captured: { updateDocumentsQuery: string | null }
+): Sql {
+  const noopResult = Object.assign([], { count: 0 });
+
+  function buildQuery(strings: TemplateStringsArray, values: unknown[]): string {
+    let q = '';
+    for (let i = 0; i < strings.length; i++) {
+      q += strings[i] ?? '';
+      if (i < values.length) {
+        const v = values[i];
+        if (v && typeof v === 'object' && '__pgIdentifier' in (v as object)) {
+          q += (v as { __pgIdentifier: string }).__pgIdentifier;
+        } else {
+          q += String(v ?? '');
+        }
+      }
+    }
+    return q.toLowerCase();
+  }
+
+  const sqlFn = vi.fn().mockImplementation(
+    (strings: TemplateStringsArray | string, ...values: unknown[]) => {
+      if (typeof strings === 'string') {
+        return { __pgIdentifier: strings };
+      }
+      if (Array.isArray(strings) && !('raw' in strings)) {
+        return { __pgBulkRows: strings };
+      }
+
+      const query = buildQuery(strings as TemplateStringsArray, values);
+
+      if (query.includes('update documents')) {
+        // Captura a query (com placeholders colapsados) para inspeção do SET.
+        captured.updateDocumentsQuery = query;
+        // Ordem dos valores interpolados no UPDATE:
+        //   values[0] = costUsdCents
+        //   values[1] = suggestedTitle
+        //   values[2] = documentId
+        //   values[3] = tenantId
+        const [, suggestedTitle, docId, tenantId] = values as [
+          unknown,
+          string | null,
+          string,
+          string,
+        ];
+        if (doc.id === docId && doc.tenantId === tenantId) {
+          // INVARIANTE: só a sugestão é escrita; `title` permanece intacto.
+          doc.suggestedTitle = suggestedTitle;
+        }
+        return Promise.resolve(noopResult);
+      }
+
+      return Promise.resolve(noopResult);
+    }
+  );
+
+  (sqlFn as unknown as Record<string, unknown>)['json'] = (val: unknown) => val;
+
+  return sqlFn as unknown as Sql;
+}
+
+describe('persistProcessingResult — invariante: só grava suggested_title, nunca title', () => {
+  it('sobrescreve suggested_title e preserva o title confirmado pelo usuário', async () => {
+    const doc: DocumentRow = {
+      id: DOCUMENT_ID,
+      tenantId: TENANT_A,
+      // Título já confirmado manualmente pelo usuário.
+      title: 'Título confirmado pelo usuário',
+      // Sugestão anterior de um processamento passado.
+      suggestedTitle: 'Sugestão antiga',
+    };
+    const captured = { updateDocumentsQuery: null as string | null };
+    const sql = makeDocumentsSqlStub(doc, captured);
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(3),
+        embeddedChunks: [],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: null,
+        suggestedTitle: 'Nova sugestão de título gerada pela IA',
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    // suggested_title foi sobrescrito com a nova sugestão.
+    expect(doc.suggestedTitle).toBe('Nova sugestão de título gerada pela IA');
+    // title confirmado permanece INTACTO — worker nunca o toca.
+    expect(doc.title).toBe('Título confirmado pelo usuário');
+    // A query de UPDATE escreve suggested_title, mas não a coluna `title`.
+    expect(captured.updateDocumentsQuery).toContain('suggested_title');
+    // Não há atribuição da coluna `title` no SET (o `_` antes de "title" em
+    // "suggested_title" garante que este regex não casa com a sugestão).
+    expect(captured.updateDocumentsQuery).not.toMatch(/[^_]title\s*=/);
+  });
+
+  it('grava suggested_title null (sem sugestão) sem alterar o title confirmado', async () => {
+    const doc: DocumentRow = {
+      id: DOCUMENT_ID,
+      tenantId: TENANT_A,
+      title: 'Título confirmado pelo usuário',
+      suggestedTitle: 'Sugestão antiga a ser limpa',
+    };
+    const captured = { updateDocumentsQuery: null as string | null };
+    const sql = makeDocumentsSqlStub(doc, captured);
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(3),
+        embeddedChunks: [],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: null,
+        // Feature off / fallback / título não inferido ⇒ null sobrescreve.
+        suggestedTitle: null,
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    // Idempotência coerente com type_suggestion: null limpa a sugestão anterior.
+    expect(doc.suggestedTitle).toBeNull();
+    // O título confirmado continua preservado.
+    expect(doc.title).toBe('Título confirmado pelo usuário');
   });
 });

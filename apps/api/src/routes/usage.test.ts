@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
+import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb } from '../test/helpers.js';
 import type { S3Service } from '../services/s3.js';
 import { newId } from '@dmdoc/db-pg';
 
@@ -19,8 +19,9 @@ function createMockS3(): S3Service {
 // ---------------------------------------------------------------------------
 // Constantes
 // ---------------------------------------------------------------------------
-const TENANT_A = '11111111-1111-1111-1111-111111111111';
-const TENANT_B = '22222222-2222-2222-2222-222222222222';
+// UUIDs de tenant por arquivo — evita colisão no `dmdoc_test` compartilhado.
+const TENANT_A = crypto.randomUUID();
+const TENANT_B = crypto.randomUUID();
 const ADMIN_A_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const SUPER_ADMIN_ID = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
 const DEPT_ID = 'e0000000-0000-0000-0000-000000000001';
@@ -53,10 +54,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db`DELETE FROM documents`;
-  await testDb.db`DELETE FROM departments`;
-  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','SUPER_ADMIN','USER')`;
-  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
+  await resetDomainTables(testDb.db);
 
   await testDb.db`
     INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
@@ -118,12 +116,12 @@ async function insertDocument(
   await testDb.db`
     INSERT INTO documents (
       id, tenant_id, department_id, document_type_id,
-      original_filename, content_hash, size_bytes, mime_type,
+      filename, original_filename, content_hash, size_bytes, mime_type,
       s3_key, status, failure_reason, tags, index_values,
       uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
     ) VALUES (
       ${id}, ${tenantId}, ${deptId}, NULL,
-      'test.pdf', ${newId()}, ${sizeBytes}, 'application/pdf',
+      'test.pdf', 'test.pdf', ${newId()}, ${sizeBytes}, 'application/pdf',
       ${`tenants/${tenantId}/test.pdf`}, ${status}, NULL, '{}'::text[], '{}'::jsonb,
       ${ADMIN_A_ID}, NOW(), ${status === 'READY' ? new Date() : null}, ${costUsdCents}, ${deleted}
     )

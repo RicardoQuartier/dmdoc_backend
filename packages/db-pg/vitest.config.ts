@@ -17,6 +17,11 @@ export default defineConfig({
     // que outro estava usando). Serializar os arquivos elimina o flake sem
     // exigir isolamento por schema/transação em cada teste.
     fileParallelism: false,
+    // Aplica migrate:fresh uma vez no banco de teste (schema limpo e completo,
+    // incluindo 0004/0005) antes de qualquer arquivo — garante que testes de
+    // ai-feature-flags/platform-settings não falhem por "relation does not
+    // exist" quando o dmdoc_test está atrás do repositório.
+    globalSetup: ['./src/test-global-setup.ts'],
     env: {
       DATABASE_URL: 'postgresql://dmdoc:dmdoc@localhost:5432/dmdoc_test',
     },

@@ -150,6 +150,22 @@ CONTENT_THRESHOLD = 220
 # (com camada de texto). Abaixo disso, a página é tratada como escaneada → OCR.
 MIN_PAGE_ALNUM = 20
 
+# OCR complementar em páginas de PDF híbridas (texto nativo + imagem embutida com
+# dados, ex.: boleto/nota fiscal renderizado como imagem dentro de um PDF que já
+# tem cabeçalho/rodapé/título em texto nativo). Uma página que passa no critério
+# de texto nativo ainda dispara OCR complementar quando:
+#   - as imagens embutidas cobrem >= PDF_IMG_COVERAGE_MIN da área da página; E
+#   - o texto nativo cobre <= PDF_NATIVE_TEXT_COVERAGE_MAX da área da página.
+# Assim evita-se OCR desnecessário em logos/ícones pequenos (baixa cobertura de
+# imagem) e em páginas densas de texto que só têm um gráfico ilustrativo (alta
+# cobertura de texto nativo), sem baixar o MIN_PAGE_ALNUM (que reintroduziria
+# falsos positivos em páginas já bem cobertas por texto).
+PDF_IMG_COVERAGE_MIN = 0.15
+PDF_NATIVE_TEXT_COVERAGE_MAX = 0.60
+# Resolução (células no maior lado) do grid booleano usado para medir cobertura
+# de imagem/texto sem dupla contagem de retângulos sobrepostos.
+PDF_COVERAGE_GRID = 120
+
 # MIMEs e extensões de imagem suportados pelo cv2.imdecode (libwebp embutida).
 _IMAGE_MIMES = frozenset({
     "image/jpeg", "image/png", "image/webp",
@@ -379,6 +395,69 @@ def extract_txt(data: bytes) -> dict:
     return {"text": text, "pageCount": 1, "ocrPages": []}
 
 
+def _ocr_page_pixmap(page) -> str:
+    """Renderiza a página inteira (200 dpi) e roda OCR sobre a imagem composta.
+
+    Renderizar a página composta — em vez de extrair cada imagem embutida via
+    page.get_images() — é mais robusto para boletos/formulários: as bandas de
+    imagem costumam vir empilhadas, com máscaras/canais separados e escalas
+    próprias; extraí-las cruas produz camadas parciais e texto ilegível. A
+    página renderizada reflete exatamente o que o usuário vê e reaproveita o
+    mesmo caminho de OCR já usado para páginas escaneadas."""
+    pix = page.get_pixmap(dpi=200)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+    if pix.n == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    elif pix.n == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    else:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    return ocr_image(img)
+
+
+def _page_coverage(page) -> tuple[float, float]:
+    """Retorna (fração da página coberta por imagens embutidas, fração coberta
+    por texto nativo).
+
+    Usa um grid booleano de baixa resolução para calcular a área de união dos
+    retângulos, evitando dupla contagem de imagens sobrepostas (bandas empilhadas
+    de boleto) e de blocos de texto que se tocam."""
+    rect = page.rect
+    if rect.width <= 0 or rect.height <= 0:
+        return 0.0, 0.0
+    gw = PDF_COVERAGE_GRID
+    gh = max(1, round(rect.height / rect.width * gw))
+    sx = gw / rect.width
+    sy = gh / rect.height
+
+    def _covered_frac(rects: list) -> float:
+        if not rects:
+            return 0.0
+        mask = np.zeros((gh, gw), dtype=bool)
+        for r in rects:
+            x0 = max(0, int(r.x0 * sx))
+            x1 = min(gw, int(round(r.x1 * sx)))
+            y0 = max(0, int(r.y0 * sy))
+            y1 = min(gh, int(round(r.y1 * sy)))
+            if x1 > x0 and y1 > y0:
+                mask[y0:y1, x0:x1] = True
+        return float(mask.sum()) / float(gw * gh)
+
+    img_rects: list = []
+    for img in page.get_images(full=True):
+        try:
+            img_rects.extend(page.get_image_rects(img[0]))
+        except Exception:  # noqa: BLE001 — xref sem rect renderizável é ignorado
+            pass
+
+    text_rects: list = []
+    for b in page.get_text("blocks"):
+        if len(b) > 4 and b[4].strip():
+            text_rects.append(fitz.Rect(b[0], b[1], b[2], b[3]))
+
+    return _covered_frac(img_rects), _covered_frac(text_rects)
+
+
 def extract_pdf(data: bytes) -> dict:
     doc = fitz.open(stream=data, filetype="pdf")
     texts: list[str] = []
@@ -388,17 +467,30 @@ def extract_pdf(data: bytes) -> dict:
         text = page.get_text().strip()
         alnum = sum(c.isalnum() for c in text)
         if alnum >= MIN_PAGE_ALNUM:
+            # Página com texto nativo suficiente. Ainda assim pode conter uma
+            # imagem embutida com dados reais (boleto/nota renderizado como
+            # imagem). Dispara OCR complementar apenas quando as imagens cobrem
+            # boa parte da página e o texto nativo cobre pouco — o resultado é
+            # mesclado com o texto nativo já extraído.
             texts.append(text)
+            try:
+                img_cov, text_cov = _page_coverage(page)
+                if img_cov >= PDF_IMG_COVERAGE_MIN and text_cov <= PDF_NATIVE_TEXT_COVERAGE_MAX:
+                    logger.info(
+                        "OCR complementar em página híbrida: page=%d imgCov=%.2f textCov=%.2f",
+                        i + 1, img_cov, text_cov,
+                    )
+                    supp = _ocr_page_pixmap(page)
+                    if supp:
+                        texts.append(supp)
+                    ocr_pages.append(i + 1)
+            except Exception:  # noqa: BLE001 — OCR complementar nunca regride o texto nativo
+                logger.exception(
+                    "falha no OCR complementar da página híbrida; mantendo só texto nativo: page=%d",
+                    i + 1,
+                )
         else:
-            pix = page.get_pixmap(dpi=200)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-            if pix.n == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-            elif pix.n == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            else:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            ocr_text = ocr_image(img)
+            ocr_text = _ocr_page_pixmap(page)
             if ocr_text:
                 texts.append(ocr_text)
             ocr_pages.append(i + 1)

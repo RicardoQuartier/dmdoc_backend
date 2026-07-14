@@ -30,6 +30,11 @@ export function testConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): Config {
     AWS_SECRET_ACCESS_KEY: 'test-secret-key',
     // Redis — placeholder; queue: null injetado via buildApp
     REDIS_URL: 'redis://placeholder:6379',
+    // Rate limit efetivamente desligado nos testes: a suíte E2E dispara centenas
+    // de requisições por arquivo numa única instância do app (contador em
+    // memória, janela de 60s), o que estouraria o default de 200/min e tornaria
+    // os testes dependentes de tempo/ordem. Nenhum teste exercita o rate limit.
+    RATE_LIMIT_MAX: '100000000',
     ...overrides,
   });
 }
@@ -37,6 +42,42 @@ export function testConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): Config {
 export interface TestDb {
   db: Sql;
   stop: () => Promise<void>;
+}
+
+/**
+ * Zera TODAS as tabelas de domínio num único `TRUNCATE ... CASCADE`
+ * (ordem-independente e FK-safe) e recria o singleton de `platform_settings`.
+ *
+ * Usado tanto pelo setupFile (limpeza antes de cada arquivo) quanto pelos
+ * `beforeEach` dos arquivos que semeiam dados por teste — substitui blocos de
+ * `DELETE FROM ...` manuais que, por dependerem de ordem correta de FK, só
+ * funcionavam graças a deletes globais de outros arquivos rodando em paralelo.
+ */
+export async function resetDomainTables(db: Sql): Promise<void> {
+  await db.unsafe(`
+    TRUNCATE TABLE
+      audit_logs,
+      chunks,
+      department_permissions,
+      department_templates,
+      departments,
+      document_content,
+      document_events,
+      document_type_index_fields,
+      document_types,
+      documents,
+      global_type_tenant_depts,
+      platform_settings,
+      tenants,
+      users
+    RESTART IDENTITY CASCADE
+  `);
+  await db`
+    INSERT INTO platform_settings (
+      ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
+    )
+    VALUES (true, true, true)
+  `;
 }
 
 /**

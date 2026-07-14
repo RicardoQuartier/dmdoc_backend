@@ -5,7 +5,13 @@ import type { Sql } from '@dmdoc/db-pg';
  *
  * Modelo de produto (Fase 6):
  *   - O acesso é concedido por DEPARTAMENTO RAIZ (nível 0, `parentId: null`).
- *   - Conceder uma raiz dá acesso de LEITURA E ESCRITA a toda a subárvore.
+ *   - Conceder uma raiz dá acesso de LEITURA a toda a subárvore. A CAPACIDADE
+ *     de escrita é adicionalmente limitada pelo PAPEL do usuário: USER é
+ *     somente leitura (nunca escreve, mesmo com raiz concedida), enquanto a
+ *     escrita exige nível >= UPLOADER. Esse gate por papel vive em
+ *     `assertCanWriteDepartment` (routes/documents.ts) — este resolvedor apenas
+ *     computa o conjunto acessível para LEITURA, reaproveitado pela checagem de
+ *     escrita de UPLOADER+ para restringir o departamento à subárvore concedida.
  *   - A herança é DINÂMICA: os filhos NÃO são materializados em
  *     `department_permissions`. A raiz é expandida para a subárvore em tempo
  *     de leitura/escrita (BFS in-memory sobre os departamentos do tenant).
@@ -20,8 +26,12 @@ import type { Sql } from '@dmdoc/db-pg';
 const ADMIN_ROLES_WITHOUT_ACL = ['TENANT_ADMIN', 'SUPER_ADMIN', 'MULTI_TENANT_ADMIN'];
 
 /**
- * Resolve o conjunto de departmentIds acessíveis a um usuário (leitura == escrita,
- * pois conceder uma raiz dá acesso total à subárvore).
+ * Resolve o conjunto de departmentIds acessíveis a um usuário para LEITURA
+ * (subárvore expandida das raízes concedidas). A capacidade de ESCRITA NÃO é
+ * decidida aqui: ela é gated por PAPEL em `assertCanWriteDepartment` (USER é
+ * somente leitura; escrita exige >= UPLOADER). Para UPLOADER+ com ACL, o
+ * conjunto retornado aqui também delimita em quais departamentos a escrita é
+ * permitida.
  *
  * - TENANT_ADMIN / SUPER_ADMIN / MULTI_TENANT_ADMIN: retorna `null`
  *   (sem restrição de ACL por departamento).
@@ -45,12 +55,17 @@ export async function resolveAccessibleDepartmentIds(
   const effectiveTenantId = tenantId as string;
 
   // 1. Raízes concedidas ao usuário.
+  //    Filtra `deleted = false` para ignorar CONCESSÕES REVOGADAS (soft-delete
+  //    da row de `department_permissions`). Uma concessão revogada não dá mais
+  //    acesso — consistente com `GET /users/:id/permissions`. NÃO confundir com
+  //    o `deleted` de `departments` (passo 2), que é deliberadamente ignorado.
   const grants = await sql<Array<{ department_id: string }>>`
     SELECT department_id
     FROM department_permissions
     WHERE user_id = ${userId}
       AND tenant_id = ${effectiveTenantId}
       AND can_read = true
+      AND deleted = false
   `;
 
   const rootIds = grants.map((g) => g.department_id);

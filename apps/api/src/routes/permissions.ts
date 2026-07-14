@@ -173,19 +173,16 @@ export const permissionsRoutes: FastifyPluginAsync = async (app) => {
 
     if (uniqueRootIds.length > 0) {
       for (const departmentId of uniqueRootIds) {
-        // Upsert: reativa a concessão caso já exista uma linha (o índice único
-        // uniq_dept_perm_user_dept é sobre (user_id, department_id) e não
-        // considera `deleted`, então a linha soft-deletada acima ainda ocupa o
-        // par e um INSERT puro colidiria com ela — 23505).
+        // INSERT puro: o índice único uniq_dept_perm_user_dept passou a ser
+        // PARCIAL (WHERE deleted = false, migration 0006). Como o UPDATE acima
+        // já soft-deletou toda concessão ativa deste usuário, não há linha
+        // `deleted = false` para o par (user_id, department_id) — a nova linha
+        // não colide com as soft-deletadas remanescentes, que ficam fora do
+        // índice. O workaround anterior (ON CONFLICT ... DO UPDATE) deixou de
+        // ser necessário e nem seria aceito como arbiter de um índice parcial.
         await sql`
           INSERT INTO department_permissions (id, tenant_id, user_id, department_id, can_read, can_write, deleted)
           VALUES (${newId()}, ${tenantId}, ${id}, ${departmentId}, true, true, false)
-          ON CONFLICT (user_id, department_id)
-          DO UPDATE SET
-            deleted = false,
-            can_read = true,
-            can_write = true,
-            tenant_id = EXCLUDED.tenant_id
         `;
       }
     }

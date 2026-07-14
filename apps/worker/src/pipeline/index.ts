@@ -3,10 +3,12 @@ import type { Sql } from 'postgres';
 import type { Logger } from 'pino';
 import OpenAI from 'openai';
 import type { ExtractorProvider } from '@dmdoc/extractor';
+import type { LLMProvider } from '@dmdoc/llm-provider';
 import type { DocumentProcessingJobData } from '@dmdoc/shared-types';
 import { extractDocument } from './extract.js';
 import { chunkText, type ChunkDocumentMeta } from './chunk.js';
 import { embedChunks } from './embed.js';
+import { classifyDocument } from './classify.js';
 import { persistProcessingResult } from './persist.js';
 
 export interface PipelineDeps {
@@ -14,6 +16,10 @@ export interface PipelineDeps {
   extractor: ExtractorProvider;
   openai: OpenAI;
   embeddingModel: string;
+  /** Provider de LLM de chat — usado na classificação automática (Fase 8). */
+  llmProvider: LLMProvider;
+  /** Modelo de chat configurado — fallback de auditoria no TypeSuggestion. */
+  chatModel: string;
   sql: Sql;
   logger: Logger;
   chunkTargetTokens?: number;
@@ -46,6 +52,8 @@ export async function runPipeline(
     extractor,
     openai,
     embeddingModel,
+    llmProvider,
+    chatModel,
     sql,
     logger: baseLogger,
     chunkTargetTokens,
@@ -98,7 +106,22 @@ export async function runPipeline(
       documentTypeName,
     };
 
-    // Etapa 2: Chunking semântico
+    // Etapa 2: Classificação automática de tipo (Fase 8) — best-effort.
+    // Roda logo após a extração (usa `extractResult.fullText`) e NUNCA derruba
+    // o pipeline: erro/skip retornam sugestão null sem interromper as etapas
+    // seguintes. NÃO toca em `documents.document_type_id` (escolha manual).
+    const { typeSuggestion, suggestedTitle, classificationUsd } =
+      await classifyDocument(
+        {
+          tenantId,
+          documentId,
+          departmentId,
+          fullText: extractResult.fullText,
+        },
+        { sql, llmProvider, chatModel, logger: log }
+      );
+
+    // Etapa 3: Chunking semântico
     log.info({ fullTextLength: extractResult.fullText.length }, 'iniciando chunking');
 
     const chunks = chunkText(
@@ -110,7 +133,7 @@ export async function runPipeline(
 
     log.info({ chunkCount: chunks.length }, 'chunking concluído');
 
-    // Etapa 3: Embeddings
+    // Etapa 4: Embeddings
     log.info({ chunkCount: chunks.length }, 'iniciando embeddings');
 
     const { embeddedChunks, totalEmbeddingsUsd } = await embedChunks(chunks, {
@@ -119,13 +142,16 @@ export async function runPipeline(
       logger: log,
     });
 
-    // Etapa 4: Persistência
+    // Etapa 5: Persistência
     await persistProcessingResult(
       {
         job: job.data,
         extractResult,
         embeddedChunks,
         totalEmbeddingsUsd,
+        typeSuggestion,
+        suggestedTitle,
+        classificationUsd,
         pipelineStartedAt,
       },
       { sql, logger: log }

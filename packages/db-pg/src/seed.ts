@@ -302,8 +302,10 @@ export async function seed(sql: postgres.Sql): Promise<void> {
   console.log(JSON.stringify({ level: 'info', name: 'seed', msg: 'MULTI_TENANT_ADMIN garantido', email: mtaEmail, allowedTenantIds: [tenantId, tenantId2] }));
 
   // --- Tipos globais (tenant_id NULL, is_global TRUE) ---
-  // index_fields é JSONB embutido no registro; o índice parcial uniq_doc_type_global_name
-  // protege unicidade por nome quando tenant_id IS NULL.
+  // document_types.index_fields (JSONB) é mantido por compatibilidade — LEGADO/
+  // CONGELADO, não é mais a fonte de verdade (ver document_type_index_fields
+  // abaixo). O índice parcial uniq_doc_type_global_name protege unicidade por
+  // nome quando tenant_id IS NULL.
   for (const seedType of globalTypeSeeds()) {
     const indexFieldsJson = seedType.indexFields.map((f, i) => ({
       id: newId(),
@@ -323,6 +325,35 @@ export async function seed(sql: postgres.Sql): Promise<void> {
         SET description  = EXCLUDED.description,
             index_fields = EXCLUDED.index_fields
     `;
+
+    const typeRows = await sql<Array<{ id: string }>>`
+      SELECT id FROM document_types WHERE name = ${seedType.name} AND tenant_id IS NULL LIMIT 1
+    `;
+    const documentTypeId = typeRows[0]?.id;
+    if (documentTypeId === undefined) {
+      throw new Error(`tipo global "${seedType.name}" não encontrado após upsert`);
+    }
+
+    // document_type_index_fields (tabela normalizada) — FONTE DE VERDADE dos
+    // campos de índice. Upsert idempotente por (document_type_id, name).
+    for (const field of seedType.indexFields) {
+      await sql`
+        INSERT INTO document_type_index_fields (
+          id, document_type_id, name, field_type, required, ai_extraction_hint, sort_order, show_on_search, deleted
+        )
+        VALUES (
+          gen_random_uuid(), ${documentTypeId}, ${field.name}, ${field.fieldType}, ${field.required},
+          ${field.aiExtractionHint}, ${field.sortOrder}, true, false
+        )
+        ON CONFLICT (document_type_id, name) DO UPDATE
+          SET field_type         = EXCLUDED.field_type,
+              required           = EXCLUDED.required,
+              ai_extraction_hint = EXCLUDED.ai_extraction_hint,
+              sort_order         = EXCLUDED.sort_order,
+              show_on_search     = EXCLUDED.show_on_search,
+              deleted            = false
+      `;
+    }
 
     console.log(JSON.stringify({ level: 'info', name: 'seed', msg: 'tipo global garantido', typeName: seedType.name, isGlobal: true }));
   }

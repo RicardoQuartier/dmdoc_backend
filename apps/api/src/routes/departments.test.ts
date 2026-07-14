@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
+import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb } from '../test/helpers.js';
 import { newId } from '@dmdoc/db-pg';
 
 /**
@@ -14,8 +14,9 @@ import { newId } from '@dmdoc/db-pg';
  * `canRead`. A exclusão é bloqueada (409) se houver sub-departamentos ativos.
  */
 
-const TENANT_A = '11111111-1111-1111-1111-111111111111';
-const TENANT_B = '22222222-2222-2222-2222-222222222222';
+// UUIDs de tenant por arquivo — evita colisão no `dmdoc_test` compartilhado.
+const TENANT_A = crypto.randomUUID();
+const TENANT_B = crypto.randomUUID();
 const ADMIN_A_ID = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
 const UPLOADER_A_ID = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
 const USER_A_ID = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
@@ -36,11 +37,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db`DELETE FROM department_permissions`;
-  await testDb.db`DELETE FROM documents`;
-  await testDb.db`DELETE FROM departments`;
-  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('TENANT_ADMIN','UPLOADER','USER')`;
-  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B})`;
+  await resetDomainTables(testDb.db);
 
   await testDb.db`
     INSERT INTO tenants (id, name, disk_quota_bytes, user_quota, active, created_at)
@@ -83,20 +80,28 @@ describe('DELETE /departments/:id — preserva documentos e permissões', () => 
     await testDb.db`
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
-        original_filename, content_hash, size_bytes, mime_type,
+        filename, original_filename, content_hash, size_bytes, mime_type,
         s3_key, status, tags, index_values, uploaded_by_id, uploaded_at, deleted
       ) VALUES (
         ${docId}, ${TENANT_A}, ${deptId}, NULL,
-        'nota-fiscal.pdf', ${newId()}, 1024, 'application/pdf',
+        'nota-fiscal.pdf', 'nota-fiscal.pdf', ${newId()}, 1024, 'application/pdf',
         ${`tenants/${TENANT_A}/${docId}.pdf`}, 'READY', '{}'::text[], '{}'::jsonb,
         ${ADMIN_A_ID}, NOW(), false
       )
     `;
 
+    // O usuário da permissão precisa existir (FK department_permissions.user_id).
+    await seedUser(testDb.db, {
+      id: permUserId,
+      tenantId: TENANT_A,
+      email: 'perm-user@empresa.com',
+      password: PASSWORD,
+      role: 'USER',
+    });
     await testDb.db`
       INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
       VALUES (${permUserId}, ${deptId}, ${TENANT_A}, true, false)
-      ON CONFLICT (user_id, department_id) DO NOTHING
+      ON CONFLICT (user_id, department_id) WHERE deleted = false DO NOTHING
     `;
 
     const res = await app.inject({
@@ -177,11 +182,11 @@ describe('GET /departments — documentCount', () => {
 
     // 2 documentos ativos + 1 deletado
     await testDb.db`
-      INSERT INTO documents (id, tenant_id, department_id, document_type_id, original_filename, content_hash, size_bytes, mime_type, s3_key, status, tags, index_values, uploaded_by_id, uploaded_at, deleted)
+      INSERT INTO documents (id, tenant_id, department_id, document_type_id, filename, original_filename, content_hash, size_bytes, mime_type, s3_key, status, tags, index_values, uploaded_by_id, uploaded_at, deleted)
       VALUES
-        (${newId()}, ${TENANT_A}, ${deptComDocs}, NULL, 'f1.pdf', ${newId()}, 100, 'application/pdf', 'k1', 'READY', '{}'::text[], '{}'::jsonb, ${ADMIN_A_ID}, NOW(), false),
-        (${newId()}, ${TENANT_A}, ${deptComDocs}, NULL, 'f2.pdf', ${newId()}, 100, 'application/pdf', 'k2', 'READY', '{}'::text[], '{}'::jsonb, ${ADMIN_A_ID}, NOW(), false),
-        (${newId()}, ${TENANT_A}, ${deptComDocs}, NULL, 'f3.pdf', ${newId()}, 100, 'application/pdf', 'k3', 'READY', '{}'::text[], '{}'::jsonb, ${ADMIN_A_ID}, NOW(), true)
+        (${newId()}, ${TENANT_A}, ${deptComDocs}, NULL, 'f1.pdf', 'f1.pdf', ${newId()}, 100, 'application/pdf', 'k1', 'READY', '{}'::text[], '{}'::jsonb, ${ADMIN_A_ID}, NOW(), false),
+        (${newId()}, ${TENANT_A}, ${deptComDocs}, NULL, 'f2.pdf', 'f2.pdf', ${newId()}, 100, 'application/pdf', 'k2', 'READY', '{}'::text[], '{}'::jsonb, ${ADMIN_A_ID}, NOW(), false),
+        (${newId()}, ${TENANT_A}, ${deptComDocs}, NULL, 'f3.pdf', 'f3.pdf', ${newId()}, 100, 'application/pdf', 'k3', 'READY', '{}'::text[], '{}'::jsonb, ${ADMIN_A_ID}, NOW(), true)
     `;
 
     const res = await app.inject({
@@ -262,7 +267,7 @@ describe('GET /departments?writable=true — filtro de escrita (seletor de uploa
     await testDb.db`
       INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
       VALUES (${userId}, ${departmentId}, ${TENANT_A}, true, true)
-      ON CONFLICT (user_id, department_id) DO UPDATE
+      ON CONFLICT (user_id, department_id) WHERE deleted = false DO UPDATE
         SET can_read = true, can_write = true
     `;
   }

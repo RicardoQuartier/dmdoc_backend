@@ -8,6 +8,7 @@ import {
   DOCUMENT_EVENTS_COLLECTION,
   newId,
   normalizeLimit,
+  resolveAiFeatureFlags,
 } from '@dmdoc/db-pg';
 import type { TenantDocument } from '@dmdoc/db-pg';
 import type { Sql } from '@dmdoc/db-pg';
@@ -15,16 +16,25 @@ import type {
   DocumentProcessingJobData,
   ExtractionResult,
   IndexSuggestion,
+  TypeSuggestion,
   CostBreakdown,
 } from '@dmdoc/shared-types';
-import { DocumentProcessingJobDataSchema } from '@dmdoc/shared-types';
+import {
+  DocumentProcessingJobDataSchema,
+  PublicTypeSuggestionSchema,
+  ROLE_LEVEL,
+  RoleSchema,
+} from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
-import { NotFoundError, QuotaExceededError, ValidationError } from '../errors/index.js';
+import { createLLMProvider, LLMError } from '@dmdoc/llm-provider';
+import { NotFoundError, QuotaExceededError, ValidationError, ForbiddenError, UpstreamServiceError, ConflictError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
 import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
-import { getConfig } from '../config.js';
+import { getConfig, type Config } from '../config.js';
+import { validateIndexValues, type IndexFieldRow } from '../lib/index-fields.js';
+import { suggestDocumentIndexes } from '../services/index-suggestion.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais que mapeiam as tabelas do PostgreSQL (spec §5.3)
@@ -52,6 +62,8 @@ interface DocumentRow extends TenantDocument {
   document_type_id: string | null;
   filename: string;
   original_filename: string;
+  title: string | null;
+  suggested_title: string | null;
   content_hash: string;
   size_bytes: bigint;
   mime_type: string;
@@ -64,17 +76,6 @@ interface DocumentRow extends TenantDocument {
   uploaded_at: Date;
   processed_at: Date | null;
   cost_usd_cents: number;
-}
-
-interface IndexFieldRow {
-  id: string;
-  name: string;
-  field_type: 'TEXT' | 'DATE' | 'NUMBER';
-  required: boolean;
-  ai_extraction_hint: string | null;
-  sort_order: number;
-  show_on_search: boolean;
-  deleted: boolean;
 }
 
 /**
@@ -94,6 +95,7 @@ interface DocumentContentRow {
   full_text: string;
   extraction: Omit<ExtractionResult, 'extractedAt'> & { extractedAt: string };
   index_suggestion: (Omit<IndexSuggestion, 'suggestedAt'> & { suggestedAt: string }) | null;
+  type_suggestion: (Omit<TypeSuggestion, 'suggestedAt'> & { suggestedAt: string }) | null;
   cost_breakdown: CostBreakdown | null;
 }
 
@@ -186,8 +188,17 @@ const ListDocumentsQuerySchema = z.object({
 /** Schema do body do PATCH /documents/:id. */
 const PatchDocumentBodySchema = z.object({
   documentTypeId: z.string().uuid().nullable().optional(),
+  // Título de exibição confirmado/editado pelo usuário (Fase 8.1).
+  // string = confirma/edita o título; `null` explícito = limpa o título
+  // confirmado (volta ao fallback `originalFilename`); ausente = não mexe.
+  title: z.string().min(1).max(500).nullable().optional(),
   indexValues: z.record(z.union([z.string(), z.number(), z.null()])).optional(),
   tags: z.array(z.string()).optional(),
+});
+
+/** Schema dos params de rotas `/documents/:id/*` que exigem um UUID válido. */
+const DocumentIdParamsSchema = z.object({
+  id: z.string().uuid(),
 });
 
 /**
@@ -317,7 +328,20 @@ async function assertCanReadDepartment(
 /**
  * Valida se o usuário pode ESCREVER em um departamento específico.
  *
- * Lança `NotFoundError` se sem permissão.
+ * Duas camadas de controle, nesta ordem:
+ *   1. GATE POR PAPEL — a CAPACIDADE de escrita exige nível >= UPLOADER (40).
+ *      USER (20) é somente leitura por definição (wiki "Papéis de acesso
+ *      (roles)"): mesmo com uma raiz concedida ativa (que lhe dá leitura da
+ *      subárvore), NUNCA pode escrever. Papel desconhecido/inválido cai como
+ *      SEM escrita (fail-closed). Cobre uniformemente PATCH/DELETE/reprocess/
+ *      suggest-indexes — todos passam por este choke point.
+ *   2. ACL POR DEPARTAMENTO — para papéis com capacidade de escrita, o
+ *      departamento precisa estar no conjunto acessível (subárvore concedida)
+ *      ou o papel ser admin (sem restrição de ACL).
+ *
+ * Lança `NotFoundError` (nunca 403 — spec §10, invariante 4) se sem permissão,
+ * com a mesma mensagem em ambas as camadas para não vazar a existência do
+ * recurso a quem não pode escrever nele.
  */
 async function assertCanWriteDepartment(
   sql: Sql,
@@ -326,6 +350,15 @@ async function assertCanWriteDepartment(
   departmentId: string,
   role: string
 ): Promise<void> {
+  // Camada 1: gate por nível de papel (fail-closed).
+  // O role vem do JWT já validado, mas mantemos a checagem type-safe: um papel
+  // não reconhecido resolve para nível 0 e é negado, nunca liberado.
+  const parsedRole = RoleSchema.safeParse(role);
+  const roleLevel = parsedRole.success ? ROLE_LEVEL[parsedRole.data] : 0;
+  if (roleLevel < ROLE_LEVEL.UPLOADER) {
+    throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
+  }
+
   const accessible = await resolveAccessibleDepartmentIds(sql, userId, tenantId, role);
   if (accessible === null) {
     // Admin sem restrição de ACL: verifica apenas que o dept pertence ao tenant.
@@ -340,59 +373,6 @@ async function assertCanWriteDepartment(
   if (!accessible.includes(departmentId)) {
     throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
   }
-}
-
-/**
- * Valida os valores de `indexValues` contra os `indexFields` do tipo de documento.
- *
- * Retorna lista de erros (vazia = válido).
- */
-function validateIndexValues(
-  indexValues: Record<string, string | number | null>,
-  indexFields: IndexFieldRow[]
-): string[] {
-  const activeFields = indexFields.filter((f) => !f.deleted);
-  const errors: string[] = [];
-
-  for (const field of activeFields) {
-    const value = indexValues[field.name];
-
-    if (field.required && (value === undefined || value === null || value === '')) {
-      errors.push(`Campo obrigatório ausente: "${field.name}"`);
-      continue;
-    }
-
-    if (value === undefined || value === null) {
-      continue;
-    }
-
-    switch (field.field_type) {
-      case 'TEXT': {
-        if (typeof value !== 'string' || value.trim() === '') {
-          errors.push(`Campo "${field.name}" deve ser texto não vazio`);
-        } else if (value.length > 500) {
-          errors.push(`Campo "${field.name}" excede 500 caracteres`);
-        }
-        break;
-      }
-      case 'DATE': {
-        const dateStr = String(value);
-        if (!/^\d{4}-\d{2}-\d{2}(T[\d:.Z+-]+)?$/.test(dateStr) || isNaN(Date.parse(dateStr))) {
-          errors.push(`Campo "${field.name}" deve ser uma data válida no formato ISO 8601`);
-        }
-        break;
-      }
-      case 'NUMBER': {
-        const num = typeof value === 'number' ? value : parseFloat(String(value));
-        if (!isFinite(num)) {
-          errors.push(`Campo "${field.name}" deve ser um número válido`);
-        }
-        break;
-      }
-    }
-  }
-
-  return errors;
 }
 
 /**
@@ -428,6 +408,8 @@ function rowToDocument(r: DocumentRow): Record<string, unknown> {
     documentTypeId: r.document_type_id,
     filename: r.filename,
     originalFilename: r.original_filename,
+    title: r.title,
+    suggestedTitle: r.suggested_title,
     contentHash: r.content_hash,
     sizeBytes: Number(r.size_bytes),
     mimeType: r.mime_type,
@@ -643,10 +625,27 @@ async function emitUploadEvent(
 // Plugin de rotas
 // ---------------------------------------------------------------------------
 
+export interface DocumentsRoutesOptions {
+  config: Config;
+}
+
 /**
  * Rotas de documentos — PostgreSQL.
  */
-export const documentsRoutes: FastifyPluginAsync = async (app) => {
+export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async (app, options) => {
+  const { config } = options;
+
+  // Provider de LLM compartilhado entre as chamadas desta rota (mesmo padrão
+  // de `search.ts`) — usado exclusivamente por `POST /documents/:id/suggest-indexes`.
+  const llmProvider = createLLMProvider(
+    {
+      provider: config.LLM_PROVIDER,
+      baseURL: config.LLM_BASE_URL,
+      apiKey: config.LLM_API_KEY || 'placeholder',
+      model: config.LLM_MODEL,
+    },
+    app.log,
+  );
   /**
    * POST /documents — upload multipart de documento.
    */
@@ -856,29 +855,80 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     const documentId = newId();
     const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
 
+    // Exceção FAILED da deduplicação (regra "Deduplicação de documentos por
+    // conteúdo"): se já existe um documento com o mesmo `contentHash` neste
+    // tenant mas em status FAILED, a dedup NÃO se aplica — criamos um NOVO
+    // documento e reenfileiramos. O índice único parcial
+    // `uniq_doc_tenant_content_hash (tenant_id, content_hash) WHERE deleted = false`
+    // impede duas linhas não-deletadas com o mesmo hash; por isso, ao reenviar
+    // um conteúdo FAILED, soft-deletamos o registro FAILED (liberando o índice)
+    // e inserimos o novo NA MESMA TRANSAÇÃO — antes disso o insert colidia
+    // (23505) e vazava como 500 (bug UPLOAD-14).
+    const reuploadOfFailed = existingDoc !== null && existingDoc.status === 'FAILED';
+
+    const insertPayload = {
+      id: documentId,
+      department_id: departmentId,
+      document_type_id: documentTypeId ?? null,
+      filename,
+      original_filename: originalFilename,
+      title: null,
+      suggested_title: null,
+      content_hash: contentHash,
+      size_bytes: BigInt(fileSize),
+      mime_type: mimeType,
+      s3_key: s3Key,
+      status: 'PENDING',
+      failure_reason: null,
+      tags: [],
+      index_values: indexValues as Record<string, string | number | null>,
+      uploaded_by_id: userId,
+      uploaded_at: new Date(),
+      processed_at: null,
+      cost_usd_cents: 0,
+    } as Omit<DocumentRow, 'id' | 'tenantId' | 'tenant_id' | 'deleted'>;
+
     let document: DocumentRow;
     try {
-      document = await repo.insertOne({
-        id: documentId,
-        department_id: departmentId,
-        document_type_id: documentTypeId ?? null,
-        filename,
-        original_filename: originalFilename,
-        content_hash: contentHash,
-        size_bytes: BigInt(fileSize),
-        mime_type: mimeType,
-        s3_key: s3Key,
-        status: 'PENDING',
-        failure_reason: null,
-        tags: [],
-        index_values: indexValues as Record<string, string | number | null>,
-        uploaded_by_id: userId,
-        uploaded_at: new Date(),
-        processed_at: null,
-        cost_usd_cents: 0,
-      } as Omit<DocumentRow, 'id' | 'tenantId' | 'tenant_id' | 'deleted'>);
+      if (reuploadOfFailed) {
+        document = await sql.begin(async (tx) => {
+          await tx`
+            UPDATE documents
+            SET deleted = true
+            WHERE tenant_id = ${tenantId}
+              AND content_hash = ${contentHash}
+              AND status = 'FAILED'
+              AND deleted = false
+          `;
+          const txRepo = new TenantRepository<DocumentRow>(tx as unknown as typeof sql, 'documents', { tenantId });
+          return txRepo.insertOne(insertPayload);
+        });
+      } else {
+        document = await repo.insertOne(insertPayload);
+      }
     } catch (insertError) {
-      // Rollback: remove arquivo do S3
+      // Corrida de deduplicação (UPLOAD-16): dois uploads do MESMO conteúdo novo
+      // passam pela checagem de dedup antes de qualquer um persistir; o índice
+      // único parcial `uniq_doc_tenant_content_hash (tenant_id, content_hash)
+      // WHERE deleted = false` garante que só um vença — o perdedor recebe 23505.
+      // Regra "Deduplicação de documentos por conteúdo" (caso de borda "upload
+      // concorrente do mesmo arquivo"): o perdedor é tratado como 409 Conflict
+      // (nunca 500). A integridade é preservada — apenas um documento persiste.
+      if ((insertError as { code?: string }).code === '23505') {
+        // NÃO remover o objeto do S3 aqui: a chave é derivada de
+        // (contentHash, filename) e, quando o vencedor subiu o mesmo arquivo
+        // com o mesmo nome, é a MESMA chave — apagá-la corromperia o documento
+        // vencedor. O conteúdo já está no S3 (upload idempotente). Um eventual
+        // objeto órfão (nomes de arquivo diferentes) é custo aceitável nesta
+        // corrida rara, preferível a arriscar apagar o arquivo do vencedor.
+        request.log.info(
+          { tenantId, userId, contentHash },
+          'colisão de deduplicação por corrida — perdedor tratado como 409'
+        );
+        throw new ConflictError('Conteúdo já existe nesta empresa (conflito de deduplicação por corrida)');
+      }
+
+      // Rollback: remove arquivo do S3 (erro de insert não relacionado à corrida).
       try {
         await app.s3.deleteFile(s3Key);
       } catch (deleteError) {
@@ -1173,9 +1223,14 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     await assertCanReadDepartment(sql, userId, doc.tenant_id, doc.department_id, role);
 
-    // Enriquece com pageCount de document_content
-    const contentRows = await sql<Array<{ extraction: { pageCount?: number } | null }>>`
-      SELECT extraction
+    // Enriquece com pageCount e a sugestão de tipo por IA (Fase 8) de
+    // document_content. A sugestão só aparece para quem já passou pelo
+    // controle de acesso acima (assertCanReadDepartment) — nunca vaza para
+    // fora do escopo do documento.
+    const contentRows = await sql<
+      Array<{ extraction: { pageCount?: number } | null; type_suggestion: unknown }>
+    >`
+      SELECT extraction, type_suggestion
       FROM document_content
       WHERE document_id = ${doc.id}
         AND tenant_id = ${doc.tenant_id}
@@ -1186,12 +1241,32 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
         ? contentRows[0].extraction.pageCount
         : null;
 
+    // Nome do tipo de documento atribuído (tenant OU global). `resolveDocumentTypeName`
+    // cobre ambos os escopos: tipos da empresa (`tenant_id = doc.tenant_id`) e tipos
+    // globais (`is_global = true`, `tenant_id NULL`). Sem isso, o detalhe não expõe o
+    // nome do tipo e a UI mostra "Sem tipo" mesmo com `document_type_id` preenchido.
+    const documentTypeName = await resolveDocumentTypeName(
+      sql,
+      doc.tenant_id,
+      doc.document_type_id
+    );
+
+    // Subconjunto SEGURO da sugestão: só documentTypeId/documentTypeName/
+    // confidence. O `parse` do PublicTypeSuggestionSchema descarta model,
+    // promptVersion, suggestedAt e rawResponse — esses ficam só no /debug.
+    // Null enquanto o worker de classificação ainda não rodou (coluna nula).
+    const rawTypeSuggestion = contentRows[0]?.type_suggestion ?? null;
+    const typeSuggestion =
+      rawTypeSuggestion !== null ? PublicTypeSuggestionSchema.parse(rawTypeSuggestion) : null;
+
     request.log.info(
       { tenantId: doc.tenant_id, userId, documentId: doc.id },
       'detalhe de documento recuperado'
     );
 
-    return reply.status(200).send({ ...rowToDocument(doc), pageCount });
+    return reply
+      .status(200)
+      .send({ ...rowToDocument(doc), documentTypeName, pageCount, typeSuggestion });
   });
 
   // =========================================================================
@@ -1394,7 +1469,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
     // antes da extração terminar) — estado válido, não é erro.
     const [contentRows, chunkCountRows, chunkSampleRows] = await Promise.all([
       sql<DocumentContentRow[]>`
-        SELECT document_id, tenant_id, full_text, extraction, index_suggestion, cost_breakdown
+        SELECT document_id, tenant_id, full_text, extraction, index_suggestion, type_suggestion, cost_breakdown
         FROM document_content
         WHERE document_id = ${doc.id}
           AND tenant_id = ${doc.tenant_id}
@@ -1427,6 +1502,13 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
         ? { ...content.index_suggestion, suggestedAt: new Date(content.index_suggestion.suggestedAt) }
         : null;
 
+    // Sugestão de tipo COMPLETA (Fase 8), incl. campos de auditoria/operação
+    // (model, promptVersion, rawResponse) — exclusiva do /debug do SUPER_ADMIN.
+    const typeSuggestion: TypeSuggestion | null =
+      content?.type_suggestion != null
+        ? { ...content.type_suggestion, suggestedAt: new Date(content.type_suggestion.suggestedAt) }
+        : null;
+
     request.log.info(
       { tenantId: doc.tenant_id, userId, documentId: doc.id },
       'debug de documento consultado por SUPER_ADMIN'
@@ -1440,6 +1522,7 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
       fullText: content?.full_text ?? null,
       fullTextLength: content?.full_text.length ?? 0,
       indexSuggestion,
+      typeSuggestion,
       costBreakdown: content?.cost_breakdown ?? null,
       costUsdCents: doc.cost_usd_cents,
       chunkCount: parseInt(chunkCountRows[0]?.count ?? '0', 10),
@@ -1541,6 +1624,9 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     if ('documentTypeId' in body) {
       updateData.document_type_id = body.documentTypeId ?? null;
+    }
+    if ('title' in body) {
+      updateData.title = body.title ?? null;
     }
     if (body.indexValues !== undefined) {
       updateData.index_values = body.indexValues as Record<string, string | number | null>;
@@ -1956,6 +2042,108 @@ export const documentsRoutes: FastifyPluginAsync = async (app) => {
 
     reply.raw.on('close', () => {
       clearInterval(interval);
+    });
+  });
+
+  // =========================================================================
+  // POST /documents/:id/suggest-indexes — sugestão de valores de índice por IA
+  // (Fase 7, entregável #55). Sob demanda — nunca roda automaticamente no
+  // worker. Requer `documentTypeId` já definido (checado pelo próprio service
+  // `suggestDocumentIndexes`, que lança `ValidationError` caso contrário).
+  // =========================================================================
+  app.post('/documents/:id/suggest-indexes', { preHandler: app.authenticate }, async (request, reply) => {
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const sql = app.db;
+
+    const { id } = DocumentIdParamsSchema.parse(request.params);
+
+    // ------------------------------------------------------------------
+    // 1. Resolve o documento respeitando o escopo do role (mesmo padrão de
+    //    GET/PATCH/DELETE) — documento de outro tenant sempre vira 404, nunca
+    //    403 (spec §10, invariante 4).
+    // ------------------------------------------------------------------
+    let doc: DocumentRow | null;
+    if (role === 'SUPER_ADMIN') {
+      doc = await findDocumentGlobally(sql, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
+      doc = await repo.findById(id);
+    }
+
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    const tenantId = doc.tenant_id;
+
+    // Sugestão de índices é uma escrita (persiste `document_content.index_suggestion`
+    // e incrementa custo) — exige a mesma permissão de escrita no departamento
+    // usada em PATCH/DELETE.
+    await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
+
+    const log = request.log.child({ tenantId, documentId: id, userId, traceId: request.id });
+
+    // ------------------------------------------------------------------
+    // 2. Feature flag de IA (Fase 6.9, entregável #71) — checa o valor
+    //    efetivo (plataforma AND empresa) ANTES de chamar o LLM.
+    // ------------------------------------------------------------------
+    const aiFlags = await resolveAiFeatureFlags(sql, tenantId);
+    if (!aiFlags.indexSuggestionEnabled) {
+      log.info({}, 'sugestão de índices por IA desabilitada para esta empresa — LLM não chamado');
+      throw new ForbiddenError('Sugestão de índices por IA está desabilitada para esta empresa');
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Chama o service (que também valida `documentTypeId` e o `content`
+    //    processado — NotFoundError/ValidationError propagam para o error
+    //    handler central, mapeando para 404/422 automaticamente). Falha do
+    //    provedor de LLM (chave inválida/ausente, provedor fora do ar) vira
+    //    502 com mensagem clara — não é um bug do DMDoc, é upstream.
+    // ------------------------------------------------------------------
+    let result: Awaited<ReturnType<typeof suggestDocumentIndexes>>;
+    try {
+      result = await suggestDocumentIndexes(
+        { tenantId, documentId: id },
+        { sql, llmProvider, logger: log }
+      );
+    } catch (err) {
+      if (err instanceof LLMError) {
+        log.error({ err }, 'sugestão de índices falhou por erro do provedor de LLM');
+        throw new UpstreamServiceError(
+          'Não foi possível gerar a sugestão agora — falha ao chamar o provedor de IA. Tente novamente em instantes.'
+        );
+      }
+      throw err;
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Resposta HTTP `{ fields: [{ name, value, confidence }] }` (spec §7).
+    //    O array já vem do service montado a partir dos campos REAIS do tipo
+    //    (`indexFieldRows`), com valor normalizado/validado e confiança casada
+    //    por campo. Nomes de campo alucinados pelo LLM foram descartados no
+    //    service — nunca chegam aqui nem vazam na resposta.
+    // ------------------------------------------------------------------
+    const fields = result.fields;
+
+    log.info(
+      {
+        fieldsRequested: fields.length,
+        fieldsSuggested: fields.filter((f) => f.value !== null).length,
+        costUsd: result.costUsd,
+      },
+      'sugestão de índices retornada'
+    );
+
+    return reply.status(200).send({
+      fields,
+      model: result.indexSuggestion.model,
+      promptVersion: result.indexSuggestion.promptVersion,
+      suggestedAt: result.indexSuggestion.suggestedAt,
+      costUsd: result.costUsd,
     });
   });
 };

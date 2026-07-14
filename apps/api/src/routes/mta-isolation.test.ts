@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
+import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb } from '../test/helpers.js';
 import { newId } from '@dmdoc/db-pg';
 
 /**
@@ -23,9 +23,10 @@ import { newId } from '@dmdoc/db-pg';
  * pode vazar).
  */
 
-const TENANT_A = '11111111-1111-1111-1111-111111111111';
-const TENANT_B = '22222222-2222-2222-2222-222222222222';
-const TENANT_C = '33333333-3333-3333-3333-333333333333';
+// UUIDs de tenant por arquivo — evita colisão no `dmdoc_test` compartilhado.
+const TENANT_A = crypto.randomUUID();
+const TENANT_B = crypto.randomUUID();
+const TENANT_C = crypto.randomUUID();
 
 const MTA_ID = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
 const MTA_EMPTY_ID = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
@@ -56,12 +57,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await testDb.db`DELETE FROM department_permissions`;
-  await testDb.db`DELETE FROM documents`;
-  await testDb.db`DELETE FROM document_types`;
-  await testDb.db`DELETE FROM departments`;
-  await testDb.db`DELETE FROM users WHERE tenant_id IS NOT NULL OR role IN ('MULTI_TENANT_ADMIN','TENANT_ADMIN','UPLOADER','USER')`;
-  await testDb.db`DELETE FROM tenants WHERE id IN (${TENANT_A}, ${TENANT_B}, ${TENANT_C})`;
+  await resetDomainTables(testDb.db);
 
   // Três tenants: A e B atribuídos ao MTA; C é de terceiro.
   await testDb.db`
@@ -109,13 +105,13 @@ beforeEach(async () => {
   await testDb.db`
     INSERT INTO documents (
       id, tenant_id, department_id, document_type_id,
-      original_filename, content_hash, size_bytes, mime_type,
+      filename, original_filename, content_hash, size_bytes, mime_type,
       s3_key, status, failure_reason, tags, index_values,
       uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
     ) VALUES
-      (${DOC_A_ID}, ${TENANT_A}, ${DEPT_A_ID}, NULL, 'a.pdf', ${hashA}, 1024, 'application/pdf', ${`tenants/${TENANT_A}/${DOC_A_ID}.pdf`}, 'READY', NULL, '{"tag-a"}'::text[], '{}'::jsonb, ${MTA_ID}, NOW(), NOW(), 0, false),
-      (${DOC_B_ID}, ${TENANT_B}, ${DEPT_B_ID}, NULL, 'b.pdf', ${hashB}, 1024, 'application/pdf', ${`tenants/${TENANT_B}/${DOC_B_ID}.pdf`}, 'READY', NULL, '{"tag-b"}'::text[], '{}'::jsonb, ${MTA_ID}, NOW(), NOW(), 0, false),
-      (${DOC_C_ID}, ${TENANT_C}, ${DEPT_C_ID}, NULL, 'c.pdf', ${hashC}, 1024, 'application/pdf', ${`tenants/${TENANT_C}/${DOC_C_ID}.pdf`}, 'READY', NULL, '{"tag-c","segredo-c"}'::text[], '{}'::jsonb, ${MTA_ID}, NOW(), NOW(), 0, false)
+      (${DOC_A_ID}, ${TENANT_A}, ${DEPT_A_ID}, NULL, 'a.pdf', 'a.pdf', ${hashA}, 1024, 'application/pdf', ${`tenants/${TENANT_A}/${DOC_A_ID}.pdf`}, 'READY', NULL, '{"tag-a"}'::text[], '{}'::jsonb, ${MTA_ID}, NOW(), NOW(), 0, false),
+      (${DOC_B_ID}, ${TENANT_B}, ${DEPT_B_ID}, NULL, 'b.pdf', 'b.pdf', ${hashB}, 1024, 'application/pdf', ${`tenants/${TENANT_B}/${DOC_B_ID}.pdf`}, 'READY', NULL, '{"tag-b"}'::text[], '{}'::jsonb, ${MTA_ID}, NOW(), NOW(), 0, false),
+      (${DOC_C_ID}, ${TENANT_C}, ${DEPT_C_ID}, NULL, 'c.pdf', 'c.pdf', ${hashC}, 1024, 'application/pdf', ${`tenants/${TENANT_C}/${DOC_C_ID}.pdf`}, 'READY', NULL, '{"tag-c","segredo-c"}'::text[], '{}'::jsonb, ${MTA_ID}, NOW(), NOW(), 0, false)
   `;
 
   mtaToken = await login('mta@plataforma.com');

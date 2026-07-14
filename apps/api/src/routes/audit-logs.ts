@@ -37,9 +37,30 @@ type AuditLogRow = {
   user_id: string | null;
   action: string;
   resource: string | null;
-  metadata: Record<string, unknown>;
+  // O cliente postgres.js deste projeto (createPgClient) NÃO faz parse
+  // automático de colunas jsonb: `metadata` volta como string JSON crua do
+  // banco. O mapeamento da resposta precisa parsear (ver parseMetadata).
+  metadata: string | Record<string, unknown> | null;
   created_at: Date;
 };
+
+/**
+ * Normaliza o `metadata` de um audit log para objeto. postgres.js entrega
+ * jsonb como string; parseamos com segurança para expor um objeto na API
+ * (nunca a string crua). Em caso de valor inesperado, cai para `{}`.
+ */
+function parseMetadata(value: AuditLogRow['metadata']): Record<string, unknown> {
+  if (value === null || value === undefined) return {};
+  if (typeof value === 'object') return value;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === 'object' && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
 
 /**
  * Encode de cursor opaco (Date ISO → base64).
@@ -158,7 +179,7 @@ export const auditLogsRoutes: FastifyPluginAsync = async (app) => {
       userId: row.user_id,
       action: row.action,
       resource: row.resource,
-      metadata: row.metadata,
+      metadata: parseMetadata(row.metadata),
       createdAt: row.created_at,
     }));
 

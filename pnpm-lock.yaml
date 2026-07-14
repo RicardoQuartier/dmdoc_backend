@@ -120,6 +120,9 @@ importers:
       '@dmdoc/extractor':
         specifier: workspace:*
         version: link:../../packages/extractor
+      '@dmdoc/llm-provider':
+        specifier: workspace:*
+        version: link:../../packages/llm-provider
       '@dmdoc/logger':
         specifier: workspace:*
         version: link:../../packages/logger
