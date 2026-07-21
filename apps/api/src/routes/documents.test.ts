@@ -83,6 +83,7 @@ beforeEach(async () => {
   await testDb.db`DELETE FROM document_content`;
   await testDb.db`DELETE FROM documents`;
   await testDb.db`DELETE FROM department_permissions`;
+  await testDb.db`DELETE FROM document_type_index_fields`;
   await testDb.db`DELETE FROM document_types`;
   await testDb.db`DELETE FROM departments`;
   // Inclui MULTI_TENANT_ADMIN/SUPER_ADMIN (tenant_id NULL) — sem isso, usuários
@@ -1507,6 +1508,136 @@ describe('GET /documents/:id — typeSuggestion (Fase 8)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /documents/:id — sugestão automática de valores de índice (T-16, Gatilho 1)
+// ---------------------------------------------------------------------------
+
+describe('GET /documents/:id — indexSuggestion (T-16)', () => {
+  /**
+   * Cria um documento READY em TENANT_A/DEPT_A e, opcionalmente, uma linha de
+   * document_content com uma sugestão de índice COMPLETA (incluindo os campos
+   * sensíveis model/promptVersion/rawResponse) para verificar que o endpoint
+   * público expõe só o subconjunto seguro (values + suggestedAt).
+   */
+  async function seedDocWithIndexSuggestion(
+    indexSuggestion: Record<string, JsonValue> | null
+  ): Promise<string> {
+    const docId = newId();
+    const hash = 'd'.repeat(64);
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
+        'idx.pdf', 'idx.pdf', ${hash}, 2048, 'application/pdf',
+        ${`tenants/${TENANT_A}/documents/${hash}/idx.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NOW(), 0, false
+      )
+    `;
+    await testDb.db`
+      INSERT INTO document_content (document_id, tenant_id, full_text, extraction, index_suggestion)
+      VALUES (
+        ${docId}, ${TENANT_A}, 'texto extraido',
+        ${testDb.db.json({ engine: 'native', engineVersion: '1.0.0', durationMs: 10, ocrPages: [], pageCount: 3, extractedAt: new Date().toISOString() })},
+        ${indexSuggestion === null ? null : testDb.db.json(indexSuggestion)}
+      )
+    `;
+    return docId;
+  }
+
+  const SUGGESTED_AT = new Date().toISOString();
+  const FULL_INDEX_SUGGESTION = {
+    values: {
+      'Numero do Documento': 'FAT-2026-000731',
+      Vencimento: '2026-08-15',
+      Valor: '3450.75',
+    },
+    model: 'gpt-4o-mini',
+    promptVersion: 'suggest-indexes-v2',
+    suggestedAt: SUGGESTED_AT,
+    rawResponse: { choices: [{ text: 'segredo interno de indices' }] },
+  };
+
+  it('expõe values + suggestedAt e NÃO vaza campos sensíveis', async () => {
+    const docId = await seedDocWithIndexSuggestion(FULL_INDEX_SUGGESTION);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.indexSuggestion).toEqual({
+      values: {
+        'Numero do Documento': 'FAT-2026-000731',
+        Vencimento: '2026-08-15',
+        Valor: '3450.75',
+      },
+      suggestedAt: SUGGESTED_AT,
+    });
+    // Campos sensíveis nunca aparecem no endpoint público
+    expect(body.indexSuggestion).not.toHaveProperty('model');
+    expect(body.indexSuggestion).not.toHaveProperty('promptVersion');
+    expect(body.indexSuggestion).not.toHaveProperty('rawResponse');
+    // Sanidade: nada sensível vaza em lugar nenhum do payload
+    expect(res.payload).not.toContain('segredo interno de indices');
+    expect(res.payload).not.toContain('suggest-indexes-v2');
+  });
+
+  it('sugestão sem nenhum valor válido → values: {}', async () => {
+    const docId = await seedDocWithIndexSuggestion({
+      values: {},
+      model: 'gpt-4o-mini',
+      promptVersion: 'suggest-indexes-v2',
+      suggestedAt: SUGGESTED_AT,
+      rawResponse: {},
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().indexSuggestion).toEqual({ values: {}, suggestedAt: SUGGESTED_AT });
+  });
+
+  it('documento sem sugestão (worker não rodou) → indexSuggestion: null', async () => {
+    const docId = await seedDocWithIndexSuggestion(null);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().indexSuggestion).toBeNull();
+  });
+
+  it('usuário de outro tenant → 404, sem vazar a sugestão de índices', async () => {
+    const docId = await seedDocWithIndexSuggestion(FULL_INDEX_SUGGESTION);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminB}` },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+    expect(res.payload).not.toContain('indexSuggestion');
+    expect(res.payload).not.toContain('FAT-2026-000731');
+    expect(res.payload).not.toContain('segredo interno de indices');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET /documents/:id — documentTypeName (tipo da empresa E tipo global)
 // ---------------------------------------------------------------------------
 
@@ -2769,6 +2900,168 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
 
     expect(res.statusCode).toBe(422);
     expect(res.json().error.code).toBe('VALIDATION_ERROR');
+    expect(fakeLlmChat).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// GATILHO 2 (Fase 7, T-16): PATCH /documents/:id que DEFINE/TROCA o tipo dispara
+// a sugestão automática de índices (aguardando, best-effort, respeitando a
+// feature). CONSULTIVO: grava só `index_suggestion`, nunca valores confirmados.
+// ===========================================================================
+describe('PATCH /documents/:id — sugestão automática de índices ao definir tipo (Fase 7)', () => {
+  /** ChatResult fake do provedor para a sugestão de índices (formato suggest-indexes-v1). */
+  function suggestChatResult(
+    fields: Array<{ name: string; value: string | null; confidence: number }>,
+    costUsd = 0.0003
+  ): ChatResult {
+    return {
+      content: JSON.stringify({ fields }),
+      model: 'gpt-4o-mini',
+      usage: { promptTokens: 300, completionTokens: 40, totalTokens: 340, costUsd },
+    };
+  }
+
+  /** Cria um doc READY com conteúdo processado e SEM tipo definido. */
+  async function seedProcessedDocNoType(): Promise<string> {
+    const docId = newId();
+    const hash = crypto.randomBytes(32).toString('hex');
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${TENANT_A}, ${DEPT_A_ID}, ${null},
+        'patch.pdf', 'patch.pdf', ${hash}, 2048, 'application/pdf',
+        ${`tenants/${TENANT_A}/documents/${hash}/patch.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NOW(), 0, false
+      )
+    `;
+    await testDb.db`
+      INSERT INTO document_content (document_id, tenant_id, full_text, extraction, cost_breakdown)
+      VALUES (
+        ${docId}, ${TENANT_A}, 'Contrato com o cliente ACME Ltda no valor de R$ 1.234,56.',
+        ${testDb.db.json({ engine: 'native', engineVersion: '1.0.0', durationMs: 10, ocrPages: [], pageCount: 1, extractedAt: new Date().toISOString() })},
+        ${testDb.db.json({ extractionUsd: 0, embeddingsUsd: 0.01, suggestionUsd: 0, classificationUsd: 0, totalUsd: 0.01 })}
+      )
+    `;
+    return docId;
+  }
+
+  /** Adiciona campos de índice ao tipo `Contrato A` (DOC_TYPE_ID). */
+  async function seedIndexFields(): Promise<void> {
+    await testDb.db`
+      INSERT INTO document_type_index_fields
+        (id, document_type_id, name, field_type, required, ai_extraction_hint, sort_order, show_on_search, deleted)
+      VALUES
+        (${newId()}, ${DOC_TYPE_ID}, 'Cliente', 'TEXT', false, NULL, 0, true, false),
+        (${newId()}, ${DOC_TYPE_ID}, 'Valor', 'NUMBER', false, NULL, 1, true, false)
+    `;
+  }
+
+  beforeEach(() => {
+    fakeLlmChat.mockReset();
+  });
+
+  it('define o tipo e retorna suggestedIndexFields (valores normalizados) na resposta', async () => {
+    await seedIndexFields();
+    const docId = await seedProcessedDocNoType();
+    // A IA sugere "Cliente" (TEXT) e "Valor" em formato pt-BR (normalizado depois).
+    fakeLlmChat.mockResolvedValueOnce(
+      suggestChatResult([
+        { name: 'Cliente', value: 'ACME Ltda', confidence: 0.92 },
+        { name: 'Valor', value: 'R$ 1.234,56', confidence: 0.8 },
+      ])
+    );
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { documentTypeId: DOC_TYPE_ID },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Record<string, unknown>;
+    // Tipo salvo (confirmado pelo usuário).
+    expect(body.documentTypeId).toBe(DOC_TYPE_ID);
+    // Valores sugeridos vêm na resposta, prontos para a tela de revisão.
+    const fields = body.suggestedIndexFields as Array<{ name: string; value: string | null }>;
+    expect(fields.map((f) => f.name)).toEqual(['Cliente', 'Valor']);
+    expect(fields.find((f) => f.name === 'Cliente')?.value).toBe('ACME Ltda');
+    // NUMBER pt-BR normalizado para o formato canônico.
+    expect(fields.find((f) => f.name === 'Valor')?.value).toBe('1234.56');
+
+    // CONSULTIVO: a sugestão é persistida em index_suggestion; index_values (valores
+    // confirmados) permanece VAZIO — nunca é preenchido automaticamente.
+    const rows = await testDb.db<
+      Array<{ index_values: Record<string, unknown>; document_type_id: string | null }>
+    >`SELECT index_values, document_type_id FROM documents WHERE id = ${docId}`;
+    expect(rows[0]!.index_values).toEqual({});
+    expect(rows[0]!.document_type_id).toBe(DOC_TYPE_ID);
+
+    const content = await testDb.db<Array<{ index_suggestion: Record<string, unknown> | null }>>`
+      SELECT index_suggestion FROM document_content WHERE document_id = ${docId}
+    `;
+    expect(content[0]!.index_suggestion).not.toBeNull();
+    expect((content[0]!.index_suggestion!['values'] as Record<string, string>)['Cliente']).toBe('ACME Ltda');
+  });
+
+  it('respeita a feature: com index suggestion DESLIGADA, PATCH salva o tipo e NÃO sugere', async () => {
+    await seedIndexFields();
+    const docId = await seedProcessedDocNoType();
+    await testDb.db`
+      UPDATE tenants SET ai_index_suggestion_enabled = false WHERE id = ${TENANT_A}
+    `;
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { documentTypeId: DOC_TYPE_ID },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Record<string, unknown>;
+    expect(body.documentTypeId).toBe(DOC_TYPE_ID);
+    expect(body).not.toHaveProperty('suggestedIndexFields');
+    // Feature desligada ⇒ LLM nunca chamado.
+    expect(fakeLlmChat).not.toHaveBeenCalled();
+  });
+
+  it('best-effort: falha do LLM não quebra o PATCH — 200 com o tipo salvo, sem sugestão', async () => {
+    await seedIndexFields();
+    const docId = await seedProcessedDocNoType();
+    fakeLlmChat.mockRejectedValue(new Error('provedor de LLM fora do ar'));
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { documentTypeId: DOC_TYPE_ID },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Record<string, unknown>;
+    expect(body.documentTypeId).toBe(DOC_TYPE_ID);
+    expect(body).not.toHaveProperty('suggestedIndexFields');
+  });
+
+  it('NÃO dispara quando o PATCH não troca o tipo (só tags)', async () => {
+    await seedIndexFields();
+    const docId = await seedProcessedDocNoType();
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { tags: ['revisado'] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).not.toHaveProperty('suggestedIndexFields');
     expect(fakeLlmChat).not.toHaveBeenCalled();
   });
 });

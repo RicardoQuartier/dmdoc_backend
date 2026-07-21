@@ -22,3 +22,16 @@ export {
   type DocumentTypeCatalogItem,
   type AiClassificationFlags,
 } from './classify-document-type.js';
+export {
+  suggestIndexValues,
+  validateIndexValues,
+  normalizeDatePtBr,
+  normalizeNumberPtBr,
+  SUGGEST_INDEXES_PROMPT,
+  SuggestIndexesResponseSchema,
+  type IndexFieldRow,
+  type SuggestedIndexField,
+  type SuggestIndexValuesInput,
+  type SuggestIndexValuesResult,
+  type SuggestIndexesResponse,
+} from './suggest-index-values.js';

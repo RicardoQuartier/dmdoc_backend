@@ -52,6 +52,8 @@ export {
   type TypeSuggestion,
   PublicTypeSuggestionSchema,
   type PublicTypeSuggestion,
+  PublicIndexSuggestionSchema,
+  type PublicIndexSuggestion,
   CostBreakdownSchema,
   type CostBreakdown,
   DocumentContentSchema,

@@ -10,6 +10,7 @@ import { chunkText, type ChunkDocumentMeta } from './chunk.js';
 import { embedChunks } from './embed.js';
 import { classifyDocument } from './classify.js';
 import { persistProcessingResult } from './persist.js';
+import { suggestIndexesStep } from './suggest-indexes.js';
 
 export interface PipelineDeps {
   s3Bucket: string;
@@ -24,7 +25,15 @@ export interface PipelineDeps {
   logger: Logger;
   chunkTargetTokens?: number;
   chunkOverlapTokens?: number;
+  /**
+   * Confiança MÍNIMA da classificação (Fase 8) para disparar a sugestão
+   * automática de índices (Fase 7) sobre o tipo sugerido. Default 0.5.
+   */
+  indexSuggestionMinConfidence?: number;
 }
+
+/** Limiar default de confiança para a sugestão automática de índices. */
+const DEFAULT_INDEX_SUGGESTION_MIN_CONFIDENCE = 0.5;
 
 /**
  * Orquestra o pipeline completo de processamento de um documento:
@@ -58,6 +67,7 @@ export async function runPipeline(
     logger: baseLogger,
     chunkTargetTokens,
     chunkOverlapTokens,
+    indexSuggestionMinConfidence = DEFAULT_INDEX_SUGGESTION_MIN_CONFIDENCE,
   } = deps;
 
   const traceId = job.id ?? `job-${Date.now()}`;
@@ -155,6 +165,21 @@ export async function runPipeline(
         pipelineStartedAt,
       },
       { sql, logger: log }
+    );
+
+    // Etapa 6: Sugestão automática de índices (Fase 7) — GATILHO 1 (upload).
+    // Best-effort e CONSULTIVA: roda após o persist (document_content já existe)
+    // sobre o TIPO SUGERIDO pela classificação quando a confiança atinge o
+    // limiar e a feature está ligada. NUNCA derruba o pipeline nem toca o tipo
+    // confirmado — o documento já está READY.
+    await suggestIndexesStep(
+      {
+        tenantId,
+        documentId,
+        typeSuggestion,
+        minConfidence: indexSuggestionMinConfidence,
+      },
+      { sql, llmProvider, logger: log }
     );
 
     log.info({ jobId: job.id }, 'pipeline concluído com sucesso');

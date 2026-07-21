@@ -1,12 +1,13 @@
-import type { Sql } from '@dmdoc/db-pg';
-import type { LLMProvider, ChatResult } from '@dmdoc/llm-provider';
+import type { Sql, JSONValue } from '@dmdoc/db-pg';
+import {
+  suggestIndexValues,
+  SUGGEST_INDEXES_PROMPT,
+  type LLMProvider,
+  type IndexFieldRow,
+  type SuggestedIndexField,
+} from '@dmdoc/llm-provider';
 import type { IndexSuggestion, CostBreakdown } from '@dmdoc/shared-types';
 import { NotFoundError, ValidationError } from '../errors/index.js';
-import type { IndexFieldRow } from '../lib/index-fields.js';
-import { validateIndexValues } from '../lib/index-fields.js';
-import { normalizeDatePtBr, normalizeNumberPtBr } from '../lib/normalize-index-value.js';
-import { SUGGEST_INDEXES_PROMPT, SuggestIndexesResponseSchema } from '../prompts/suggest-indexes.js';
-import type { SuggestIndexesResponse } from '../prompts/suggest-indexes.js';
 
 /**
  * Interface mínima de logger — compatível com Pino Logger e FastifyBaseLogger.
@@ -19,12 +20,18 @@ interface MinimalLogger {
   child(bindings: Record<string, unknown>): MinimalLogger;
 }
 
-/** Número máximo de tentativas de chamada ao LLM até obter um JSON válido. */
-const MAX_ATTEMPTS = 2;
-
 export interface SuggestDocumentIndexesParams {
   tenantId: string;
   documentId: string;
+  /**
+   * Tipo de documento a usar na sugestão. Quando FORNECIDO (caminho do worker,
+   * que passa o tipo SUGERIDO pela classificação), é usado diretamente e o
+   * `documents.document_type_id` NÃO é lido/exigido — CONSULTIVO, nunca toca a
+   * escolha manual. Quando AUSENTE (caminho on-demand `POST
+   * /documents/:id/suggest-indexes`), o service lê `documents.document_type_id`
+   * e lança `ValidationError` se estiver `null` — comportamento HTTP inalterado.
+   */
+  documentTypeId?: string;
 }
 
 export interface SuggestDocumentIndexesDeps {
@@ -34,153 +41,42 @@ export interface SuggestDocumentIndexesDeps {
 }
 
 /**
- * Sugestão por campo já casada contra os campos REAIS do tipo do documento
- * (`document_type_index_fields`) — nunca contém nomes alucinados pelo LLM. É
- * exatamente o array `fields` da resposta HTTP de `POST /documents/:id/suggest-indexes`.
+ * Reexporta o tipo por campo do núcleo compartilhado — é exatamente o array
+ * `fields` da resposta HTTP de `POST /documents/:id/suggest-indexes`.
  */
-export interface SuggestedIndexField {
-  /** Nome do campo real do tipo (nunca um nome inventado pelo LLM). */
-  name: string;
-  /** Valor já normalizado/validado, ou `null` quando descartado/ausente. */
-  value: string | null;
-  /** Confiança devolvida pelo LLM para este campo; 0 quando o LLM não o sugeriu. */
-  confidence: number;
-}
+export type { SuggestedIndexField };
 
 export interface SuggestDocumentIndexesResult {
   /** Sugestão persistida em `document_content.index_suggestion`. */
   indexSuggestion: IndexSuggestion;
   /**
    * Sugestão por campo, derivada dos campos REAIS do tipo — pronta para a
-   * resposta HTTP. Campos alucinados pelo LLM são descartados aqui, nunca vazam.
+   * resposta HTTP. Campos alucinados pelo LLM são descartados no núcleo.
    */
   fields: SuggestedIndexField[];
   /** `cost_breakdown` completo já atualizado (acumulado) do documento. */
   costBreakdown: CostBreakdown;
-  /** Custo em USD APENAS desta chamada (não o acumulado) — para exibição/log do chamador. */
+  /** Custo em USD APENAS desta chamada (não o acumulado) — para exibição/log. */
   costUsd: number;
 }
 
 /**
- * Extrai o JSON de uma resposta do LLM, tolerando blocos ```json ... ``` que
- * alguns modelos retornam mesmo quando instruídos a responder só o JSON.
- */
-function tryParseJson(text: string): unknown {
-  const trimmed = text.trim();
-  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
-  const candidate = fenced ? (fenced[1] ?? '') : trimmed;
-  try {
-    return JSON.parse(candidate);
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Normaliza (formatos pt-BR) e valida um valor candidato sugerido pela IA
- * contra o `IndexFieldRow` correspondente, usando exatamente a mesma
- * `validateIndexValues` do PATCH /documents/:id.
+ * Serviço de sugestão de valores de índice por IA (Fase 7) — ORQUESTRADOR
+ * on-demand (com banco). A lógica de IA (LLM + normalize pt-BR + validate +
+ * prompt) vive no núcleo compartilhado `suggestIndexValues`
+ * (`@dmdoc/llm-provider`); aqui ficam apenas as leituras/escritas de banco e a
+ * acumulação de custo — mesmo padrão de `classify-document.ts`/`classify.ts`.
  *
- * Retorna o valor pronto para persistir, ou `null` se a IA não encontrou o
- * campo, o valor veio vazio, ou não validou mesmo após a normalização.
- */
-function normalizeAndValidateField(field: IndexFieldRow, rawValue: string | null): string | null {
-  if (rawValue === null) return null;
-
-  const trimmed = rawValue.trim();
-  if (trimmed === '') return null;
-
-  let candidate: string | null = trimmed;
-  if (field.field_type === 'DATE') {
-    candidate = normalizeDatePtBr(trimmed);
-  } else if (field.field_type === 'NUMBER') {
-    candidate = normalizeNumberPtBr(trimmed);
-  }
-  // TEXT: sem normalização de formato — só o trim já aplicado.
-
-  if (candidate === null) return null;
-
-  const errors = validateIndexValues({ [field.name]: candidate }, [field]);
-  if (errors.length > 0) return null;
-
-  return candidate;
-}
-
-/**
- * Chama o LLM pedindo a sugestão de índices, com retry (até `MAX_ATTEMPTS`)
- * quando a resposta não é um JSON válido no formato esperado.
- *
- * Retorna também o custo ACUMULADO de todas as tentativas — inclusive a(s)
- * tentativa(s) inválida(s), pois o provedor cobra pelos tokens gerados mesmo
- * quando a resposta não pôde ser aproveitada.
- */
-async function callLlmWithRetry(
-  llmProvider: LLMProvider,
-  userMessage: string,
-  logger: MinimalLogger
-): Promise<{ parsed: SuggestIndexesResponse; lastResult: ChatResult; totalCostUsd: number }> {
-  let totalCostUsd = 0;
-  let lastResult: ChatResult | null = null;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const messages = [
-      { role: 'system' as const, content: SUGGEST_INDEXES_PROMPT.systemPrompt },
-      { role: 'user' as const, content: userMessage },
-      ...(attempt > 1
-        ? [
-            {
-              role: 'user' as const,
-              content:
-                'Sua resposta anterior não era um JSON válido no formato exigido. Responda ' +
-                'APENAS com o JSON: {"fields":[{"name":string,"value":string|null,"confidence":number}]}.',
-            },
-          ]
-        : []),
-    ];
-
-    const result = await llmProvider.chat({ messages, temperature: 0.1, maxTokens: 2048 });
-    lastResult = result;
-    totalCostUsd += result.usage.costUsd;
-
-    const json = tryParseJson(result.content);
-    const parsed = SuggestIndexesResponseSchema.safeParse(json);
-
-    if (parsed.success) {
-      return { parsed: parsed.data, lastResult: result, totalCostUsd };
-    }
-
-    logger.warn(
-      { attempt, maxAttempts: MAX_ATTEMPTS, issue: parsed.error.message },
-      'resposta do LLM não passou na validação Zod da sugestão de índices — tentando novamente'
-    );
-  }
-
-  throw new Error(
-    `Resposta do LLM inválida para sugestão de índices após ${MAX_ATTEMPTS} tentativas` +
-      (lastResult ? ` (último conteúdo: ${lastResult.content.slice(0, 200)})` : '')
-  );
-}
-
-/**
- * Serviço de sugestão de valores de índice por IA (Fase 7).
- *
- * Fluxo completo (spec §7/§11, wiki "Sugestão de valores de índice por IA —
- * alcance no texto e normalização de formato"):
- * 1. Lê `document_content.full_text` (texto completo, nunca truncado) e os
- *    `document_type_index_fields` do tipo do documento.
- * 2. Monta o prompt `suggest-indexes-v1` com todos os campos a extrair.
- * 3. Chama o `llm-provider`, com retry em caso de resposta fora do schema.
- * 4. Normaliza formatos pt-BR (datas, números) e valida cada campo contra
- *    `validateIndexValues` — campo que não validar vira "sem sugestão"
- *    (não aparece em `values`), sem afetar os demais campos da chamada.
- * 5. Persiste `document_content.index_suggestion` e atualiza
- *    `document_content.cost_breakdown.suggestionUsd` (acumulado — nunca
- *    sobrescreve `extractionUsd`/`embeddingsUsd`) e `documents.cost_usd_cents`
- *    (incrementado, nunca sobrescrito). Toda query filtra por `tenantId`.
- *
- * Lança `NotFoundError` se o documento ou seu conteúdo processado não
- * existirem (ou pertencerem a outro tenant), e `ValidationError` se o
- * documento ainda não tiver `documentTypeId` definido.
+ * Fluxo:
+ * 1. Resolve o `documentTypeId`: usa o EXPLÍCITO quando fornecido (worker, tipo
+ *    sugerido); senão lê `documents.document_type_id` (on-demand) — `NotFoundError`
+ *    se o documento não existir, `ValidationError` se ainda não tiver tipo.
+ * 2. Lê `document_content.full_text` (texto completo) e os campos do tipo.
+ * 3. Chama o núcleo (`suggestIndexValues`) — normaliza/valida cada campo.
+ * 4. Persiste `document_content.index_suggestion` e acumula
+ *    `cost_breakdown.suggestionUsd` (nunca sobrescreve extraction/embeddings/
+ *    classification) e `documents.cost_usd_cents` (incrementado). Toda query
+ *    filtra por `tenantId`.
  */
 export async function suggestDocumentIndexes(
   params: SuggestDocumentIndexesParams,
@@ -190,27 +86,35 @@ export async function suggestDocumentIndexes(
   const { sql, llmProvider } = deps;
   const log = deps.logger.child({ tenantId, documentId, step: 'suggest-indexes' });
 
-  // 1. Documento + tipo -----------------------------------------------------
-  const docRows = await sql<Array<{ document_type_id: string | null }>>`
-    SELECT document_type_id
-    FROM documents
-    WHERE id = ${documentId}
-      AND tenant_id = ${tenantId}
-      AND deleted = false
-    LIMIT 1
-  `;
-  const doc = docRows[0];
-  if (!doc) {
-    throw new NotFoundError('Documento não encontrado');
+  // 1. Resolve o tipo do documento -------------------------------------------
+  let documentTypeId: string;
+  if (params.documentTypeId !== undefined) {
+    // Caminho do worker: tipo SUGERIDO explícito. Não lê nem exige o tipo
+    // confirmado (`documents.document_type_id`) — CONSULTIVO.
+    documentTypeId = params.documentTypeId;
+  } else {
+    // Caminho on-demand: lê o tipo confirmado. Comportamento HTTP inalterado.
+    const docRows = await sql<Array<{ document_type_id: string | null }>>`
+      SELECT document_type_id
+      FROM documents
+      WHERE id = ${documentId}
+        AND tenant_id = ${tenantId}
+        AND deleted = false
+      LIMIT 1
+    `;
+    const doc = docRows[0];
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+    if (doc.document_type_id === null) {
+      throw new ValidationError(
+        'Documento precisa ter um tipo de documento definido antes de sugerir índices'
+      );
+    }
+    documentTypeId = doc.document_type_id;
   }
-  if (doc.document_type_id === null) {
-    throw new ValidationError(
-      'Documento precisa ter um tipo de documento definido antes de sugerir índices'
-    );
-  }
-  const documentTypeId = doc.document_type_id;
 
-  // 2. Conteúdo extraído (texto completo, nunca truncado) -------------------
+  // 2. Conteúdo extraído (texto completo, nunca truncado) --------------------
   const contentRows = await sql<
     Array<{ full_text: string; cost_breakdown: CostBreakdown | null }>
   >`
@@ -242,111 +146,24 @@ export async function suggestDocumentIndexes(
     totalUsd: 0,
   };
 
-  // Tipo sem campos de índice configurados: nada a sugerir, sem custo.
-  if (indexFieldRows.length === 0) {
-    log.info({}, 'tipo de documento sem campos de índice configurados — nenhuma sugestão gerada');
-    const suggestedAt = new Date();
-    const indexSuggestion: IndexSuggestion = {
-      values: {},
-      model: '',
-      promptVersion: SUGGEST_INDEXES_PROMPT.version,
-      suggestedAt,
-      rawResponse: {},
-    };
-    // Payload separado para persistência: `sql.json` exige `JSONValue`
-    // (sem `unknown`), diferente do tipo `IndexSuggestion` (rawResponse
-    // tipado como `Record<string, unknown>` pelo shared-types).
-    await sql`
-      UPDATE document_content
-      SET index_suggestion = ${sql.json({
-        values: {} as Record<string, string>,
-        model: '',
-        promptVersion: SUGGEST_INDEXES_PROMPT.version,
-        suggestedAt,
-        rawResponse: {},
-      })}
-      WHERE document_id = ${documentId}
-        AND tenant_id = ${tenantId}
-    `;
-    return { indexSuggestion, fields: [], costBreakdown: existingBreakdown, costUsd: 0 };
-  }
-
-  // 4. Monta prompt e chama o LLM (com retry) --------------------------------
-  const userMessage = SUGGEST_INDEXES_PROMPT.buildUserMessage(
-    content.full_text,
-    indexFieldRows.map((f) => ({
-      name: f.name,
-      fieldType: f.field_type,
-      required: f.required,
-      aiExtractionHint: f.ai_extraction_hint,
-    }))
+  // 4. Núcleo compartilhado: LLM + normalize + validate (SEM banco) ----------
+  const core = await suggestIndexValues(
+    llmProvider,
+    { fullText: content.full_text, indexFields: indexFieldRows },
+    log
   );
 
-  const { parsed, lastResult, totalCostUsd } = await callLlmWithRetry(llmProvider, userMessage, log);
-
-  // 5. Normaliza + valida cada campo -----------------------------------------
-  // Indexa a resposta do LLM por nome para casar contra os campos REAIS do tipo
-  // (fonte de verdade). Nomes que o LLM inventou (que não existem em
-  // `indexFieldRows`) simplesmente nunca são consultados aqui — não entram em
-  // `values` nem no array `fields` devolvido, portanto nunca vazam para o HTTP.
-  const suggestionByName = new Map(parsed.fields.map((f) => [f.name, f]));
-  const values: Record<string, string> = {};
-
-  // Loga (uma vez) os nomes alucinados descartados, para observabilidade.
-  const realNames = new Set(indexFieldRows.map((f) => f.name));
-  for (const suggested of parsed.fields) {
-    if (!realNames.has(suggested.name)) {
-      log.warn(
-        { fieldName: suggested.name },
-        'IA sugeriu campo que não existe no tipo do documento — ignorado'
-      );
-    }
-  }
-
-  // Monta a sugestão por campo a partir dos campos REAIS do tipo (nunca da
-  // resposta crua do LLM). Cada campo carrega o valor normalizado/validado (ou
-  // null) e a confiança casada; campos que o LLM não sugeriu ficam com value
-  // null e confiança 0.
-  const fields: SuggestedIndexField[] = indexFieldRows.map((field) => {
-    const suggested = suggestionByName.get(field.name);
-    const normalized = suggested ? normalizeAndValidateField(field, suggested.value) : null;
-    if (suggested && normalized === null && suggested.value !== null) {
-      log.warn(
-        { fieldName: field.name, rawValue: suggested.value },
-        'sugestão de índice descartada — não validou mesmo após normalização pt-BR'
-      );
-    }
-    if (normalized !== null) {
-      values[field.name] = normalized;
-    }
-    return {
-      name: field.name,
-      value: normalized,
-      confidence: suggested?.confidence ?? 0,
-    };
-  });
-
-  log.info(
-    {
-      fieldsRequested: indexFieldRows.length,
-      fieldsSuggested: Object.keys(values).length,
-      model: lastResult.model,
-      costUsd: totalCostUsd.toFixed(6),
-    },
-    'sugestão de índices concluída'
-  );
-
-  // 6. Persiste indexSuggestion + custo (acumulado, escopado por tenant) ----
+  // 5. Persiste indexSuggestion + custo (acumulado, escopado por tenant) -----
   const suggestedAt = new Date();
   const indexSuggestion: IndexSuggestion = {
-    values,
-    model: lastResult.model,
-    promptVersion: SUGGEST_INDEXES_PROMPT.version,
+    values: core.values,
+    model: core.model,
+    promptVersion: core.promptVersion || SUGGEST_INDEXES_PROMPT.version,
     suggestedAt,
-    rawResponse: parsed,
+    rawResponse: core.rawResponse,
   };
 
-  const newSuggestionUsd = existingBreakdown.suggestionUsd + totalCostUsd;
+  const newSuggestionUsd = existingBreakdown.suggestionUsd + core.costUsd;
   const newCostBreakdown: CostBreakdown = {
     extractionUsd: existingBreakdown.extractionUsd,
     embeddingsUsd: existingBreakdown.embeddingsUsd,
@@ -365,20 +182,20 @@ export async function suggestDocumentIndexes(
   await sql`
     UPDATE document_content
     SET index_suggestion = ${sql.json({
-      values,
-      model: lastResult.model,
-      promptVersion: SUGGEST_INDEXES_PROMPT.version,
-      suggestedAt,
-      rawResponse: parsed,
-    })},
+      values: core.values,
+      model: core.model,
+      promptVersion: indexSuggestion.promptVersion,
+      suggestedAt: suggestedAt.toISOString(),
+      rawResponse: core.rawResponse,
+    } as unknown as JSONValue)},
         cost_breakdown = ${sql.json(newCostBreakdown)}
     WHERE document_id = ${documentId}
       AND tenant_id = ${tenantId}
   `;
 
   // documents.cost_usd_cents é SEMPRE incrementado, nunca sobrescrito — outras
-  // etapas (extração, embeddings) podem já ter contribuído para o total.
-  const deltaCents = Math.ceil(totalCostUsd * 100);
+  // etapas (extração, embeddings, classificação) já podem ter contribuído.
+  const deltaCents = Math.ceil(core.costUsd * 100);
   if (deltaCents > 0) {
     await sql`
       UPDATE documents
@@ -388,5 +205,5 @@ export async function suggestDocumentIndexes(
     `;
   }
 
-  return { indexSuggestion, fields, costBreakdown: newCostBreakdown, costUsd: totalCostUsd };
+  return { indexSuggestion, fields: core.fields, costBreakdown: newCostBreakdown, costUsd: core.costUsd };
 }

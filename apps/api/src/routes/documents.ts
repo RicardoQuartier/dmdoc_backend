@@ -22,18 +22,24 @@ import type {
 import {
   DocumentProcessingJobDataSchema,
   PublicTypeSuggestionSchema,
+  PublicIndexSuggestionSchema,
   ROLE_LEVEL,
   RoleSchema,
 } from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
-import { createLLMProvider, LLMError, type LLMProvider } from '@dmdoc/llm-provider';
+import {
+  createLLMProvider,
+  LLMError,
+  validateIndexValues,
+  type LLMProvider,
+  type IndexFieldRow,
+} from '@dmdoc/llm-provider';
 import { NotFoundError, QuotaExceededError, ValidationError, ForbiddenError, UpstreamServiceError, ConflictError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
 import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 import { getConfig, type Config } from '../config.js';
-import { validateIndexValues, type IndexFieldRow } from '../lib/index-fields.js';
 import { suggestDocumentIndexes } from '../services/index-suggestion.js';
 import { classifyDocument } from '../services/classify-document.js';
 
@@ -1238,9 +1244,13 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     // controle de acesso acima (assertCanReadDepartment) — nunca vaza para
     // fora do escopo do documento.
     const contentRows = await sql<
-      Array<{ extraction: { pageCount?: number } | null; type_suggestion: unknown }>
+      Array<{
+        extraction: { pageCount?: number } | null;
+        type_suggestion: unknown;
+        index_suggestion: unknown;
+      }>
     >`
-      SELECT extraction, type_suggestion
+      SELECT extraction, type_suggestion, index_suggestion
       FROM document_content
       WHERE document_id = ${doc.id}
         AND tenant_id = ${doc.tenant_id}
@@ -1269,6 +1279,16 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const typeSuggestion =
       rawTypeSuggestion !== null ? PublicTypeSuggestionSchema.parse(rawTypeSuggestion) : null;
 
+    // Subconjunto SEGURO da sugestão automática de valores de índice (T-16,
+    // gatilho 1 do worker no upload). Só `values` + `suggestedAt`; o `parse`
+    // do PublicIndexSuggestionSchema descarta model, promptVersion e
+    // rawResponse — esses ficam só no /debug. É o que a UI usa para
+    // pré-preencher os campos de índice sem o usuário pedir. Null enquanto o
+    // worker ainda não gerou sugestão (coluna nula).
+    const rawIndexSuggestion = contentRows[0]?.index_suggestion ?? null;
+    const indexSuggestion =
+      rawIndexSuggestion !== null ? PublicIndexSuggestionSchema.parse(rawIndexSuggestion) : null;
+
     request.log.info(
       { tenantId: doc.tenant_id, userId, documentId: doc.id },
       'detalhe de documento recuperado'
@@ -1276,7 +1296,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
 
     return reply
       .status(200)
-      .send({ ...rowToDocument(doc), documentTypeName, pageCount, typeSuggestion });
+      .send({ ...rowToDocument(doc), documentTypeName, pageCount, typeSuggestion, indexSuggestion });
   });
 
   // =========================================================================
@@ -1689,7 +1709,57 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       'documento atualizado'
     );
 
-    return reply.status(200).send(rowToDocument(updated as DocumentRow));
+    // -----------------------------------------------------------------------
+    // GATILHO 2 (Fase 7): quando o PATCH DEFINE/TROCA o tipo do documento para
+    // um valor não-nulo (mudança efetiva), dispara a sugestão de índices sobre
+    // o NOVO tipo — aguardando (o usuário verá os valores pré-preenchidos na
+    // resposta). Best-effort e CONSULTIVA: respeita `indexSuggestionEnabled`,
+    // grava só `document_content.index_suggestion` (nunca valores confirmados) e
+    // NUNCA quebra o PATCH — falha de IA ⇒ 200 com o tipo salvo, sem sugestão.
+    // -----------------------------------------------------------------------
+    const typeChangedToNonNull =
+      'documentTypeId' in body &&
+      effectiveDocumentTypeId !== null &&
+      effectiveDocumentTypeId !== (doc.document_type_id ?? null);
+
+    let suggestedIndexFields: Awaited<
+      ReturnType<typeof suggestDocumentIndexes>
+    >['fields'] | undefined;
+
+    if (typeChangedToNonNull) {
+      const log = request.log.child({ tenantId, documentId: doc.id, userId, traceId: request.id });
+      try {
+        const aiFlags = await resolveAiFeatureFlags(sql, tenantId);
+        if (aiFlags.indexSuggestionEnabled) {
+          const suggestion = await suggestDocumentIndexes(
+            { tenantId, documentId: id, documentTypeId: effectiveDocumentTypeId as string },
+            { sql, llmProvider, logger: log }
+          );
+          suggestedIndexFields = suggestion.fields;
+          log.info(
+            {
+              fieldsRequested: suggestion.fields.length,
+              fieldsSuggested: suggestion.fields.filter((f) => f.value !== null).length,
+              costUsd: suggestion.costUsd,
+            },
+            'sugestão de índices gerada após definição de tipo no PATCH'
+          );
+        } else {
+          log.info({}, 'sugestão de índices no PATCH pulada: feature desabilitada para a empresa');
+        }
+      } catch (err) {
+        // Best-effort: o PATCH sempre retorna 200 com o tipo salvo, mesmo sem sugestão.
+        log.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'sugestão de índices após PATCH falhou — retornando sem sugestão (best-effort)'
+        );
+      }
+    }
+
+    return reply.status(200).send({
+      ...rowToDocument(updated as DocumentRow),
+      ...(suggestedIndexFields !== undefined ? { suggestedIndexFields } : {}),
+    });
   });
 
   // =========================================================================
