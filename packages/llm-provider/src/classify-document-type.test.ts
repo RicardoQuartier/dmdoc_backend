@@ -183,12 +183,15 @@ describe('classifyDocumentType', () => {
     expect(result.suggestedTitle).toBeNull();
   });
 
-  it('(f) catálogo vazio → não chama o LLM e retorna nenhum tipo', async () => {
+  it('(f1) catálogo vazio + título DESLIGADO → não chama o LLM e retorna nenhum tipo', async () => {
     const { provider, chat } = mockProvider([]);
 
     const result = await classifyDocumentType(
       provider,
-      inputWith({ catalog: [] }),
+      inputWith({
+        catalog: [],
+        flags: { classificationEnabled: true, titleSuggestionEnabled: false },
+      }),
       makeLogger()
     );
 
@@ -196,7 +199,38 @@ describe('classifyDocumentType', () => {
     expect(result.documentTypeId).toBeNull();
     expect(result.documentTypeName).toBeNull();
     expect(result.confidence).toBe(0);
+    expect(result.suggestedTitle).toBeNull();
     expect(result.usage.totalTokens).toBe(0);
+  });
+
+  it('(f2) catálogo vazio + título LIGADO → chama o LLM e retorna título (tipo null)', async () => {
+    const { provider, chat } = mockProvider([
+      JSON.stringify({
+        documentTypeName: null,
+        confidence: 0,
+        suggestedTitle: 'Contrato de Prestação de Serviços de Consultoria',
+      }),
+    ]);
+
+    const result = await classifyDocumentType(
+      provider,
+      inputWith({ catalog: [], flags: FLAGS_ON }),
+      makeLogger()
+    );
+
+    // Título independe do catálogo de tipos: a IA é chamada mesmo com catálogo vazio.
+    expect(chat).toHaveBeenCalledTimes(1);
+    // O prompt sinaliza explicitamente a ausência de tipos.
+    const params = chat.mock.calls[0]?.[0] as ChatParams;
+    const userMessage = params.messages.find((m) => m.role === 'user')?.content ?? '';
+    expect(userMessage).toContain('nenhum tipo disponível');
+    // Nenhum tipo pode ser resolvido de um catálogo vazio.
+    expect(result.documentTypeId).toBeNull();
+    expect(result.documentTypeName).toBeNull();
+    expect(result.confidence).toBe(0);
+    // ...mas o título sugerido é preservado.
+    expect(result.suggestedTitle).toBe('Contrato de Prestação de Serviços de Consultoria');
+    expect(result.usage.totalTokens).toBe(120);
   });
 
   it('tolera resposta embrulhada em cercas markdown ```json', async () => {

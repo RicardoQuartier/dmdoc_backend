@@ -6,6 +6,7 @@ import { buildApp } from '../app.js';
 import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
 import type { S3Service } from '../services/s3.js';
 import { newId } from '@dmdoc/db-pg';
+import type { LLMProvider, ChatResult } from '@dmdoc/llm-provider';
 
 // ---------------------------------------------------------------------------
 // Mock de S3Service — nunca chama AWS real nos testes
@@ -46,6 +47,15 @@ let tokenAdminA: string;
 let tokenUploaderA: string;
 let tokenAdminB: string;
 
+// Fake de LLMProvider injetado nas rotas de IA (POST /documents/:id/classify e
+// /suggest-indexes) — exercita as rotas sem chamar o provedor real. Cada teste
+// configura o retorno via `fakeLlmChat.mockResolvedValueOnce(...)`.
+const fakeLlmChat = vi.fn();
+const fakeLlm = {
+  chat: fakeLlmChat,
+  chatStream: vi.fn(),
+} as unknown as LLMProvider;
+
 beforeAll(async () => {
   testDb = await startTestDb();
   mockS3 = createMockS3();
@@ -54,6 +64,7 @@ beforeAll(async () => {
     db: testDb.db,
     queue: null, // sem Redis nos testes
     s3: mockS3,
+    llmProvider: fakeLlm,
   });
 });
 
@@ -2478,5 +2489,231 @@ describe('PATCH /documents/:id — título de exibição (Fase 8.1)', () => {
     expect(found).toBeDefined();
     expect(found!.title).toBe('Contrato Listado');
     expect(found!.suggestedTitle).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /documents/:id/classify — classificação automática de tipo por IA
+// (Fase 8, entregável #61). Re-sugere o tipo sob demanda; CONSULTIVO — nunca
+// sobrescreve documents.document_type_id.
+// ---------------------------------------------------------------------------
+
+describe('POST /documents/:id/classify (Fase 8)', () => {
+  /** Monta um ChatResult fake do provedor de LLM a partir do JSON de saída. */
+  function chatResult(
+    output: { documentTypeName: string | null; confidence: number; suggestedTitle: string | null },
+    costUsd = 0.002
+  ): ChatResult {
+    return {
+      content: JSON.stringify(output),
+      model: 'gpt-4o-mini',
+      usage: { promptTokens: 500, completionTokens: 20, totalTokens: 520, costUsd },
+    };
+  }
+
+  /**
+   * Cria um documento READY em TENANT_A/DEPT_A com conteúdo processado
+   * (`document_content.full_text` presente). Opcionalmente já com um tipo manual
+   * definido, para provar que a classificação NÃO o sobrescreve.
+   */
+  async function seedProcessedDoc(opts: {
+    tenantId?: string;
+    departmentId?: string;
+    documentTypeId?: string | null;
+    status?: string;
+    withContent?: boolean;
+  }): Promise<string> {
+    const tenantId = opts.tenantId ?? TENANT_A;
+    const departmentId = opts.departmentId ?? DEPT_A_ID;
+    const documentTypeId = opts.documentTypeId ?? null;
+    const status = opts.status ?? 'READY';
+    const withContent = opts.withContent ?? true;
+    const docId = newId();
+    const hash = crypto.randomBytes(32).toString('hex');
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${tenantId}, ${departmentId}, ${documentTypeId},
+        'classify.pdf', 'classify.pdf', ${hash}, 2048, 'application/pdf',
+        ${`tenants/${tenantId}/documents/${hash}/classify.pdf`}, ${status}, NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), ${status === 'READY' ? testDb.db`NOW()` : null}, 0, false
+      )
+    `;
+    if (withContent) {
+      await testDb.db`
+        INSERT INTO document_content (document_id, tenant_id, full_text, extraction, cost_breakdown)
+        VALUES (
+          ${docId}, ${tenantId}, 'Contrato de prestação de serviços entre as partes.',
+          ${testDb.db.json({ engine: 'native', engineVersion: '1.0.0', durationMs: 10, ocrPages: [], pageCount: 1, extractedAt: new Date().toISOString() })},
+          ${testDb.db.json({ extractionUsd: 0, embeddingsUsd: 0.01, suggestionUsd: 0, classificationUsd: 0, totalUsd: 0.01 })}
+        )
+      `;
+    }
+    return docId;
+  }
+
+  /** Torna o tipo `Contrato A` visível para DEPT_A (entra no catálogo da IA). */
+  async function makeTypeVisibleInDeptA(): Promise<void> {
+    await testDb.db`
+      UPDATE document_types
+      SET department_ids = ${[DEPT_A_ID]}::uuid[]
+      WHERE id = ${DOC_TYPE_ID}
+    `;
+  }
+
+  beforeEach(() => {
+    // Garante fila de retornos limpa entre testes (clearAllMocks não remove
+    // valores de mockResolvedValueOnce ainda não consumidos).
+    fakeLlmChat.mockReset();
+  });
+
+  it('sucesso: tipo do catálogo é sugerido, persistido e NÃO sobrescreve o tipo manual', async () => {
+    await makeTypeVisibleInDeptA();
+    const docId = await seedProcessedDoc({ documentTypeId: null });
+    fakeLlmChat.mockResolvedValueOnce(
+      chatResult({ documentTypeName: 'Contrato A', confidence: 0.9, suggestedTitle: 'Contrato de Serviço' })
+    );
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/classify`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.typeSuggestion.documentTypeId).toBe(DOC_TYPE_ID);
+    expect(body.typeSuggestion.documentTypeName).toBe('Contrato A');
+    expect(body.typeSuggestion.confidence).toBe(0.9);
+    expect(body.typeSuggestion.model).toBe('gpt-4o-mini');
+    expect(body.typeSuggestion.promptVersion).toBe('classify-document-type-v1');
+    expect(body.typeSuggestion).not.toHaveProperty('rawResponse');
+    expect(body.suggestedTitle).toBe('Contrato de Serviço');
+    expect(body.costUsd).toBeCloseTo(0.002, 6);
+
+    // Persistência: type_suggestion + suggested_title; document_type_id intacto.
+    const rows = await testDb.db<
+      Array<{ document_type_id: string | null; suggested_title: string | null; cost_usd_cents: number }>
+    >`
+      SELECT document_type_id, suggested_title, cost_usd_cents FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]!.document_type_id).toBeNull(); // CONSULTIVO: nunca preenchido pela IA
+    expect(rows[0]!.suggested_title).toBe('Contrato de Serviço');
+    expect(rows[0]!.cost_usd_cents).toBe(1); // ceil(0.002 * 100)
+
+    const content = await testDb.db<
+      Array<{ type_suggestion: Record<string, unknown> | null; cost_breakdown: Record<string, number> | null }>
+    >`
+      SELECT type_suggestion, cost_breakdown FROM document_content WHERE document_id = ${docId}
+    `;
+    expect(content[0]!.type_suggestion!['documentTypeId']).toBe(DOC_TYPE_ID);
+    expect(content[0]!.type_suggestion!['documentTypeName']).toBe('Contrato A');
+    // custo mesclado: embeddings preservado, classification acumulado
+    expect(content[0]!.cost_breakdown!['embeddingsUsd']).toBeCloseTo(0.01, 6);
+    expect(content[0]!.cost_breakdown!['classificationUsd']).toBeCloseTo(0.002, 6);
+    expect(content[0]!.cost_breakdown!['totalUsd']).toBeCloseTo(0.012, 6);
+  });
+
+  it('não sobrescreve um tipo manual JÁ definido', async () => {
+    await makeTypeVisibleInDeptA();
+    const docId = await seedProcessedDoc({ documentTypeId: GLOBAL_DOC_TYPE_ID });
+    fakeLlmChat.mockResolvedValueOnce(
+      chatResult({ documentTypeName: 'Contrato A', confidence: 0.95, suggestedTitle: 'Novo Título' })
+    );
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/classify`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    // A IA sugeriu 'Contrato A' (DOC_TYPE_ID), mas o tipo manual permanece.
+    expect(res.json().typeSuggestion.documentTypeId).toBe(DOC_TYPE_ID);
+    const rows = await testDb.db<Array<{ document_type_id: string | null }>>`
+      SELECT document_type_id FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]!.document_type_id).toBe(GLOBAL_DOC_TYPE_ID);
+  });
+
+  it('nenhum tipo: LLM devolve nome fora do catálogo → sugestão null persistida', async () => {
+    await makeTypeVisibleInDeptA();
+    const docId = await seedProcessedDoc({ documentTypeId: null });
+    fakeLlmChat.mockResolvedValueOnce(
+      chatResult({ documentTypeName: 'Nota Fiscal Eletrônica', confidence: 0.8, suggestedTitle: null })
+    );
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/classify`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.typeSuggestion.documentTypeId).toBeNull();
+    expect(body.typeSuggestion.documentTypeName).toBeNull();
+    expect(body.typeSuggestion.confidence).toBe(0); // confiança zerada no fallback
+
+    // A sugestão "nenhum tipo" é PERSISTIDA (Cenário 2 da tela de qualificação).
+    const content = await testDb.db<Array<{ type_suggestion: Record<string, unknown> | null }>>`
+      SELECT type_suggestion FROM document_content WHERE document_id = ${docId}
+    `;
+    expect(content[0]!.type_suggestion).not.toBeNull();
+    expect(content[0]!.type_suggestion!['documentTypeId']).toBeNull();
+  });
+
+  it('403 quando classificação E título estão ambos desabilitados para a empresa', async () => {
+    await makeTypeVisibleInDeptA();
+    const docId = await seedProcessedDoc({ documentTypeId: null });
+    await testDb.db`
+      UPDATE tenants
+      SET ai_classification_enabled = false, ai_title_suggestion_enabled = false
+      WHERE id = ${TENANT_A}
+    `;
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/classify`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+    // Nenhum custo de IA disparado: o LLM não foi chamado.
+    expect(fakeLlmChat).not.toHaveBeenCalled();
+  });
+
+  it('404 para documento de outro tenant (isolamento) — sem chamar o LLM', async () => {
+    await makeTypeVisibleInDeptA();
+    const docId = await seedProcessedDoc({ documentTypeId: null });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/classify`,
+      headers: { authorization: `Bearer ${tokenAdminB}` },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+    expect(fakeLlmChat).not.toHaveBeenCalled();
+  });
+
+  it('422 quando o documento ainda não foi processado (sem full_text)', async () => {
+    const docId = await seedProcessedDoc({ documentTypeId: null, status: 'PENDING', withContent: false });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/classify`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
+    expect(fakeLlmChat).not.toHaveBeenCalled();
   });
 });

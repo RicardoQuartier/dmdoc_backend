@@ -19,4 +19,4 @@ export function createPgClient(connectionString: string): postgres.Sql {
   });
 }
 
-export type { Sql } from 'postgres';
+export type { Sql, JSONValue } from 'postgres';

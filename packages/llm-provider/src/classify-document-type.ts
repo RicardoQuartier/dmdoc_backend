@@ -70,9 +70,12 @@ Regras obrigatórias:
     text: string,
     catalog: Array<{ name: string; description: string | null }>
   ): string {
-    const catalogo = catalog
-      .map((t) => `- ${t.name}${t.description ? `: ${t.description}` : ''}`)
-      .join('\n');
+    const catalogo =
+      catalog.length === 0
+        ? '(nenhum tipo disponível — retorne documentTypeName: null, mas ainda sugira um título)'
+        : catalog
+            .map((t) => `- ${t.name}${t.description ? `: ${t.description}` : ''}`)
+            .join('\n');
 
     return `Tipos de documento disponíveis:\n${catalogo}\n\n---\n\nTexto do documento:\n${text}`;
   },
@@ -253,7 +256,9 @@ function applyFlagMask(
  *   (`documentTypeId: null, confidence: 0`) — não pode derrubar o pipeline.
  * - Resolve nome→id por match exato case-insensitive contra o catálogo enviado.
  *   Nome sem correspondência ⇒ "nenhum tipo".
- * - Catálogo vazio ⇒ retorna "nenhum tipo" SEM chamar o LLM (economia).
+ * - Catálogo vazio + título DESLIGADO ⇒ retorna "nenhum tipo" SEM chamar o LLM
+ *   (economia). Com título LIGADO, ainda chama o LLM para sugerir só o título
+ *   (o tipo resolve para null) — o título independe do catálogo de tipos.
  * - Custo em tokens de cada call é logado pelo próprio provider.
  *
  * @param provider Adaptador de LLM (o mesmo `chat` que loga tokens+custo).
@@ -268,9 +273,18 @@ export async function classifyDocumentType(
   const { text, catalog, flags } = input;
   const promptVersion = CLASSIFY_DOCUMENT_TYPE_PROMPT.version;
 
-  // Catálogo vazio: nenhum tipo é possível — não gasta uma chamada de LLM.
-  if (catalog.length === 0) {
-    logger.info({ promptVersion }, 'classificação pulada: catálogo de tipos vazio');
+  // Catálogo vazio: nenhum TIPO é possível (nenhum nome pode bater). Mas a
+  // sugestão de TÍTULO é INDEPENDENTE do catálogo de tipos — regra de negócio:
+  // "a sugestão de título não depende do tipo; roda mesmo em documentos ainda
+  // sem tipo definido". Portanto:
+  // - título LIGADO  ⇒ segue para a chamada de LLM (caminho só-título; o tipo
+  //   resolve para null naturalmente, pois o catálogo enviado está vazio).
+  // - título DESLIGADO ⇒ não há nada a ganhar com a chamada: pula (economia).
+  if (catalog.length === 0 && !flags.titleSuggestionEnabled) {
+    logger.info(
+      { promptVersion },
+      'classificação pulada: catálogo vazio e título desligado'
+    );
     return applyFlagMask(
       {
         documentTypeId: null,

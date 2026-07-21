@@ -26,7 +26,7 @@ import {
   RoleSchema,
 } from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
-import { createLLMProvider, LLMError } from '@dmdoc/llm-provider';
+import { createLLMProvider, LLMError, type LLMProvider } from '@dmdoc/llm-provider';
 import { NotFoundError, QuotaExceededError, ValidationError, ForbiddenError, UpstreamServiceError, ConflictError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
@@ -35,6 +35,7 @@ import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 import { getConfig, type Config } from '../config.js';
 import { validateIndexValues, type IndexFieldRow } from '../lib/index-fields.js';
 import { suggestDocumentIndexes } from '../services/index-suggestion.js';
+import { classifyDocument } from '../services/classify-document.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais que mapeiam as tabelas do PostgreSQL (spec §5.3)
@@ -627,6 +628,12 @@ async function emitUploadEvent(
 
 export interface DocumentsRoutesOptions {
   config: Config;
+  /**
+   * Permite injetar um provider de LLM alternativo (útil em testes, para
+   * exercitar as rotas de IA sem chamar o provedor real). Quando ausente, é
+   * criado a partir da config.
+   */
+  llmProvider?: LLMProvider;
 }
 
 /**
@@ -636,16 +643,19 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
   const { config } = options;
 
   // Provider de LLM compartilhado entre as chamadas desta rota (mesmo padrão
-  // de `search.ts`) — usado exclusivamente por `POST /documents/:id/suggest-indexes`.
-  const llmProvider = createLLMProvider(
-    {
-      provider: config.LLM_PROVIDER,
-      baseURL: config.LLM_BASE_URL,
-      apiKey: config.LLM_API_KEY || 'placeholder',
-      model: config.LLM_MODEL,
-    },
-    app.log,
-  );
+  // de `search.ts`) — usado por `POST /documents/:id/suggest-indexes` e
+  // `POST /documents/:id/classify`. Injetável em testes via options.
+  const llmProvider =
+    options.llmProvider ??
+    createLLMProvider(
+      {
+        provider: config.LLM_PROVIDER,
+        baseURL: config.LLM_BASE_URL,
+        apiKey: config.LLM_API_KEY || 'placeholder',
+        model: config.LLM_MODEL,
+      },
+      app.log,
+    );
   /**
    * POST /documents — upload multipart de documento.
    */
@@ -2143,6 +2153,119 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       model: result.indexSuggestion.model,
       promptVersion: result.indexSuggestion.promptVersion,
       suggestedAt: result.indexSuggestion.suggestedAt,
+      costUsd: result.costUsd,
+    });
+  });
+
+  // =========================================================================
+  // POST /documents/:id/classify — classificação automática de tipo por IA
+  // (Fase 8, entregável #61). Sob demanda — re-sugere o tipo de um documento já
+  // processado. CONSULTIVO: persiste `document_content.type_suggestion` (e o
+  // `documents.suggested_title`, quando a feature de título está ligada), mas
+  // NUNCA sobrescreve `documents.document_type_id` (escolha manual do usuário).
+  // Espelha o guard/escopo de `POST /documents/:id/suggest-indexes`.
+  // =========================================================================
+  app.post('/documents/:id/classify', { preHandler: app.authenticate }, async (request, reply) => {
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const sql = app.db;
+
+    const { id } = DocumentIdParamsSchema.parse(request.params);
+
+    // ------------------------------------------------------------------
+    // 1. Resolve o documento respeitando o escopo do role (mesmo padrão de
+    //    GET/PATCH/DELETE/suggest-indexes) — documento de outro tenant sempre
+    //    vira 404, nunca 403 (spec §10, invariante 4).
+    // ------------------------------------------------------------------
+    let doc: DocumentRow | null;
+    if (role === 'SUPER_ADMIN') {
+      doc = await findDocumentGlobally(sql, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
+      doc = await repo.findById(id);
+    }
+
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    const tenantId = doc.tenant_id;
+
+    // Classificação sob demanda é uma ESCRITA (persiste `type_suggestion`,
+    // `suggested_title` e incrementa custo) — exige a mesma permissão de escrita
+    // no departamento usada em PATCH/DELETE/suggest-indexes.
+    await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
+
+    const log = request.log.child({ tenantId, documentId: id, userId, traceId: request.id });
+
+    // ------------------------------------------------------------------
+    // 2. Feature flags de IA (Fase 6.9) — valor EFETIVO (plataforma AND empresa).
+    //    Classificação de tipo e título sugerido nascem da MESMA chamada de LLM,
+    //    então basta UMA das duas estar ligada para a chamada valer a pena. Se
+    //    AMBAS estiverem desligadas ⇒ 403 ANTES de qualquer custo de IA.
+    // ------------------------------------------------------------------
+    const aiFlags = await resolveAiFeatureFlags(sql, tenantId);
+    if (!aiFlags.classificationEnabled && !aiFlags.titleSuggestionEnabled) {
+      log.info({}, 'classificação por IA desabilitada para esta empresa — LLM não chamado');
+      throw new ForbiddenError('Classificação por IA está desabilitada para esta empresa');
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Chama o service (valida a pré-condição de documento processado —
+    //    NotFoundError/ValidationError propagam para o error handler central,
+    //    mapeando para 404/422). Falha do provedor de LLM (chave inválida/ausente,
+    //    provedor fora do ar) vira 502 — não é bug do DMDoc, é upstream.
+    // ------------------------------------------------------------------
+    let result: Awaited<ReturnType<typeof classifyDocument>>;
+    try {
+      result = await classifyDocument(
+        {
+          tenantId,
+          documentId: id,
+          flags: {
+            classificationEnabled: aiFlags.classificationEnabled,
+            titleSuggestionEnabled: aiFlags.titleSuggestionEnabled,
+          },
+        },
+        { sql, llmProvider, chatModel: config.LLM_MODEL, logger: log }
+      );
+    } catch (err) {
+      if (err instanceof LLMError) {
+        log.error({ err }, 'classificação falhou por erro do provedor de LLM');
+        throw new UpstreamServiceError(
+          'Não foi possível classificar o documento agora — falha ao chamar o provedor de IA. Tente novamente em instantes.'
+        );
+      }
+      throw err;
+    }
+
+    log.info(
+      {
+        documentTypeId: result.typeSuggestion.documentTypeId,
+        confidence: result.typeSuggestion.confidence,
+        hasSuggestedTitle: result.suggestedTitle !== null,
+        costUsd: result.costUsd,
+      },
+      'classificação sob demanda retornada'
+    );
+
+    // ------------------------------------------------------------------
+    // 4. Resposta 200 — subconjunto do TypeSuggestion (sem rawResponse) +
+    //    título sugerido + custo desta chamada.
+    // ------------------------------------------------------------------
+    return reply.status(200).send({
+      typeSuggestion: {
+        documentTypeId: result.typeSuggestion.documentTypeId,
+        documentTypeName: result.typeSuggestion.documentTypeName,
+        confidence: result.typeSuggestion.confidence,
+        model: result.typeSuggestion.model,
+        promptVersion: result.typeSuggestion.promptVersion,
+        suggestedAt: result.typeSuggestion.suggestedAt,
+      },
+      suggestedTitle: result.suggestedTitle,
       costUsd: result.costUsd,
     });
   });
