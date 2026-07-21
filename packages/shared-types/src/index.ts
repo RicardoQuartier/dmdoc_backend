@@ -91,6 +91,8 @@ export {
   type SearchResponse,
   SearchChunkSchema,
   type SearchChunk,
+  SearchChunkIndexValueSchema,
+  type SearchChunkIndexValue,
   CitationSchema,
   type Citation,
   IndexFilterValueSchema,

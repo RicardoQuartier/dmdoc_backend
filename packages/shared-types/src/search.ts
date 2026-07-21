@@ -50,14 +50,44 @@ export const SearchRequestSchema = z.object({
 export type SearchRequest = z.infer<typeof SearchRequestSchema>;
 
 /**
+ * Um valor de índice de um documento exposto na resposta da busca.
+ *
+ * Só entram os campos cujo `IndexField.showOnSearch` está ligado (flag
+ * "aparece na busca") e que possuem valor preenchido no documento. Os itens
+ * vêm na ordem de exibição do campo (`sortOrder`).
+ *
+ * `label` reflete o rótulo do campo (`IndexField.name`, também usado como
+ * chave em `documents.indexValues`); `fieldName` é essa mesma chave.
+ */
+export const SearchChunkIndexValueSchema = z.object({
+  fieldName: z.string(),
+  label: z.string(),
+  fieldType: z.string(),
+  value: z.union([z.string(), z.number()]),
+});
+
+export type SearchChunkIndexValue = z.infer<typeof SearchChunkIndexValueSchema>;
+
+/**
  * Um chunk retornado na resposta da busca.
  *
  * `score` é a relevância calculada pelo motor (rankFusion, vector ou lexical).
  * `pageNumber` pode ser null quando não determinável (ex.: DOCX sem paginação).
+ *
+ * `title` é o título de exibição CONFIRMADO do documento (`documents.title`).
+ * Vem `null` quando não há confirmação — o fallback para `documentName`
+ * (nome do arquivo) é responsabilidade do front. A sugestão bruta da IA
+ * (`suggestedTitle`) NUNCA é exposta aqui (invariante da wiki "Título de
+ * exibição sugerido por IA").
+ *
+ * `indexValues` traz apenas os índices "que aparecem na busca" (showOnSearch)
+ * do documento, com rótulo, tipo e valor, na ordem de exibição do campo.
  */
 export const SearchChunkSchema = z.object({
   documentId: z.string(),
   documentName: z.string().nullable(),
+  title: z.string().nullable(),
+  indexValues: z.array(SearchChunkIndexValueSchema),
   tenantId: z.string().nullable(),
   documentTypeName: z.string().nullable(),
   pageNumber: z.number().nullable(),
