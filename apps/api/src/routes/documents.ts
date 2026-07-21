@@ -1289,14 +1289,28 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const indexSuggestion =
       rawIndexSuggestion !== null ? PublicIndexSuggestionSchema.parse(rawIndexSuggestion) : null;
 
+    // Valor EFETIVO (plataforma AND empresa) da feature de título sugerido por
+    // IA (T-18) — o frontend usa isso para decidir se mostra o indicador de
+    // sugestão pendente na tela de detalhes, sem precisar "descobrir"
+    // reativamente via 403 ao tentar reclassificar/regerar. Só o booleano
+    // final é exposto — nunca a configuração de plataforma/empresa em
+    // separado, então não vaza a decisão comercial que o TENANT_ADMIN não tem
+    // acesso (mesma lógica já usada em `suggest-indexes`/`classify`).
+    const aiFlags = await resolveAiFeatureFlags(sql, doc.tenant_id);
+
     request.log.info(
       { tenantId: doc.tenant_id, userId, documentId: doc.id },
       'detalhe de documento recuperado'
     );
 
-    return reply
-      .status(200)
-      .send({ ...rowToDocument(doc), documentTypeName, pageCount, typeSuggestion, indexSuggestion });
+    return reply.status(200).send({
+      ...rowToDocument(doc),
+      documentTypeName,
+      pageCount,
+      typeSuggestion,
+      indexSuggestion,
+      titleSuggestionEnabled: aiFlags.titleSuggestionEnabled,
+    });
   });
 
   // =========================================================================

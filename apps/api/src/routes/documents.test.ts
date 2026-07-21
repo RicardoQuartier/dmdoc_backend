@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import FormData from 'form-data';
 import { buildApp } from '../app.js';
@@ -1704,6 +1704,103 @@ describe('GET /documents/:id — documentTypeName', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json().documentTypeName).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /documents/:id — titleSuggestionEnabled (valor EFETIVO, T-18)
+// ---------------------------------------------------------------------------
+
+describe('GET /documents/:id — titleSuggestionEnabled (T-18)', () => {
+  afterEach(async () => {
+    // `platform_settings` é um singleton que NÃO é resetado pelo `beforeEach`
+    // global do arquivo (que só recria tenants/departamentos/documentos) —
+    // restaura o kill switch de plataforma para não vazar estado para outros
+    // testes do arquivo (mesmo padrão de `admin/platform-settings.test.ts`).
+    await testDb.db`
+      UPDATE platform_settings
+      SET ai_classification_enabled = true, ai_title_suggestion_enabled = true, ai_index_suggestion_enabled = true
+    `;
+  });
+
+  /** Cria um documento READY simples em TENANT_A/DEPT_A, sem tipo. */
+  async function seedSimpleDoc(): Promise<string> {
+    const docId = newId();
+    const hash = crypto.randomBytes(32).toString('hex');
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
+        'titulo.pdf', 'titulo.pdf', ${hash}, 1024, 'application/pdf',
+        ${`tenants/${TENANT_A}/documents/${hash}/titulo.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NOW(), 0, false
+      )
+    `;
+    return docId;
+  }
+
+  it('plataforma e empresa ligadas (default do seed) → titleSuggestionEnabled: true', async () => {
+    const docId = await seedSimpleDoc();
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().titleSuggestionEnabled).toBe(true);
+  });
+
+  it('flag desligada no NÍVEL DA EMPRESA → titleSuggestionEnabled: false', async () => {
+    const docId = await seedSimpleDoc();
+    await testDb.db`
+      UPDATE tenants SET ai_title_suggestion_enabled = false WHERE id = ${TENANT_A}
+    `;
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().titleSuggestionEnabled).toBe(false);
+  });
+
+  it('flag desligada no NÍVEL DA PLATAFORMA (kill switch global) → titleSuggestionEnabled: false mesmo com empresa ligada', async () => {
+    const docId = await seedSimpleDoc();
+    await testDb.db`UPDATE platform_settings SET ai_title_suggestion_enabled = false`;
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().titleSuggestionEnabled).toBe(false);
+  });
+
+  it('não vaza a configuração comercial separada — só o booleano efetivo final', async () => {
+    const docId = await seedSimpleDoc();
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(typeof body.titleSuggestionEnabled).toBe('boolean');
+    expect(body).not.toHaveProperty('platformTitleSuggestionEnabled');
+    expect(body).not.toHaveProperty('tenantTitleSuggestionEnabled');
+    expect(body).not.toHaveProperty('aiFlags');
   });
 });
 
