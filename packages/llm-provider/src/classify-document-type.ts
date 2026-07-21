@@ -14,72 +14,159 @@ interface MinimalLogger {
 }
 
 /**
+ * Teto de palavras-chave de reconhecimento renderizadas por tipo no prompt
+ * (Fase 8, epic E-1). Defensivo: contém o custo em tokens quando o catálogo
+ * inteiro entra em TODA chamada. Excedente é truncado silenciosamente. A API
+ * (`document-types.ts`) valida a entrada com o MESMO teto.
+ */
+export const MAX_RECOGNITION_KEYWORDS_PER_TYPE = 20;
+
+/**
+ * Teto de caracteres das regras de desambiguação renderizadas por tipo no
+ * prompt. Excedente é truncado (com reticências). A API valida com o mesmo teto.
+ */
+export const MAX_RECOGNITION_RULES_CHARS = 500;
+
+/**
  * Prompt de classificação automática de tipo de documento.
  *
- * Versão: classify-document-type-v1
+ * Versão: classify-document-type-v3
  *
- * O modelo recebe um CATÁLOGO FECHADO de tipos (escopado ao departamento do
- * documento pelo chamador) e o início do texto extraído, e deve:
- * 1. Escolher o tipo pelo NOME EXATO da lista — ou `null` se nenhum se encaixa
- *    (nunca forçar uma escolha aproximada).
+ * O modelo recebe um CATÁLOGO FECHADO e NUMERADO de tipos (escopado ao
+ * departamento do documento pelo chamador) e o início do texto extraído, e deve:
+ * 1. Escolher o tipo pelo NÚMERO da lista numerada — ou `null` se nenhum se
+ *    encaixa (nunca forçar uma escolha aproximada). Número fora da faixa é
+ *    tratado como "nenhum tipo".
  * 2. Reportar uma confiança de 0 a 1.
- * 3. Sugerir um título de exibição legível (forward-compat da Fase 8.1 —
- *    a mesma chamada cobre classificação + título).
+ * 3. Sugerir um título de exibição legível (Fase 8.1 — a mesma chamada cobre
+ *    classificação + título).
+ *
+ * SELEÇÃO POR ÍNDICE (v3): a v2 pedia o NOME EXATO do tipo e o backend resolvia
+ * por match exato. Isso quebrava quando o modelo devolvia o nome BASE ("Boleto")
+ * de um tipo com qualificador ("Boleto (QA E-1)", "Boleto Bancário"): o match
+ * exato falhava e a sugestão correta era descartada silenciosamente (T-10). A
+ * v3 pede o NÚMERO do tipo no catálogo numerado, eliminando a dependência de o
+ * modelo ecoar o nome literalmente. CINTO E SUSPENSÓRIO: o backend ainda aceita
+ * `documentTypeName` como campo opcional e resolve por nome EXATO como FALLBACK
+ * quando o número vem ausente/inválido — estritamente superior à v2, sem
+ * regressão possível.
  *
  * A `description` de cada tipo entra no prompt como dica de classificação
- * (mesmo papel do `aiExtractionHint` por campo na Fase 7).
+ * (mesmo papel do `aiExtractionHint` por campo na Fase 7). Cada tipo pode ainda
+ * trazer SINAIS (palavras-chave) e REGRAS de desambiguação (inclusive
+ * negativas) — usados para separar tipos parecidos (ex.: Boleto × Fatura ×
+ * Recibo). Esses campos são renderizados apenas quando presentes.
  *
  * A versão é gravada junto com o resultado para rastrear o que reprocessar
- * quando o prompt evoluir (invariante de prompt versionado — spec §11).
+ * quando o prompt evoluir (invariante de prompt versionado — spec §11). O bump
+ * para v3 é apenas de rastreabilidade — NÃO força reprocessamento.
  */
 export const CLASSIFY_DOCUMENT_TYPE_PROMPT = {
-  version: 'classify-document-type-v1',
+  version: 'classify-document-type-v3',
 
-  systemPrompt: `Você classifica documentos empresariais dentro de um catálogo FECHADO de tipos e sugere um título de exibição.
+  systemPrompt: `Você classifica documentos empresariais dentro de um catálogo FECHADO e NUMERADO de tipos e sugere um título de exibição.
 
 Regras obrigatórias:
-1. Escolha o tipo pelo NOME EXATO, exatamente como aparece na lista de tipos fornecida. Nunca invente um tipo fora da lista.
-2. Se nenhum tipo da lista descrever bem o documento, retorne "documentTypeName": null — não force uma escolha aproximada.
+1. Escolha o tipo pelo NÚMERO que aparece à esquerda de cada tipo na lista numerada (ex.: se o tipo certo é "3. Boleto (QA E-1)", retorne "documentTypeNumber": 3). Nunca invente um número fora da lista.
+2. Se nenhum tipo da lista descrever bem o documento, retorne "documentTypeNumber": null — não force uma escolha aproximada. Um número fora da faixa da lista também é tratado como "nenhum tipo".
 3. Use a descrição de cada tipo como dica para decidir o encaixe.
-4. "confidence" reflete sua certeza sobre o tipo escolhido, de 0 a 1. Se "documentTypeName" for null, "confidence" deve ser baixa (próxima de 0).
-5. "suggestedTitle" é um título curto e legível gerado a partir do conteúdo do documento (não é o nome do arquivo). Se não for possível inferir, retorne null.
-6. Responda em português brasileiro, em JSON estrito, contendo APENAS os campos "documentTypeName", "confidence" e "suggestedTitle". Sem texto fora do JSON.`,
+4. Quando um tipo trouxer "Sinais" (palavras-chave) ou "Regras", use-os para desambiguar entre tipos parecidos. As regras podem ser NEGATIVAS (ex.: "NÃO classifique como X se..."): respeite-as — se uma regra negativa se aplicar ao documento, NÃO escolha aquele tipo.
+5. "confidence" reflete sua certeza sobre o tipo escolhido, de 0 a 1. Se "documentTypeNumber" for null, "confidence" deve ser baixa (próxima de 0).
+6. "suggestedTitle" é um título curto e legível gerado a partir do conteúdo do documento (não é o nome do arquivo). Se não for possível inferir, retorne null.
+7. Responda em português brasileiro, em JSON estrito, contendo APENAS os campos "documentTypeNumber", "confidence" e "suggestedTitle". Sem texto fora do JSON.`,
 
   /**
-   * Schema do que o LLM deve retornar. `suggestedTitle` é nullable (Fase 8.1) —
-   * incluído sempre no schema (custo zero), mas descartado pela máscara de flags
-   * quando `titleSuggestionEnabled === false`.
+   * Schema do que o LLM deve retornar.
+   *
+   * `documentTypeNumber` (v3) é o índice 1-based do tipo escolhido no catálogo
+   * numerado — o caminho PRIMÁRIO de resolução. `documentTypeName` permanece
+   * aceito (opcional) como CINTO E SUSPENSÓRIO: se o número vier ausente/nulo, o
+   * backend tenta resolver por nome EXATO como na v2 (sem regressão). Ambos são
+   * opcionais/nullable para que uma resposta com só um deles ainda valide.
+   * `suggestedTitle` é nullable (Fase 8.1) — sempre no schema (custo zero), mas
+   * descartado pela máscara de flags quando `titleSuggestionEnabled === false`.
    */
   outputSchema: z.object({
-    documentTypeName: z.string().nullable(),
+    documentTypeNumber: z.number().int().nullable().optional(),
+    documentTypeName: z.string().nullable().optional(),
     confidence: z.number().min(0).max(1),
     suggestedTitle: z.string().nullable(),
   }),
 
   /**
-   * Monta a mensagem do usuário com o catálogo de tipos e o início do texto.
+   * Monta a mensagem do usuário com o catálogo NUMERADO de tipos e o início do
+   * texto.
    *
-   * Envia sempre NOMES + descrições dos tipos — NUNCA IDs. O `id` fica só do
-   * lado do backend, que resolve `documentTypeName` → `documentTypeId` por match
-   * exato após a resposta.
+   * Envia sempre NÚMERO + NOME + descrição dos tipos — NUNCA IDs. O `id` fica só
+   * do lado do backend, que resolve o `documentTypeNumber` escolhido → índice do
+   * catálogo → `documentTypeId`. O nome ainda vai no prompt (legibilidade para o
+   * modelo e fallback de resolução por nome exato no backend), mas a seleção é
+   * pelo NÚMERO — o modelo não precisa ecoar o nome literalmente.
+   *
+   * Cada tipo pode acrescentar — SÓ quando presentes — uma linha `Sinais:`
+   * (palavras-chave) e/ou uma linha `Regras:` (desambiguação). Tetos defensivos
+   * por tipo (`MAX_RECOGNITION_KEYWORDS_PER_TYPE`, `MAX_RECOGNITION_RULES_CHARS`)
+   * contêm o custo em tokens.
    *
    * @param text    Início do texto extraído do documento (já fatiado ao orçamento).
-   * @param catalog Tipos visíveis para o departamento (name + description).
+   * @param catalog Tipos visíveis para o departamento (name + description +
+   *                sinais/regras opcionais). A ordem define o NÚMERO de cada tipo
+   *                (1-based) — deve ser a MESMA lista usada na resolução.
    */
   buildUserMessage(
     text: string,
-    catalog: Array<{ name: string; description: string | null }>
+    catalog: Array<{
+      name: string;
+      description: string | null;
+      recognitionKeywords?: string[];
+      recognitionRules?: string | null;
+    }>
   ): string {
     const catalogo =
       catalog.length === 0
-        ? '(nenhum tipo disponível — retorne documentTypeName: null, mas ainda sugira um título)'
-        : catalog
-            .map((t) => `- ${t.name}${t.description ? `: ${t.description}` : ''}`)
-            .join('\n');
+        ? '(nenhum tipo disponível — retorne documentTypeNumber: null, mas ainda sugira um título)'
+        : catalog.map((t, i) => renderCatalogType(t, i + 1)).join('\n');
 
     return `Tipos de documento disponíveis:\n${catalogo}\n\n---\n\nTexto do documento:\n${text}`;
   },
 } as const;
+
+/**
+ * Renderiza UM tipo do catálogo para o prompt, prefixado pelo seu NÚMERO
+ * (1-based) — é esse número que o modelo retorna em `documentTypeNumber`. A
+ * linha base é `{index}. {name}[: {description}]`. As linhas `Sinais:` e
+ * `Regras:` só aparecem quando há conteúdo, com os tetos defensivos aplicados.
+ */
+function renderCatalogType(
+  t: {
+    name: string;
+    description: string | null;
+    recognitionKeywords?: string[];
+    recognitionRules?: string | null;
+  },
+  index: number
+): string {
+  let line = `${index}. ${t.name}${t.description ? `: ${t.description}` : ''}`;
+
+  const keywords = (t.recognitionKeywords ?? [])
+    .map((k) => k.trim())
+    .filter((k) => k.length > 0)
+    .slice(0, MAX_RECOGNITION_KEYWORDS_PER_TYPE);
+  if (keywords.length > 0) {
+    line += `\n  Sinais: ${keywords.join(', ')}`;
+  }
+
+  const rules = (t.recognitionRules ?? '').trim();
+  if (rules.length > 0) {
+    const truncated =
+      rules.length > MAX_RECOGNITION_RULES_CHARS
+        ? `${rules.slice(0, MAX_RECOGNITION_RULES_CHARS)}…`
+        : rules;
+    line += `\n  Regras: ${truncated}`;
+  }
+
+  return line;
+}
 
 /**
  * Fator de estimativa caracteres→tokens usado para fatiar o texto ao orçamento.
@@ -117,6 +204,17 @@ export interface DocumentTypeCatalogItem {
   id: string;
   name: string;
   description: string | null;
+  /**
+   * Palavras/expressões-sinal do tipo (Fase 8, epic E-1). Renderizadas no prompt
+   * como linha `Sinais:` quando presentes. Opcional para retrocompatibilidade
+   * com chamadores que ainda não carregam o campo (o prompt trata como ausente).
+   */
+  recognitionKeywords?: string[];
+  /**
+   * Regras de desambiguação em texto livre — inclusive negativas. Renderizadas
+   * no prompt como linha `Regras:` quando presentes.
+   */
+  recognitionRules?: string | null;
 }
 
 /**
@@ -146,8 +244,9 @@ export interface ClassifyDocumentTypeInput {
  * Resultado da classificação — CONSULTIVO. Nunca sobrescreve a escolha manual
  * do usuário; o worker/endpoint mapeia isto para `DocumentContent.typeSuggestion`.
  *
- * `documentTypeId` é resolvido no backend por match exato do nome contra o
- * catálogo enviado — nunca confia em ID gerado pelo modelo, nunca faz fuzzy.
+ * `documentTypeId` é resolvido no backend pelo NÚMERO escolhido (índice 1-based
+ * do catálogo enviado) e, como fallback, por match exato do nome — nunca confia
+ * em ID gerado pelo modelo, nunca faz fuzzy.
  */
 export interface ClassificationResult {
   documentTypeId: string | null;
@@ -210,15 +309,34 @@ function parseJsonObject(content: string): Record<string, unknown> | null {
 }
 
 /**
- * Resolve o nome escolhido pelo modelo para um item do catálogo por match
- * EXATO case-insensitive (após trim). Sem correspondência ⇒ `null` (tratado
- * como "nenhum tipo", nunca como erro). NUNCA fuzzy, NUNCA usa ID do modelo.
+ * Resolve o NÚMERO escolhido pelo modelo (1-based, na ordem do catálogo enviado
+ * ao prompt) para um item do catálogo. Caminho PRIMÁRIO de resolução na v3.
+ *
+ * Valida a faixa `1..catalog.length`: um número ausente, não inteiro ou fora da
+ * faixa ⇒ `null` (tratado como "nenhum tipo" — preserva o invariante "nenhum
+ * tipo quando não há encaixe", inclusive quando o modelo alucina um índice).
  */
-function resolveCatalogType(
-  name: string | null,
+function resolveByIndex(
+  n: number | null | undefined,
   catalog: DocumentTypeCatalogItem[]
 ): { id: string; name: string } | null {
-  if (name === null) return null;
+  if (n === null || n === undefined || !Number.isInteger(n)) return null;
+  if (n < 1 || n > catalog.length) return null;
+  const item = catalog[n - 1];
+  return item ? { id: item.id, name: item.name } : null;
+}
+
+/**
+ * FALLBACK (v2): resolve o nome escolhido pelo modelo para um item do catálogo
+ * por match EXATO case-insensitive (após trim). Usado só quando a resolução por
+ * índice não deu resultado. Sem correspondência ⇒ `null` (tratado como "nenhum
+ * tipo", nunca como erro). NUNCA fuzzy, NUNCA usa ID do modelo.
+ */
+function resolveCatalogType(
+  name: string | null | undefined,
+  catalog: DocumentTypeCatalogItem[]
+): { id: string; name: string } | null {
+  if (name === null || name === undefined) return null;
   const target = name.trim().toLowerCase();
   if (target.length === 0) return null;
   const match = catalog.find((c) => c.name.trim().toLowerCase() === target);
@@ -371,9 +489,12 @@ export async function classifyDocumentType(
     );
   }
 
-  // Resolve nome→id por match exato. Sem correspondência ⇒ "nenhum tipo",
-  // mas o título (independente do tipo) é preservado.
-  const match = resolveCatalogType(parsed.documentTypeName, catalog);
+  // Resolução v3: NÚMERO → índice do catálogo (primário). Se ausente/inválido,
+  // FALLBACK por nome EXATO (comportamento v2). Sem nenhum dos dois ⇒ "nenhum
+  // tipo", mas o título (independente do tipo) é preservado.
+  const match =
+    resolveByIndex(parsed.documentTypeNumber, catalog) ??
+    resolveCatalogType(parsed.documentTypeName, catalog);
 
   return applyFlagMask(
     {

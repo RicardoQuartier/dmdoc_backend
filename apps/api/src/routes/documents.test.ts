@@ -2499,9 +2499,20 @@ describe('PATCH /documents/:id — título de exibição (Fase 8.1)', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /documents/:id/classify (Fase 8)', () => {
-  /** Monta um ChatResult fake do provedor de LLM a partir do JSON de saída. */
+  /**
+   * Monta um ChatResult fake do provedor de LLM a partir do JSON de saída.
+   *
+   * v3: o modelo escolhe o tipo pelo NÚMERO (`documentTypeNumber`). O campo
+   * `documentTypeName` ainda é aceito como FALLBACK de resolução por nome exato —
+   * ambos são opcionais aqui para cobrir os dois caminhos.
+   */
   function chatResult(
-    output: { documentTypeName: string | null; confidence: number; suggestedTitle: string | null },
+    output: {
+      documentTypeNumber?: number | null;
+      documentTypeName?: string | null;
+      confidence: number;
+      suggestedTitle: string | null;
+    },
     costUsd = 0.002
   ): ChatResult {
     return {
@@ -2590,7 +2601,7 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     expect(body.typeSuggestion.documentTypeName).toBe('Contrato A');
     expect(body.typeSuggestion.confidence).toBe(0.9);
     expect(body.typeSuggestion.model).toBe('gpt-4o-mini');
-    expect(body.typeSuggestion.promptVersion).toBe('classify-document-type-v1');
+    expect(body.typeSuggestion.promptVersion).toBe('classify-document-type-v3');
     expect(body.typeSuggestion).not.toHaveProperty('rawResponse');
     expect(body.suggestedTitle).toBe('Contrato de Serviço');
     expect(body.costUsd).toBeCloseTo(0.002, 6);
@@ -2616,6 +2627,50 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     expect(content[0]!.cost_breakdown!['embeddingsUsd']).toBeCloseTo(0.01, 6);
     expect(content[0]!.cost_breakdown!['classificationUsd']).toBeCloseTo(0.002, 6);
     expect(content[0]!.cost_breakdown!['totalUsd']).toBeCloseTo(0.012, 6);
+  });
+
+  it('v3 (T-10): resolve por NÚMERO — modelo devolve documentTypeNumber, não o nome', async () => {
+    // Cenário do bug T-10: o modelo escolhe pelo índice e nem precisa ecoar o
+    // nome (que poderia ter qualificador/sufixo). Só há 1 tipo visível em
+    // DEPT_A, então documentTypeNumber:1 → DOC_TYPE_ID.
+    await makeTypeVisibleInDeptA();
+    const docId = await seedProcessedDoc({ documentTypeId: null });
+    fakeLlmChat.mockResolvedValueOnce(
+      chatResult({ documentTypeNumber: 1, confidence: 0.9, suggestedTitle: 'Contrato de Serviço' })
+    );
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/classify`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.typeSuggestion.documentTypeId).toBe(DOC_TYPE_ID);
+    expect(body.typeSuggestion.documentTypeName).toBe('Contrato A');
+    expect(body.typeSuggestion.confidence).toBe(0.9);
+    expect(body.typeSuggestion.promptVersion).toBe('classify-document-type-v3');
+  });
+
+  it('v3: número fora da faixa → nenhum tipo (sugestão null persistida)', async () => {
+    await makeTypeVisibleInDeptA();
+    const docId = await seedProcessedDoc({ documentTypeId: null });
+    fakeLlmChat.mockResolvedValueOnce(
+      chatResult({ documentTypeNumber: 99, confidence: 0.85, suggestedTitle: null })
+    );
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/classify`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.typeSuggestion.documentTypeId).toBeNull();
+    expect(body.typeSuggestion.documentTypeName).toBeNull();
+    expect(body.typeSuggestion.confidence).toBe(0);
   });
 
   it('não sobrescreve um tipo manual JÁ definido', async () => {

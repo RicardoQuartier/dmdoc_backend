@@ -50,6 +50,13 @@
       "when": 1784822400000,
       "tag": "0007_document_display_title",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1784908800000,
+      "tag": "0008_type_recognition_signals",
+      "breakpoints": true
     }
   ]
 }

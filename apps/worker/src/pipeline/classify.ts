@@ -77,8 +77,9 @@ const NO_SUGGESTION: ClassifyDocumentOutcome = {
  *    custo. Retorna `null` (sem sugestão).
  * 2. Resolve o catálogo de tipos escopado ao departamento do documento
  *    (mesma visibilidade de `GET /document-types`).
- * 3. Chama o service de classificação (`classify-document-type-v1`), que já
- *    aplica a máscara de flags, resolve nome→id por match exato e nunca lança.
+ * 3. Chama o service de classificação (`classify-document-type-v3`), que já
+ *    aplica a máscara de flags, resolve o número escolhido → id (fallback: nome
+ *    exato) e nunca lança.
  * 4. Monta o `TypeSuggestion` a persistir. Mesmo quando o resultado é "nenhum
  *    tipo" (`documentTypeId: null`, confiança baixa) a sugestão é persistida —
  *    é o Cenário 2 da tela de qualificação ("IA não identificou tipo"). Só

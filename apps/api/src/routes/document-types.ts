@@ -2,6 +2,10 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import type { Sql } from '@dmdoc/db-pg';
 import { z } from 'zod';
 import { TenantRepository, newId } from '@dmdoc/db-pg';
+import {
+  MAX_RECOGNITION_KEYWORDS_PER_TYPE,
+  MAX_RECOGNITION_RULES_CHARS,
+} from '@dmdoc/llm-provider';
 import type { IndexField } from '@dmdoc/shared-types';
 import type { TenantDocument } from '@dmdoc/db-pg';
 import { ConflictError, ForbiddenError, NotFoundError } from '../errors/index.js';
@@ -13,6 +17,9 @@ import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 interface DocumentTypeDoc extends TenantDocument {
   name: string;
   description: string | null;
+  /** Sinais de reconhecimento do tipo (Fase 8, epic E-1). */
+  recognitionKeywords: string[];
+  recognitionRules: string | null;
   isGlobal: boolean;
   createdAt: Date;
   indexFields: IndexField[];
@@ -33,10 +40,24 @@ const ListDocumentTypesQuerySchema = z.object({
   departmentId: z.string().uuid().optional(),
 });
 
+/**
+ * Palavras-chave de reconhecimento: cada item com tamanho limitado e o array
+ * com o MESMO teto aplicado no prompt (`MAX_RECOGNITION_KEYWORDS_PER_TYPE`) —
+ * mantém o custo de tokens da classificação sob controle já na entrada.
+ */
+const RecognitionKeywordsSchema = z
+  .array(z.string().min(1).max(80))
+  .max(MAX_RECOGNITION_KEYWORDS_PER_TYPE);
+
+/** Regras de desambiguação: texto livre com o mesmo teto de chars do prompt. */
+const RecognitionRulesSchema = z.string().max(MAX_RECOGNITION_RULES_CHARS);
+
 const CreateDocumentTypeBodySchema = z
   .object({
     name: z.string().min(1).max(200),
     description: z.string().nullable().default(null),
+    recognitionKeywords: RecognitionKeywordsSchema.default([]),
+    recognitionRules: RecognitionRulesSchema.nullable().default(null),
     tenantId: z.string().uuid().optional(),
     isGlobal: z.boolean().default(false),
     departmentIds: z.array(z.string().uuid()).min(1).optional(),
@@ -54,6 +75,8 @@ const CreateDocumentTypeBodySchema = z
 const PatchDocumentTypeBodySchema = z.object({
   name: z.string().min(1).max(200).optional(),
   description: z.string().nullable().optional(),
+  recognitionKeywords: RecognitionKeywordsSchema.optional(),
+  recognitionRules: RecognitionRulesSchema.nullable().optional(),
   departmentIds: z.array(z.string().uuid()).min(1).optional(),
 });
 
@@ -95,6 +118,8 @@ type DocTypeRow = {
   tenant_id: string | null;
   name: string;
   description: string | null;
+  recognition_keywords: string[] | null;
+  recognition_rules: string | null;
   is_global: boolean;
   created_at: Date;
   department_ids: string[] | null;
@@ -133,6 +158,8 @@ function rowToDocType(r: DocTypeRow, indexFields: IndexField[]): DocumentTypeDoc
     tenantId: r.tenant_id ?? '',
     name: r.name,
     description: r.description,
+    recognitionKeywords: r.recognition_keywords ?? [],
+    recognitionRules: r.recognition_rules,
     isGlobal: r.is_global,
     createdAt: r.created_at,
     indexFields,
@@ -271,7 +298,8 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       }
 
       rows = await sql<DocTypeRow[]>`
-        SELECT DISTINCT dt.id, dt.tenant_id, dt.name, dt.description, dt.is_global,
+        SELECT DISTINCT dt.id, dt.tenant_id, dt.name, dt.description,
+                        dt.recognition_keywords, dt.recognition_rules, dt.is_global,
                         dt.created_at, dt.department_ids, dt.deleted
         FROM document_types dt
         WHERE dt.deleted = false
@@ -297,14 +325,14 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       `;
     } else if (ctx.mode === 'all') {
       rows = await sql<DocTypeRow[]>`
-        SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
+        SELECT id, tenant_id, name, description, recognition_keywords, recognition_rules, is_global, created_at, department_ids, deleted
         FROM document_types
         WHERE deleted = false
         ORDER BY name ASC
       `;
     } else if (ctx.mode === 'allowed') {
       rows = await sql<DocTypeRow[]>`
-        SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
+        SELECT id, tenant_id, name, description, recognition_keywords, recognition_rules, is_global, created_at, department_ids, deleted
         FROM document_types
         WHERE deleted = false
           AND (
@@ -333,7 +361,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
         // lista geral. Gatear os globais por aquela config aqui era a causa da
         // lista vazia para papéis não-admin.
         rows = await sql<DocTypeRow[]>`
-          SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
+          SELECT id, tenant_id, name, description, recognition_keywords, recognition_rules, is_global, created_at, department_ids, deleted
           FROM document_types
           WHERE deleted = false
             AND (
@@ -345,7 +373,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       } else {
         // Admins: veem todos os tipos do tenant + globais
         rows = await sql<DocTypeRow[]>`
-          SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
+          SELECT id, tenant_id, name, description, recognition_keywords, recognition_rules, is_global, created_at, department_ids, deleted
           FROM document_types
           WHERE deleted = false
             AND (
@@ -411,7 +439,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       throw new ForbiddenError('Apenas SUPER_ADMIN pode criar tipos de documento globais');
     }
 
-    const { name, description, departmentIds } = body;
+    const { name, description, recognitionKeywords, recognitionRules, departmentIds } = body;
     const sql = app.db;
 
     // Tipo nasce sem campos de índice — nada a inserir em
@@ -422,8 +450,8 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       const now = new Date();
       try {
         await sql`
-          INSERT INTO document_types (id, tenant_id, name, description, is_global, created_at, department_ids, deleted)
-          VALUES (${id}, NULL, ${name}, ${description ?? null}, true, ${now}, NULL, false)
+          INSERT INTO document_types (id, tenant_id, name, description, recognition_keywords, recognition_rules, is_global, created_at, department_ids, deleted)
+          VALUES (${id}, NULL, ${name}, ${description ?? null}, ${recognitionKeywords}, ${recognitionRules}, true, ${now}, NULL, false)
         `;
       } catch (err: unknown) {
         if ((err as { code?: string }).code === '23505') {
@@ -433,7 +461,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       }
       request.log.info({ documentTypeId: id }, 'tipo de documento global criado');
       const enrichedGlobal = await enrichWithDepartments(
-        { id, tenantId: null as unknown as string, name, description: description ?? null, isGlobal: true, createdAt: now, indexFields: [], deleted: false },
+        { id, tenantId: null as unknown as string, name, description: description ?? null, recognitionKeywords, recognitionRules, isGlobal: true, createdAt: now, indexFields: [], deleted: false },
         sql
       );
       return reply.status(201).send(enrichedGlobal);
@@ -465,6 +493,8 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       inserted = (await repo.insertOne({
         name,
         description: description ?? null,
+        recognitionKeywords,
+        recognitionRules,
         isGlobal: false,
         createdAt: new Date(),
         indexFields: [],
@@ -498,7 +528,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
     const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
 
     const existingRows = await sql<DocTypeRow[]>`
-      SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
+      SELECT id, tenant_id, name, description, recognition_keywords, recognition_rules, is_global, created_at, department_ids, deleted
       FROM document_types
       WHERE id = ${id}
         AND deleted = false
@@ -519,13 +549,15 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
 
       if (clean.name !== undefined) { setParts.push(`name = $${paramIdx++}`); values.push(clean.name); }
       if ('description' in clean && clean.description !== undefined) { setParts.push(`description = $${paramIdx++}`); values.push(clean.description); }
+      if (clean.recognitionKeywords !== undefined) { setParts.push(`recognition_keywords = $${paramIdx++}`); values.push(clean.recognitionKeywords); }
+      if ('recognitionRules' in clean && clean.recognitionRules !== undefined) { setParts.push(`recognition_rules = $${paramIdx++}`); values.push(clean.recognitionRules); }
 
       if (setParts.length === 0) {
         const enrichedNoOp = await enrichWithDepartments(doc, sql);
         return reply.status(200).send(enrichedNoOp);
       }
 
-      const query = `UPDATE document_types SET ${setParts.join(', ')} WHERE id = $1 AND deleted = false RETURNING id, tenant_id, name, description, is_global, created_at, department_ids, deleted`;
+      const query = `UPDATE document_types SET ${setParts.join(', ')} WHERE id = $1 AND deleted = false RETURNING id, tenant_id, name, description, recognition_keywords, recognition_rules, is_global, created_at, department_ids, deleted`;
       const updRows = await sql.unsafe<DocTypeRow[]>(query, values as Parameters<typeof sql.unsafe>[1]);
       if (updRows.length === 0) throw new NotFoundError();
 
@@ -619,7 +651,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
 
       const existingRows = await sql<DocTypeRow[]>`
-        SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
+        SELECT id, tenant_id, name, description, recognition_keywords, recognition_rules, is_global, created_at, department_ids, deleted
         FROM document_types
         WHERE id = ${id}
           AND deleted = false
@@ -672,7 +704,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
 
       const existingRows = await sql<DocTypeRow[]>`
-        SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
+        SELECT id, tenant_id, name, description, recognition_keywords, recognition_rules, is_global, created_at, department_ids, deleted
         FROM document_types
         WHERE id = ${id}
           AND deleted = false
@@ -864,7 +896,7 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       const isSuperAdmin = request.user?.role === 'SUPER_ADMIN';
 
       const existingRows = await sql<DocTypeRow[]>`
-        SELECT id, tenant_id, name, description, is_global, created_at, department_ids, deleted
+        SELECT id, tenant_id, name, description, recognition_keywords, recognition_rules, is_global, created_at, department_ids, deleted
         FROM document_types
         WHERE id = ${id}
           AND deleted = false
