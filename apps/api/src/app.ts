@@ -24,6 +24,7 @@ import { auditLogsRoutes } from './routes/audit-logs.js';
 import { usageRoutes } from './routes/usage.js';
 import { reportsRoutes } from './routes/reports.js';
 import { createS3Service, type S3Service, type S3Config } from './services/s3.js';
+import type { LLMProvider } from '@dmdoc/llm-provider';
 
 declare module 'fastify' {
   interface FastifyInstance {
@@ -77,6 +78,12 @@ export interface BuildAppOptions {
    * Em testes, passe um mock. Em produção é criado a partir da config.
    */
   s3?: S3Service;
+  /**
+   * Provider de LLM a injetar nas rotas de IA (documentos, busca).
+   * Em testes, passe um fake para exercitar as rotas sem chamar o provedor real.
+   * Em produção, cada rota cria o seu a partir da config.
+   */
+  llmProvider?: LLMProvider;
 }
 
 /**
@@ -157,7 +164,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(departmentsRoutes);
   await app.register(documentTypesRoutes);
   await app.register(permissionsRoutes);
-  await app.register(documentsRoutes, { config } satisfies DocumentsRoutesOptions);
+  await app.register(documentsRoutes, {
+    config,
+    ...(options.llmProvider ? { llmProvider: options.llmProvider } : {}),
+  } satisfies DocumentsRoutesOptions);
   await app.register(searchRoutes, { config } satisfies SearchRoutesOptions);
   await app.register(auditLogsRoutes);
   await app.register(usageRoutes);
