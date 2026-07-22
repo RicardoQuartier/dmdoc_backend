@@ -14,6 +14,7 @@ import { parseCitations } from '../services/citation-parser.js';
 import { RAG_ANSWER_PROMPT } from '../prompts/rag-answer.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
 import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
+import { resolveIndexFieldDisplayLabel } from '../lib/index-fields.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais
@@ -32,6 +33,7 @@ type DocMetaRow = {
 type IndexFieldRow = {
   document_type_id: string;
   name: string;
+  label: string | null;
   field_type: string;
   sort_order: number;
 };
@@ -432,7 +434,7 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
       const fieldsByType = new Map<string, IndexFieldRow[]>();
       if (typeIds.length > 0) {
         const fieldRows = await sql<IndexFieldRow[]>`
-          SELECT document_type_id, name, field_type, sort_order
+          SELECT document_type_id, name, label, field_type, sort_order
           FROM document_type_index_fields
           WHERE document_type_id = ANY(${typeIds}::uuid[])
             AND show_on_search = true
@@ -456,7 +458,7 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
           if (raw === undefined || raw === null) continue;
           indexValues.push({
             fieldName: field.name,
-            label: field.name,
+            label: resolveIndexFieldDisplayLabel(field),
             fieldType: field.field_type,
             value: raw,
           });

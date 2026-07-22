@@ -13,6 +13,7 @@ import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantContext, resolveTenantId } from '../auth/resolve-tenant.js';
 import { ADMIN_ROLES } from '@dmdoc/shared-types';
 import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
+import { resolveIndexFieldDisplayLabel } from '../lib/index-fields.js';
 
 interface DocumentTypeDoc extends TenantDocument {
   name: string;
@@ -85,6 +86,8 @@ const CreateIndexFieldBodySchema = z.object({
   fieldType: z.enum(['TEXT', 'DATE', 'NUMBER']),
   required: z.boolean().default(false),
   aiExtractionHint: z.string().nullable().default(null),
+  /** Rótulo amigável opcional (T-15). `null`/ausente → rótulo derivado do `name`. */
+  label: z.string().max(200).nullable().default(null),
   order: z.number().int().nonnegative().default(0),
   showOnSearch: z.boolean().default(true),
 });
@@ -94,6 +97,8 @@ const PatchIndexFieldBodySchema = z.object({
   fieldType: z.enum(['TEXT', 'DATE', 'NUMBER']).optional(),
   required: z.boolean().optional(),
   aiExtractionHint: z.string().nullable().optional(),
+  /** Rótulo amigável opcional (T-15). `null` → volta a derivar do `name`. */
+  label: z.string().max(200).nullable().optional(),
   order: z.number().int().nonnegative().optional(),
   showOnSearch: z.boolean().optional(),
 });
@@ -134,6 +139,8 @@ type IndexFieldDbRow = {
   field_type: 'TEXT' | 'DATE' | 'NUMBER';
   required: boolean;
   ai_extraction_hint: string | null;
+  /** Rótulo amigável explícito (T-15). `null` quando não preenchido pelo admin. */
+  label: string | null;
   sort_order: number;
   show_on_search: boolean;
   deleted: boolean;
@@ -143,6 +150,8 @@ function indexFieldRowToIndexField(r: IndexFieldDbRow): IndexField {
   return {
     id: r.id,
     name: r.name,
+    label: r.label,
+    displayLabel: resolveIndexFieldDisplayLabel(r),
     fieldType: r.field_type,
     required: r.required,
     aiExtractionHint: r.ai_extraction_hint,
@@ -186,7 +195,7 @@ async function fetchIndexFieldsBatch(
   if (documentTypeIds.length === 0) return map;
 
   const rows = await sql<IndexFieldDbRow[]>`
-    SELECT id, document_type_id, name, field_type, required, ai_extraction_hint, sort_order, show_on_search, deleted
+    SELECT id, document_type_id, name, field_type, required, ai_extraction_hint, label, sort_order, show_on_search, deleted
     FROM document_type_index_fields
     WHERE document_type_id = ANY(${documentTypeIds}::uuid[])
     ORDER BY sort_order ASC
@@ -666,11 +675,11 @@ export const documentTypesRoutes: FastifyPluginAsync = async (app) => {
       try {
         await sql`
           INSERT INTO document_type_index_fields (
-            id, document_type_id, name, field_type, required, ai_extraction_hint, sort_order, show_on_search, deleted
+            id, document_type_id, name, field_type, required, ai_extraction_hint, label, sort_order, show_on_search, deleted
           )
           VALUES (
             ${newFieldId}, ${id}, ${fieldInput.name}, ${fieldInput.fieldType}, ${fieldInput.required},
-            ${fieldInput.aiExtractionHint}, ${fieldInput.order}, ${fieldInput.showOnSearch}, false
+            ${fieldInput.aiExtractionHint}, ${fieldInput.label}, ${fieldInput.order}, ${fieldInput.showOnSearch}, false
           )
         `;
       } catch (err: unknown) {
@@ -946,6 +955,9 @@ function indexFieldUpdatesToRow(
   if (updates.required !== undefined) row['required'] = updates.required;
   if ('aiExtractionHint' in updates && updates.aiExtractionHint !== undefined) {
     row['ai_extraction_hint'] = updates.aiExtractionHint;
+  }
+  if ('label' in updates && updates.label !== undefined) {
+    row['label'] = updates.label;
   }
   if (updates.order !== undefined) row['sort_order'] = updates.order;
   if (updates.showOnSearch !== undefined) row['show_on_search'] = updates.showOnSearch;

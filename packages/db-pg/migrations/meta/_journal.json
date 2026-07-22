@@ -57,6 +57,13 @@
       "when": 1784908800000,
       "tag": "0008_type_recognition_signals",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1785008800000,
+      "tag": "0009_index_field_label",
+      "breakpoints": true
     }
   ]
 }

@@ -216,7 +216,8 @@ describe('POST /search — enriquecimento com title e indexValues (T-12)', () =>
     const numero = chunkA!.indexValues.find((v) => v.fieldName === 'numero_nota');
     expect(numero).toMatchObject({
       fieldName: 'numero_nota',
-      label: 'numero_nota',
+      // Sem `label` explícito no campo (T-15): derivado do `name` snake_case.
+      label: 'Numero Nota',
       fieldType: 'TEXT',
       value: 'NF-123',
     });

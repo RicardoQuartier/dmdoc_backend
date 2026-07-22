@@ -12,6 +12,15 @@ export type FieldType = z.infer<typeof FieldTypeSchema>;
 export const IndexFieldSchema = z.object({
   id: z.string().uuid(),
   name: z.string().min(1).max(200),
+  /** Rótulo amigável explícito, digitado pelo admin (T-15). `null` quando não preenchido. */
+  label: z.string().max(200).nullable(),
+  /**
+   * Rótulo sempre resolvido para exibição: `label?.trim() || deriveIndexFieldLabel(name)`.
+   * Nunca `null` — consumidores read-only (chips de busca, `<dt>` de detalhe) devem usar
+   * este campo em vez de `name` cru. Ver `deriveIndexFieldLabel` em
+   * `apps/api/src/lib/index-fields.ts` (T-15).
+   */
+  displayLabel: z.string().min(1).max(200),
   fieldType: FieldTypeSchema,
   required: z.boolean(),
   aiExtractionHint: z.string().nullable(),

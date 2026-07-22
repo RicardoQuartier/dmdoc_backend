@@ -180,6 +180,50 @@ describe('POST /document-types/:id/index-fields — grava na tabela normalizada'
     expect(legacyRows[0]!.index_fields).toEqual([]);
   });
 
+  it('sem label explícito, displayLabel é derivado do name (T-15)', async () => {
+    const typeId = await createDocType(tokenAdminA);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/document-types/${typeId}/index-fields`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { name: 'numero_nota', fieldType: 'TEXT', required: false, order: 0 },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { indexFields: Array<Record<string, unknown>> };
+    expect(body.indexFields[0]).toMatchObject({
+      name: 'numero_nota',
+      label: null,
+      displayLabel: 'Numero Nota',
+    });
+  });
+
+  it('com label explícito, displayLabel usa o label (T-15)', async () => {
+    const typeId = await createDocType(tokenAdminA);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/document-types/${typeId}/index-fields`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: {
+        name: 'numero_nota',
+        fieldType: 'TEXT',
+        required: false,
+        order: 0,
+        label: 'Número da Nota Fiscal',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { indexFields: Array<Record<string, unknown>> };
+    expect(body.indexFields[0]).toMatchObject({
+      name: 'numero_nota',
+      label: 'Número da Nota Fiscal',
+      displayLabel: 'Número da Nota Fiscal',
+    });
+  });
+
   it('campo também aparece em GET /document-types (batch fetch)', async () => {
     const typeId = await createDocType(tokenAdminA);
 
@@ -268,6 +312,33 @@ describe('PATCH /document-types/:id/index-fields/:fieldId — atualiza a linha n
       SELECT name, required FROM document_type_index_fields WHERE id = ${fieldId}
     `;
     expect(rows[0]).toMatchObject({ name: 'Campo Editado', required: true });
+  });
+
+  it('editar label reflete no displayLabel (T-15)', async () => {
+    const typeId = await createDocType(tokenAdminA);
+    const createRes = await app.inject({
+      method: 'POST',
+      url: `/document-types/${typeId}/index-fields`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { name: 'data_vencimento', fieldType: 'DATE', required: false, order: 0 },
+    });
+    const created = createRes.json() as { indexFields: Array<Record<string, unknown>> };
+    expect(created.indexFields[0]).toMatchObject({ label: null, displayLabel: 'Data Vencimento' });
+    const fieldId = created.indexFields[0]!['id'] as string;
+
+    const patchRes = await app.inject({
+      method: 'PATCH',
+      url: `/document-types/${typeId}/index-fields/${fieldId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { label: 'Data de Vencimento' },
+    });
+
+    expect(patchRes.statusCode).toBe(200);
+    const body = patchRes.json() as { indexFields: Array<Record<string, unknown>> };
+    expect(body.indexFields[0]).toMatchObject({
+      label: 'Data de Vencimento',
+      displayLabel: 'Data de Vencimento',
+    });
   });
 
   it('404 ao editar campo inexistente', async () => {
