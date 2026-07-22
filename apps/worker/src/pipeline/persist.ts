@@ -1,7 +1,7 @@
 import type { Sql, JSONValue } from 'postgres';
 import type { Logger } from 'pino';
 import type { DocumentProcessingJobData, TypeSuggestion } from '@dmdoc/shared-types';
-import { DocumentEventsRepository } from '@dmdoc/db-pg';
+import { DocumentEventsRepository, resolveAiFeatureFlags } from '@dmdoc/db-pg';
 import { newId } from '@dmdoc/db-pg';
 import type { ExtractResult } from './extract.js';
 import type { EmbeddedChunkDraft } from './embed.js';
@@ -29,6 +29,11 @@ export interface PersistParams {
   /** Custo em USD da(s) chamada(s) de LLM da classificação (0 se não houve). */
   classificationUsd: number;
   pipelineStartedAt: Date;
+  /**
+   * Confiança MÍNIMA da classificação para auto-aplicar `document_type_id`
+   * (reaproveita `DMDOC_INDEX_SUGGESTION_MIN_CONFIDENCE` — sem novo env var).
+   */
+  typeAutoApplyMinConfidence: number;
 }
 
 export interface PersistDeps {
@@ -64,6 +69,7 @@ export async function persistProcessingResult(
     suggestedTitle,
     classificationUsd,
     pipelineStartedAt,
+    typeAutoApplyMinConfidence,
   } = params;
   const { tenantId, documentId } = job;
   const { sql, logger: baseLogger } = deps;
@@ -186,6 +192,43 @@ export async function persistProcessingResult(
     WHERE id        = ${documentId}
       AND tenant_id = ${tenantId}
   `;
+
+  // 4.1 Auto-aplicação de TIPO e TÍTULO (pedido do Owner, 2026-07-22) — mesmo
+  //     princípio da auto-aplicação de tags (`aiTagAutoApplyEnabled`): quando
+  //     as flags dedicadas estão ligadas (efetivo = plataforma AND empresa),
+  //     preenche `document_type_id`/`title` quando ainda VAZIOS. Cobre tanto o
+  //     upload (documento sempre novo, campos sempre NULL) quanto o
+  //     reprocessamento individual via `POST /documents/:id/reprocess` (reusa
+  //     este MESMO pipeline sobre um documento já existente, que pode já ter
+  //     tipo/título confirmados) — cada UPDATE decide contra o estado ATUAL da
+  //     linha (`WHERE ... IS NULL` / `COALESCE(coluna, ...)`), nunca contra um
+  //     valor lido antecipadamente, então nunca sobrescreve uma confirmação já
+  //     existente (inclusive concorrente).
+  const aiFlags = await resolveAiFeatureFlags(sql, tenantId);
+
+  if (
+    aiFlags.classificationAutoApplyEnabled &&
+    typeSuggestion !== null &&
+    typeSuggestion.documentTypeId !== null &&
+    typeSuggestion.confidence >= typeAutoApplyMinConfidence
+  ) {
+    await sql`
+      UPDATE documents
+      SET document_type_id = ${typeSuggestion.documentTypeId}
+      WHERE id = ${documentId}
+        AND tenant_id = ${tenantId}
+        AND document_type_id IS NULL
+    `;
+  }
+
+  if (aiFlags.titleAutoApplyEnabled && suggestedTitle !== null) {
+    await sql`
+      UPDATE documents
+      SET title = COALESCE(title, ${suggestedTitle})
+      WHERE id = ${documentId}
+        AND tenant_id = ${tenantId}
+    `;
+  }
 
   // 5. Backfill de pageCount nos eventos de upload (document_events).
   //    `document_events` é append-only; o backfill é a ÚNICA mutação permitida

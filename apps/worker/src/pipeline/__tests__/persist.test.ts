@@ -2,8 +2,28 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Sql } from 'postgres';
 import type { Logger } from 'pino';
 import type { DocumentProcessingJobData } from '@dmdoc/shared-types';
-import { persistProcessingResult } from '../persist.js';
 import type { ExtractResult } from '../extract.js';
+
+/**
+ * `persistProcessingResult` agora resolve as feature flags de IA (auto-
+ * aplicação de tipo/título, pedido do Owner 2026-07-22) — mockamos
+ * `resolveAiFeatureFlags` e mantemos o resto de `@dmdoc/db-pg`
+ * (`DocumentEventsRepository`) real, via `importOriginal`. Default `{}`
+ * (todas as flags de auto-aplicação `undefined`/falsy) preserva o
+ * comportamento dos testes pré-existentes, que nunca esperam auto-aplicação —
+ * os novos testes de auto-aplicação (final do arquivo) sobrescrevem o mock
+ * pontualmente com `mockResolvedValueOnce`.
+ */
+const { resolveAiFeatureFlagsMock } = vi.hoisted(() => ({
+  resolveAiFeatureFlagsMock: vi.fn().mockResolvedValue({}),
+}));
+
+vi.mock('@dmdoc/db-pg', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@dmdoc/db-pg')>();
+  return { ...actual, resolveAiFeatureFlags: resolveAiFeatureFlagsMock };
+});
+
+const { persistProcessingResult } = await import('../persist.js');
 
 /**
  * Testes do backfill de `page_count` em `document_events` na etapa final do
@@ -175,6 +195,7 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
         suggestedTitle: null,
         classificationUsd: 0,
         pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
       },
       { sql, logger: makeSilentLogger() }
     );
@@ -199,6 +220,7 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
         suggestedTitle: null,
         classificationUsd: 0,
         pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
       },
       { sql, logger: makeSilentLogger() }
     );
@@ -226,6 +248,7 @@ describe('persistProcessingResult — backfill de pageCount em document_events',
           suggestedTitle: null,
           classificationUsd: 0,
           pipelineStartedAt: new Date(),
+          typeAutoApplyMinConfidence: 0.5,
         },
         { sql, logger: makeSilentLogger() }
       );
@@ -344,6 +367,7 @@ describe('persistProcessingResult — invariante: só grava suggested_title, nun
         suggestedTitle: 'Nova sugestão de título gerada pela IA',
         classificationUsd: 0,
         pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
       },
       { sql, logger: makeSilentLogger() }
     );
@@ -380,6 +404,7 @@ describe('persistProcessingResult — invariante: só grava suggested_title, nun
         suggestedTitle: null,
         classificationUsd: 0,
         pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
       },
       { sql, logger: makeSilentLogger() }
     );
@@ -388,5 +413,164 @@ describe('persistProcessingResult — invariante: só grava suggested_title, nun
     expect(doc.suggestedTitle).toBeNull();
     // O título confirmado continua preservado.
     expect(doc.title).toBe('Título confirmado pelo usuário');
+  });
+});
+
+/**
+ * Testes da auto-aplicação de tipo/título (pedido do Owner, 2026-07-22) —
+ * cobre tanto o upload (documento novo, campos sempre NULL) quanto o
+ * reprocessamento individual via `POST /documents/:id/reprocess` (mesmo
+ * pipeline, documento pode já ter tipo/título confirmados).
+ */
+function makeAutoApplySqlStub(): { sql: Sql; documentsUpdates: Array<{ query: string; values: unknown[] }> } {
+  const noopResult = Object.assign([], { count: 0 });
+  const documentsUpdates: Array<{ query: string; values: unknown[] }> = [];
+
+  function buildStructuralQuery(strings: TemplateStringsArray): string {
+    return strings.join('?').toLowerCase();
+  }
+
+  const sqlFn = vi.fn().mockImplementation(
+    (strings: TemplateStringsArray | string, ...values: unknown[]) => {
+      if (typeof strings === 'string') return { __pgIdentifier: strings };
+      if (Array.isArray(strings) && !('raw' in strings)) return { __pgBulkRows: strings };
+
+      const structural = buildStructuralQuery(strings as TemplateStringsArray);
+      if (structural.includes('update documents')) {
+        documentsUpdates.push({ query: structural, values });
+      }
+      return Promise.resolve(noopResult);
+    }
+  );
+  (sqlFn as unknown as Record<string, unknown>)['json'] = (val: unknown) => val;
+
+  return { sql: sqlFn as unknown as Sql, documentsUpdates };
+}
+
+function makeTypeSuggestion(overrides: { documentTypeId?: string | null; confidence?: number } = {}) {
+  return {
+    documentTypeId: overrides.documentTypeId ?? 'type-1',
+    documentTypeName: 'Contrato',
+    confidence: overrides.confidence ?? 0.9,
+    model: 'gpt-4o-mini',
+    promptVersion: 'classify-document-type-v3',
+    suggestedAt: new Date(),
+    rawResponse: {},
+  };
+}
+
+describe('persistProcessingResult — auto-aplicação de tipo/título (gate por flag)', () => {
+  it('auto-aplica document_type_id quando classificationAutoApplyEnabled está ligada e a confiança é suficiente', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValueOnce({ classificationAutoApplyEnabled: true });
+    const { sql, documentsUpdates } = makeAutoApplySqlStub();
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(1),
+        embeddedChunks: [],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: makeTypeSuggestion(),
+        suggestedTitle: null,
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    const typeUpdate = documentsUpdates.find((u) => u.query.includes('document_type_id = ?'));
+    expect(typeUpdate).toBeDefined();
+    expect(typeUpdate!.values[0]).toBe('type-1');
+  });
+
+  it('NÃO auto-aplica document_type_id quando classificationAutoApplyEnabled está desligada', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValueOnce({ classificationAutoApplyEnabled: false });
+    const { sql, documentsUpdates } = makeAutoApplySqlStub();
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(1),
+        embeddedChunks: [],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: makeTypeSuggestion(),
+        suggestedTitle: null,
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    expect(documentsUpdates.find((u) => u.query.includes('document_type_id = ?'))).toBeUndefined();
+  });
+
+  it('NÃO auto-aplica document_type_id quando a confiança está abaixo do limiar', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValueOnce({ classificationAutoApplyEnabled: true });
+    const { sql, documentsUpdates } = makeAutoApplySqlStub();
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(1),
+        embeddedChunks: [],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: makeTypeSuggestion({ confidence: 0.2 }),
+        suggestedTitle: null,
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    expect(documentsUpdates.find((u) => u.query.includes('document_type_id = ?'))).toBeUndefined();
+  });
+
+  it('auto-aplica title (via COALESCE) quando titleAutoApplyEnabled está ligada', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValueOnce({ titleAutoApplyEnabled: true });
+    const { sql, documentsUpdates } = makeAutoApplySqlStub();
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(1),
+        embeddedChunks: [],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: null,
+        suggestedTitle: 'Título sugerido pela IA',
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    const titleUpdate = documentsUpdates.find((u) => u.query.includes('coalesce(title'));
+    expect(titleUpdate).toBeDefined();
+    expect(titleUpdate!.values[0]).toBe('Título sugerido pela IA');
+  });
+
+  it('NÃO auto-aplica title quando titleAutoApplyEnabled está desligada', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValueOnce({ titleAutoApplyEnabled: false });
+    const { sql, documentsUpdates } = makeAutoApplySqlStub();
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(1),
+        embeddedChunks: [],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: null,
+        suggestedTitle: 'Título sugerido pela IA',
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    expect(documentsUpdates.find((u) => u.query.includes('coalesce(title'))).toBeUndefined();
   });
 });

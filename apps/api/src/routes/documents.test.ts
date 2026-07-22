@@ -3015,7 +3015,7 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     fakeLlmChat.mockReset();
   });
 
-  it('sucesso: tipo do catálogo é sugerido, persistido e NÃO sobrescreve o tipo manual', async () => {
+  it('sucesso: tipo do catálogo é sugerido, persistido e auto-aplicado (documento sem tipo/título confirmados, flags default ligadas)', async () => {
     await makeTypeVisibleInDeptA();
     const docId = await seedProcessedDoc({ documentTypeId: null });
     fakeLlmChat.mockResolvedValueOnce(
@@ -3038,14 +3038,28 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     expect(body.typeSuggestion).not.toHaveProperty('rawResponse');
     expect(body.suggestedTitle).toBe('Contrato de Serviço');
     expect(body.costUsd).toBeCloseTo(0.002, 6);
+    // Auto-aplicação (aiClassificationAutoApplyEnabled/aiTitleAutoApplyEnabled,
+    // default ligadas): documento não tinha tipo/título confirmados, então a
+    // resposta reflete o que foi aplicado.
+    expect(body.appliedType).toEqual({ documentTypeId: DOC_TYPE_ID, documentTypeName: 'Contrato A' });
+    expect(body.appliedTitle).toBe('Contrato de Serviço');
 
-    // Persistência: type_suggestion + suggested_title; document_type_id intacto.
+    // Persistência: type_suggestion/suggested_title (consultivo) E
+    // document_type_id/title (confirmados, auto-aplicados por serem os
+    // primeiros valores — nunca sobrescrevem uma confirmação manual já
+    // existente, ver teste "não sobrescreve um tipo manual JÁ definido").
     const rows = await testDb.db<
-      Array<{ document_type_id: string | null; suggested_title: string | null; cost_usd_cents: number }>
+      Array<{
+        document_type_id: string | null;
+        title: string | null;
+        suggested_title: string | null;
+        cost_usd_cents: number;
+      }>
     >`
-      SELECT document_type_id, suggested_title, cost_usd_cents FROM documents WHERE id = ${docId}
+      SELECT document_type_id, title, suggested_title, cost_usd_cents FROM documents WHERE id = ${docId}
     `;
-    expect(rows[0]!.document_type_id).toBeNull(); // CONSULTIVO: nunca preenchido pela IA
+    expect(rows[0]!.document_type_id).toBe(DOC_TYPE_ID);
+    expect(rows[0]!.title).toBe('Contrato de Serviço');
     expect(rows[0]!.suggested_title).toBe('Contrato de Serviço');
     expect(rows[0]!.cost_usd_cents).toBe(1); // ceil(0.002 * 100)
 
@@ -3060,6 +3074,47 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     expect(content[0]!.cost_breakdown!['embeddingsUsd']).toBeCloseTo(0.01, 6);
     expect(content[0]!.cost_breakdown!['classificationUsd']).toBeCloseTo(0.002, 6);
     expect(content[0]!.cost_breakdown!['totalUsd']).toBeCloseTo(0.012, 6);
+  });
+
+  it('NÃO auto-aplica tipo/título quando as flags de auto-aplicação estão desligadas para a empresa (permanece consultivo)', async () => {
+    await makeTypeVisibleInDeptA();
+    await testDb.db`
+      UPDATE tenants SET ai_classification_auto_apply_enabled = false, ai_title_auto_apply_enabled = false
+      WHERE id = ${TENANT_A}
+    `;
+    const docId = await seedProcessedDoc({ documentTypeId: null });
+    fakeLlmChat.mockResolvedValueOnce(
+      chatResult({ documentTypeName: 'Contrato A', confidence: 0.9, suggestedTitle: 'Contrato de Serviço' })
+    );
+
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/documents/${docId}/classify`,
+        headers: { authorization: `Bearer ${tokenAdminA}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body).not.toHaveProperty('appliedType');
+      expect(body).not.toHaveProperty('appliedTitle');
+
+      const rows = await testDb.db<
+        Array<{ document_type_id: string | null; title: string | null; suggested_title: string | null }>
+      >`
+        SELECT document_type_id, title, suggested_title FROM documents WHERE id = ${docId}
+      `;
+      // Continua consultivo: type_suggestion/suggested_title gravados, mas
+      // document_type_id/title permanecem vazios.
+      expect(rows[0]!.document_type_id).toBeNull();
+      expect(rows[0]!.title).toBeNull();
+      expect(rows[0]!.suggested_title).toBe('Contrato de Serviço');
+    } finally {
+      await testDb.db`
+        UPDATE tenants SET ai_classification_auto_apply_enabled = true, ai_title_auto_apply_enabled = true
+        WHERE id = ${TENANT_A}
+      `;
+    }
   });
 
   it('v3 (T-10): resolve por NÚMERO — modelo devolve documentTypeNumber, não o nome', async () => {
@@ -3267,7 +3322,7 @@ describe('PATCH /documents/:id — sugestão automática de índices ao definir 
     fakeLlmChat.mockReset();
   });
 
-  it('define o tipo e retorna suggestedIndexFields (valores normalizados) na resposta', async () => {
+  it('define o tipo, retorna suggestedIndexFields (valores normalizados) e auto-aplica em index_values (flag default ligada)', async () => {
     await seedIndexFields();
     const docId = await seedProcessedDocNoType();
     // A IA sugere "Cliente" (TEXT) e "Valor" em formato pt-BR (normalizado depois).
@@ -3295,13 +3350,18 @@ describe('PATCH /documents/:id — sugestão automática de índices ao definir 
     expect(fields.find((f) => f.name === 'Cliente')?.value).toBe('ACME Ltda');
     // NUMBER pt-BR normalizado para o formato canônico.
     expect(fields.find((f) => f.name === 'Valor')?.value).toBe('1234.56');
+    // Auto-aplicação (aiIndexAutoApplyEnabled, default ligada): o tipo aqui já
+    // é sempre o CONFIRMADO (acabou de ser definido neste mesmo PATCH), então
+    // aplica direto — sem o problema do "tipo órfão" do gatilho de upload.
+    expect(body.appliedIndexValues).toEqual({ Cliente: 'ACME Ltda', Valor: 1234.56 });
 
-    // CONSULTIVO: a sugestão é persistida em index_suggestion; index_values (valores
-    // confirmados) permanece VAZIO — nunca é preenchido automaticamente.
+    // A sugestão é persistida em index_suggestion; index_values (confirmado)
+    // é auto-preenchido com os mesmos valores (Valor convertido para number,
+    // como no salvar manual do IndexValuesForm).
     const rows = await testDb.db<
       Array<{ index_values: Record<string, unknown>; document_type_id: string | null }>
     >`SELECT index_values, document_type_id FROM documents WHERE id = ${docId}`;
-    expect(rows[0]!.index_values).toEqual({});
+    expect(rows[0]!.index_values).toEqual({ Cliente: 'ACME Ltda', Valor: 1234.56 });
     expect(rows[0]!.document_type_id).toBe(DOC_TYPE_ID);
 
     const content = await testDb.db<Array<{ index_suggestion: Record<string, unknown> | null }>>`
@@ -3309,6 +3369,38 @@ describe('PATCH /documents/:id — sugestão automática de índices ao definir 
     `;
     expect(content[0]!.index_suggestion).not.toBeNull();
     expect((content[0]!.index_suggestion!['values'] as Record<string, string>)['Cliente']).toBe('ACME Ltda');
+  });
+
+  it('NÃO auto-aplica em index_values quando aiIndexAutoApplyEnabled está desligada para a empresa', async () => {
+    await seedIndexFields();
+    const docId = await seedProcessedDocNoType();
+    await testDb.db`
+      UPDATE tenants SET ai_index_auto_apply_enabled = false WHERE id = ${TENANT_A}
+    `;
+    fakeLlmChat.mockResolvedValueOnce(
+      suggestChatResult([{ name: 'Cliente', value: 'ACME Ltda', confidence: 0.92 }])
+    );
+
+    try {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/documents/${docId}`,
+        headers: { authorization: `Bearer ${tokenAdminA}` },
+        payload: { documentTypeId: DOC_TYPE_ID },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as Record<string, unknown>;
+      expect(body).not.toHaveProperty('appliedIndexValues');
+
+      const rows = await testDb.db<Array<{ index_values: Record<string, unknown> }>>`
+        SELECT index_values FROM documents WHERE id = ${docId}
+      `;
+      // Continua consultivo: index_suggestion gravado, index_values vazio.
+      expect(rows[0]!.index_values).toEqual({});
+    } finally {
+      await testDb.db`UPDATE tenants SET ai_index_auto_apply_enabled = true WHERE id = ${TENANT_A}`;
+    }
   });
 
   it('respeita a feature: com index suggestion DESLIGADA, PATCH salva o tipo e NÃO sugere', async () => {
@@ -3429,7 +3521,7 @@ describe('POST /documents/:id/generate-tags (Fase 9 / E-3)', () => {
     await setTenantTagFlag(TENANT_A, true);
   });
 
-  it('sucesso: gera tags, persiste suggested_tags e NÃO toca documents.tags; acumula custo', async () => {
+  it('sucesso: gera tags, persiste suggested_tags e auto-aplica em documents.tags (aiTagAutoApplyEnabled default ligada); acumula custo', async () => {
     const docId = await seedDoc();
     fakeLlmChat.mockResolvedValueOnce(tagsChatResult(['Contrato', 'Boleto', 'R$ 1.234,56']));
 
@@ -3443,6 +3535,9 @@ describe('POST /documents/:id/generate-tags (Fase 9 / E-3)', () => {
     const body = res.json();
     expect(body.suggestedTags.tags).toEqual(['Contrato', 'Boleto', 'R$ 1.234,56']);
     expect(body.costUsd).toBeCloseTo(0.0003, 6);
+    // Auto-aplicação (aiTagAutoApplyEnabled, default ligada): documento sem
+    // tags confirmadas ⇒ a resposta reflete o que foi mesclado.
+    expect(body.appliedTags).toEqual(['Contrato', 'Boleto', 'R$ 1.234,56']);
 
     // Persistiu a sugestão consultiva.
     const contentRows = await testDb.db<Array<{ suggested_tags: { tags: string[] } | null; cost_breakdown: { tagGenerationUsd: number } | null }>>`
@@ -3451,12 +3546,37 @@ describe('POST /documents/:id/generate-tags (Fase 9 / E-3)', () => {
     expect(contentRows[0]!.suggested_tags!.tags).toEqual(['Contrato', 'Boleto', 'R$ 1.234,56']);
     expect(contentRows[0]!.cost_breakdown!.tagGenerationUsd).toBeCloseTo(0.0003, 6);
 
-    // NUNCA tocou as tags confirmadas.
+    // Auto-aplicado em documents.tags (mesclado, dedupe case-insensitive).
     const docRows = await testDb.db<Array<{ tags: string[]; cost_usd_cents: number }>>`
       SELECT tags, cost_usd_cents FROM documents WHERE id = ${docId}
     `;
-    expect(docRows[0]!.tags).toEqual([]);
+    expect(docRows[0]!.tags).toEqual(['Contrato', 'Boleto', 'R$ 1.234,56']);
     expect(docRows[0]!.cost_usd_cents).toBeGreaterThan(0);
+  });
+
+  it('NÃO auto-aplica em documents.tags quando aiTagAutoApplyEnabled está desligada (permanece consultivo)', async () => {
+    const docId = await seedDoc();
+    await testDb.db`UPDATE tenants SET ai_tag_auto_apply_enabled = false WHERE id = ${TENANT_A}`;
+    fakeLlmChat.mockResolvedValueOnce(tagsChatResult(['Contrato', 'Boleto']));
+
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/documents/${docId}/generate-tags`,
+        headers: { authorization: `Bearer ${tokenAdminA}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body).not.toHaveProperty('appliedTags');
+
+      const docRows = await testDb.db<Array<{ tags: string[] }>>`
+        SELECT tags FROM documents WHERE id = ${docId}
+      `;
+      expect(docRows[0]!.tags).toEqual([]);
+    } finally {
+      await testDb.db`UPDATE tenants SET ai_tag_auto_apply_enabled = true WHERE id = ${TENANT_A}`;
+    }
   });
 
   it('feature desligada para a empresa → 403 antes de qualquer custo de IA', async () => {

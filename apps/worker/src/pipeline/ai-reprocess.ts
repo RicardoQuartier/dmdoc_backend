@@ -4,6 +4,7 @@ import { resolveAiFeatureFlags } from '@dmdoc/db-pg';
 import {
   suggestIndexValues,
   SUGGEST_INDEXES_PROMPT,
+  mergeSuggestedIndexValues,
   type LLMProvider,
   type IndexFieldRow,
 } from '@dmdoc/llm-provider';
@@ -37,6 +38,12 @@ export interface RunAiReprocessDeps {
   /** Modelo de chat configurado — fallback de auditoria do TypeSuggestion. */
   chatModel: string;
   logger: Logger;
+  /**
+   * Confiança MÍNIMA da classificação para auto-aplicar `document_type_id`
+   * (mesmo valor de `DMDOC_INDEX_SUGGESTION_MIN_CONFIDENCE`, reaproveitado —
+   * sem novo env var dedicado).
+   */
+  typeAutoApplyMinConfidence: number;
 }
 
 /** Resultado sumarizado (para log/observabilidade). */
@@ -49,6 +56,8 @@ interface DocRow {
   department_id: string;
   document_type_id: string | null;
   status: string;
+  title: string | null;
+  index_values: Record<string, string | number | null>;
 }
 
 /**
@@ -60,12 +69,29 @@ interface DocRow {
  * padrão de acumulação de custo do pipeline de upload:
  *
  * - `title`   → classificação de tipo + título sugerido (worker `classifyDocument`),
- *               persiste `type_suggestion`/`suggested_title` (CONSULTIVO — nunca
- *               toca `document_type_id`/`title` confirmados).
+ *               persiste `type_suggestion`/`suggested_title`.
  * - `indexes` → sugestão de valores de índice sobre o TIPO CONFIRMADO do
  *               documento (semântica on-demand: sem tipo confirmado ⇒ pula),
  *               persiste `index_suggestion`.
  * - `tags`    → geração automática de tags (E-3), persiste `suggested_tags`.
+ *
+ * AUTO-APLICAÇÃO (pedido do Owner, 2026-07-22): em QUALQUER gatilho de IA —
+ * upload, reprocessamento individual, reprocessamento em lote, endpoints sob
+ * demanda — cada sugestão gerada é aplicada automaticamente nos campos
+ * CONFIRMADOS do documento, sem exigir confirmação manual, DESDE QUE a flag
+ * dedicada esteja ligada (efetivo = plataforma AND empresa, default LIGADA):
+ * - `title`   → `document_type_id` (`aiClassificationAutoApplyEnabled`, com
+ *               limiar de confiança) e `title` (`aiTitleAutoApplyEnabled`).
+ * - `indexes` → cada campo sugerido é mesclado em `index_values`
+ *               (`aiIndexAutoApplyEnabled`).
+ * - `tags`    → mescla em `documents.tags` (via `generateTagsStep`, que já
+ *               reaproveita a flag `aiTagAutoApplyEnabled` em TODOS os
+ *               gatilhos, inclusive este).
+ * Em todos os casos, a auto-aplicação SÓ preenche campos ainda VAZIOS — nunca
+ * sobrescreve uma confirmação manual já existente (o gesto explícito do
+ * usuário sempre vence). Cada UPDATE decide isso contra o estado ATUAL da
+ * linha no banco (`WHERE ... IS NULL`), nunca contra um valor lido
+ * antecipadamente em JS — race-safe mesmo com uma confirmação concorrente.
  *
  * Gating: `resolveAiFeatureFlags` (plataforma AND empresa) — etapa desligada é
  * PULADA (não é erro). BEST-EFFORT por etapa: falha de LLM/validação numa etapa
@@ -73,8 +99,8 @@ interface DocRow {
  * (nunca sobrescreve etapas anteriores), inclusive tentativas de retry inválidas
  * (a acumulação vive dentro dos núcleos/persist, como no upload).
  *
- * IDEMPOTENTE: rerodar sobrescreve as sugestões consultivas e nunca duplica
- * dados — mesmo contrato do reprocessamento individual.
+ * IDEMPOTENTE: rerodar sobrescreve as sugestões consultivas e reaplica a
+ * auto-aplicação sobre os campos ainda vazios — nunca duplica dados.
  *
  * @throws {AiReprocessPreconditionError} documento inexistente/sem texto —
  *   o processor conta o documento como `failed`.
@@ -84,12 +110,12 @@ export async function runAiReprocessDocument(
   deps: RunAiReprocessDeps,
 ): Promise<RunAiReprocessOutcome> {
   const { tenantId, documentId, steps } = params;
-  const { sql, llmProvider, chatModel, logger: baseLogger } = deps;
+  const { sql, llmProvider, chatModel, logger: baseLogger, typeAutoApplyMinConfidence } = deps;
   const log = baseLogger.child({ tenantId, documentId, step: 'ai-reprocess' });
 
   // 1. Pré-condições: documento vivo + texto extraído disponível.
   const docRows = await sql<DocRow[]>`
-    SELECT department_id, document_type_id, status
+    SELECT department_id, document_type_id, status, title, index_values
     FROM documents
     WHERE id = ${documentId}
       AND tenant_id = ${tenantId}
@@ -126,7 +152,16 @@ export async function runAiReprocessDocument(
       log.info({ reason: 'feature-desligada' }, 'etapa title pulada: classificação e título desligados');
     } else {
       await reprocessTitleStep(
-        { tenantId, documentId, departmentId: doc.department_id, fullText, titleSuggestionEnabled: flags.titleSuggestionEnabled },
+        {
+          tenantId,
+          documentId,
+          departmentId: doc.department_id,
+          fullText,
+          titleSuggestionEnabled: flags.titleSuggestionEnabled,
+          classificationAutoApplyEnabled: flags.classificationAutoApplyEnabled,
+          titleAutoApplyEnabled: flags.titleAutoApplyEnabled,
+          typeAutoApplyMinConfidence,
+        },
         { sql, llmProvider, chatModel, logger: log },
       );
       stepsRun.push('title');
@@ -135,10 +170,26 @@ export async function runAiReprocessDocument(
 
   // 4. indexes (TIPO CONFIRMADO) -------------------------------------------
   if (steps.includes('indexes')) {
+    // Reconsulta document_type_id/index_values FRESCOS (não o `doc` lido no
+    // topo desta função): quando `steps` inclui `title` E `indexes` juntos
+    // (caso comum do lote), a etapa `title` pode ter acabado de auto-aplicar
+    // um tipo no documento que antes não tinha nenhum — usar o `doc` original
+    // (stale) faria esta etapa pular por engano, achando que ainda não há
+    // tipo confirmado.
+    const freshDocRows = await sql<Array<{ document_type_id: string | null; index_values: Record<string, string | number | null> }>>`
+      SELECT document_type_id, index_values
+      FROM documents
+      WHERE id = ${documentId}
+        AND tenant_id = ${tenantId}
+      LIMIT 1
+    `;
+    const freshDoc = freshDocRows[0];
+    const currentDocumentTypeId = freshDoc?.document_type_id ?? null;
+
     if (!flags.indexSuggestionEnabled) {
       stepsSkipped.push('indexes');
       log.info({ reason: 'feature-desligada' }, 'etapa indexes pulada: sugestão de índices desligada');
-    } else if (doc.document_type_id === null) {
+    } else if (currentDocumentTypeId === null) {
       stepsSkipped.push('indexes');
       log.info(
         { reason: 'sem-tipo-confirmado' },
@@ -146,7 +197,14 @@ export async function runAiReprocessDocument(
       );
     } else {
       await reprocessIndexesStep(
-        { tenantId, documentId, documentTypeId: doc.document_type_id, fullText },
+        {
+          tenantId,
+          documentId,
+          documentTypeId: currentDocumentTypeId,
+          fullText,
+          currentIndexValues: freshDoc?.index_values ?? {},
+          indexAutoApplyEnabled: flags.indexAutoApplyEnabled,
+        },
         { sql, llmProvider, logger: log },
       );
       stepsRun.push('indexes');
@@ -178,6 +236,12 @@ interface ReprocessTitleParams {
   departmentId: string;
   fullText: string;
   titleSuggestionEnabled: boolean;
+  /** Auto-aplica `document_type_id` quando vazio e a confiança é suficiente. */
+  classificationAutoApplyEnabled: boolean;
+  /** Auto-aplica `title` quando vazio. */
+  titleAutoApplyEnabled: boolean;
+  /** Confiança mínima da classificação para auto-aplicar o tipo. */
+  typeAutoApplyMinConfidence: number;
 }
 
 /**
@@ -187,6 +251,14 @@ interface ReprocessTitleParams {
  * (o worker não importa de `apps/api`; a lógica de IA é compartilhada via
  * `@dmdoc/llm-provider`, só o persist é replicado).
  *
+ * AUTO-APLICAÇÃO: além de gravar a sugestão, preenche `document_type_id`/
+ * `title` CONFIRMADOS quando ainda estiverem vazios (gate: as flags dedicadas
+ * `aiClassificationAutoApplyEnabled`/`aiTitleAutoApplyEnabled`). Cada UPDATE
+ * decide isso via `WHERE ... IS NULL`/`COALESCE(coluna, ...)` contra o estado
+ * ATUAL da linha — nunca contra um valor lido antecipadamente — então é
+ * race-safe mesmo com uma confirmação manual concorrente, e não precisa
+ * receber o valor "atual" como parâmetro.
+ *
  * BEST-EFFORT: `classifyDocument` nunca lança (self-catch); se retornar
  * `typeSuggestion === null` (features off / erro) não há nada a persistir.
  */
@@ -194,7 +266,16 @@ async function reprocessTitleStep(
   params: ReprocessTitleParams,
   deps: { sql: Sql; llmProvider: LLMProvider; chatModel: string; logger: Logger },
 ): Promise<void> {
-  const { tenantId, documentId, departmentId, fullText, titleSuggestionEnabled } = params;
+  const {
+    tenantId,
+    documentId,
+    departmentId,
+    fullText,
+    titleSuggestionEnabled,
+    classificationAutoApplyEnabled,
+    titleAutoApplyEnabled,
+    typeAutoApplyMinConfidence,
+  } = params;
   const { sql, llmProvider, chatModel, logger } = deps;
 
   const outcome = await classifyDocument(
@@ -258,16 +339,39 @@ async function reprocessTitleStep(
       AND tenant_id = ${tenantId}
   `;
 
+  // Auto-aplicação do TIPO (gate: aiClassificationAutoApplyEnabled + limiar de
+  // confiança): só preenche `document_type_id` quando o documento ainda não
+  // tem um tipo CONFIRMADO (checado pelo próprio WHERE, não por um SELECT
+  // antecipado) e a IA identificou um tipo compatível com confiança suficiente.
+  if (
+    classificationAutoApplyEnabled &&
+    typeSuggestion.documentTypeId !== null &&
+    typeSuggestion.confidence >= typeAutoApplyMinConfidence
+  ) {
+    await sql`
+      UPDATE documents
+      SET document_type_id = ${typeSuggestion.documentTypeId}
+      WHERE id = ${documentId}
+        AND tenant_id = ${tenantId}
+        AND document_type_id IS NULL
+    `;
+  }
+
   // suggested_title só é gravado quando a feature de título está ligada — para
   // NÃO apagar (null) uma sugestão anterior quando só a classificação roda.
-  // NUNCA toca `title` (título confirmado pelo usuário). cost_usd_cents SEMPRE
-  // incrementado, nunca sobrescrito.
+  // cost_usd_cents SEMPRE incrementado, nunca sobrescrito. Auto-aplicação do
+  // TÍTULO (gate: aiTitleAutoApplyEnabled): preenche `title` quando ainda vazio
+  // e há sugestão. `COALESCE(title, ...)` — não o inverso — é avaliado pelo
+  // próprio Postgres contra o valor ATUAL da coluna, nunca sobrescrevendo um
+  // título já confirmado (inclusive por uma escrita concorrente).
   const deltaCents = Math.ceil(classificationUsd * 100);
   if (titleSuggestionEnabled) {
+    const titleToApply = titleAutoApplyEnabled ? outcome.suggestedTitle : null;
     await sql`
       UPDATE documents
       SET suggested_title = ${outcome.suggestedTitle},
-          cost_usd_cents = cost_usd_cents + ${deltaCents}
+          cost_usd_cents = cost_usd_cents + ${deltaCents},
+          title = COALESCE(title, ${titleToApply})
       WHERE id = ${documentId}
         AND tenant_id = ${tenantId}
     `;
@@ -291,12 +395,21 @@ interface ReprocessIndexesParams {
   /** Tipo CONFIRMADO do documento (nunca o sugerido — semântica on-demand). */
   documentTypeId: string;
   fullText: string;
+  /** Valores de índice já CONFIRMADOS — auto-aplicação só preenche campos vazios. */
+  currentIndexValues: Record<string, string | number | null>;
+  /** Auto-aplica os valores sugeridos em `index_values` (campo a campo). */
+  indexAutoApplyEnabled: boolean;
 }
 
 /**
  * Sugere valores de índice sobre o TIPO CONFIRMADO do documento e persiste
  * `index_suggestion` + custo acumulado. Espelha o caminho on-demand de
  * `apps/api/.../index-suggestion.ts` (núcleo `suggestIndexValues` compartilhado).
+ *
+ * AUTO-APLICAÇÃO (gate: aiIndexAutoApplyEnabled): mescla os valores sugeridos
+ * em `documents.index_values` via `mergeSuggestedIndexValues` (núcleo
+ * compartilhado de `@dmdoc/llm-provider`) — só preenche o que ainda está vazio
+ * (`undefined`/`null`/string vazia), nunca sobrescreve um valor já confirmado.
  *
  * BEST-EFFORT: qualquer erro (LLM/validação/banco) é logado como `warn` e NÃO
  * derruba o documento nem as outras etapas.
@@ -305,7 +418,7 @@ async function reprocessIndexesStep(
   params: ReprocessIndexesParams,
   deps: { sql: Sql; llmProvider: LLMProvider; logger: Logger },
 ): Promise<void> {
-  const { tenantId, documentId, documentTypeId, fullText } = params;
+  const { tenantId, documentId, documentTypeId, fullText, currentIndexValues, indexAutoApplyEnabled } = params;
   const { sql, llmProvider, logger } = deps;
 
   try {
@@ -380,11 +493,29 @@ async function reprocessIndexesStep(
       `;
     }
 
+    // Auto-aplicação (gate: aiIndexAutoApplyEnabled): mescla campo a campo em
+    // `index_values`, preenchendo só o que ainda está vazio (nunca sobrescreve
+    // um valor já confirmado manualmente).
+    let appliedCount = 0;
+    if (indexAutoApplyEnabled) {
+      const merged = mergeSuggestedIndexValues(currentIndexValues, core.values, indexFieldRows);
+      appliedCount = merged.appliedCount;
+      if (appliedCount > 0) {
+        await sql`
+          UPDATE documents
+          SET index_values = ${sql.json(merged.merged as unknown as JSONValue)}
+          WHERE id = ${documentId}
+            AND tenant_id = ${tenantId}
+        `;
+      }
+    }
+
     logger.info(
       {
         documentTypeId,
         fieldsRequested: indexFieldRows.length,
         fieldsSuggested: Object.keys(core.values).length,
+        fieldsAutoApplied: appliedCount,
         suggestionUsd: core.costUsd.toFixed(6),
       },
       'reprocessamento de índices concluído',

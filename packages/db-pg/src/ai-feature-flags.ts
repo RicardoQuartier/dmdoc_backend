@@ -31,6 +31,12 @@ export interface AiFeatureFlags {
   tagGenerationEnabled: boolean;
   /** Aplicação automática das tags sugeridas em `documents.tags`, sem confirmação manual. */
   tagAutoApplyEnabled: boolean;
+  /** Aplica automaticamente o tipo sugerido em `documents.document_type_id`, quando ainda vazio. */
+  classificationAutoApplyEnabled: boolean;
+  /** Aplica automaticamente o título sugerido em `documents.title`, quando ainda vazio. */
+  titleAutoApplyEnabled: boolean;
+  /** Mescla automaticamente os valores sugeridos em `documents.index_values`, campo a campo, só nos vazios. */
+  indexAutoApplyEnabled: boolean;
 }
 
 /**
@@ -58,11 +64,17 @@ interface AiFeatureFlagsRow {
   platform_index_suggestion_enabled: boolean;
   platform_tag_generation_enabled: boolean;
   platform_tag_auto_apply_enabled: boolean;
+  platform_classification_auto_apply_enabled: boolean;
+  platform_title_auto_apply_enabled: boolean;
+  platform_index_auto_apply_enabled: boolean;
   tenant_classification_enabled: boolean;
   tenant_title_suggestion_enabled: boolean;
   tenant_index_suggestion_enabled: boolean;
   tenant_tag_generation_enabled: boolean;
   tenant_tag_auto_apply_enabled: boolean;
+  tenant_classification_auto_apply_enabled: boolean;
+  tenant_title_auto_apply_enabled: boolean;
+  tenant_index_auto_apply_enabled: boolean;
 }
 
 /**
@@ -85,11 +97,17 @@ export async function resolveAiFeatureFlags(sql: Sql, tenantId: string): Promise
       ps.ai_index_suggestion_enabled AS platform_index_suggestion_enabled,
       ps.ai_tag_generation_enabled   AS platform_tag_generation_enabled,
       ps.ai_tag_auto_apply_enabled   AS platform_tag_auto_apply_enabled,
+      ps.ai_classification_auto_apply_enabled AS platform_classification_auto_apply_enabled,
+      ps.ai_title_auto_apply_enabled AS platform_title_auto_apply_enabled,
+      ps.ai_index_auto_apply_enabled AS platform_index_auto_apply_enabled,
       t.ai_classification_enabled    AS tenant_classification_enabled,
       t.ai_title_suggestion_enabled  AS tenant_title_suggestion_enabled,
       t.ai_index_suggestion_enabled  AS tenant_index_suggestion_enabled,
       t.ai_tag_generation_enabled    AS tenant_tag_generation_enabled,
-      t.ai_tag_auto_apply_enabled    AS tenant_tag_auto_apply_enabled
+      t.ai_tag_auto_apply_enabled    AS tenant_tag_auto_apply_enabled,
+      t.ai_classification_auto_apply_enabled AS tenant_classification_auto_apply_enabled,
+      t.ai_title_auto_apply_enabled  AS tenant_title_auto_apply_enabled,
+      t.ai_index_auto_apply_enabled  AS tenant_index_auto_apply_enabled
     FROM platform_settings ps
     CROSS JOIN tenants t
     WHERE t.id = ${tenantId}
@@ -108,5 +126,9 @@ export async function resolveAiFeatureFlags(sql: Sql, tenantId: string): Promise
     indexSuggestionEnabled: row.platform_index_suggestion_enabled && row.tenant_index_suggestion_enabled,
     tagGenerationEnabled: row.platform_tag_generation_enabled && row.tenant_tag_generation_enabled,
     tagAutoApplyEnabled: row.platform_tag_auto_apply_enabled && row.tenant_tag_auto_apply_enabled,
+    classificationAutoApplyEnabled:
+      row.platform_classification_auto_apply_enabled && row.tenant_classification_auto_apply_enabled,
+    titleAutoApplyEnabled: row.platform_title_auto_apply_enabled && row.tenant_title_auto_apply_enabled,
+    indexAutoApplyEnabled: row.platform_index_auto_apply_enabled && row.tenant_index_auto_apply_enabled,
   };
 }

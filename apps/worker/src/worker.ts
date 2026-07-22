@@ -169,6 +169,7 @@ async function main(): Promise<void> {
     llmProvider,
     chatModel: config.LLM_MODEL,
     logger,
+    typeAutoApplyMinConfidence: config.DMDOC_INDEX_SUGGESTION_MIN_CONFIDENCE,
   });
 
   logger.info(

@@ -30,6 +30,11 @@ export const TenantSchema = z.object({
   // 5ª feature de IA: aplica automaticamente as tags sugeridas em `documents.tags`
   // (sem exigir confirmação manual). Default ligado (decisão de produto).
   aiTagAutoApplyEnabled: z.boolean().default(true),
+  // 6ª/7ª/8ª features de IA: aplicam automaticamente tipo, título e índices
+  // sugeridos (sem exigir confirmação manual). Default ligado.
+  aiClassificationAutoApplyEnabled: z.boolean().default(true),
+  aiTitleAutoApplyEnabled: z.boolean().default(true),
+  aiIndexAutoApplyEnabled: z.boolean().default(true),
 });
 
 export type Tenant = z.infer<typeof TenantSchema>;
@@ -48,6 +53,9 @@ export const PlatformSettingsSchema = z.object({
   aiIndexSuggestionEnabled: z.boolean().default(true),
   aiTagGenerationEnabled: z.boolean().default(true),
   aiTagAutoApplyEnabled: z.boolean().default(true),
+  aiClassificationAutoApplyEnabled: z.boolean().default(true),
+  aiTitleAutoApplyEnabled: z.boolean().default(true),
+  aiIndexAutoApplyEnabled: z.boolean().default(true),
   updatedAt: z.date(),
 });
 

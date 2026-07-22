@@ -72,6 +72,13 @@ const EnvSchema = z.object({
   // Defaults conservadores para produção; sobrescrever em dev/staging.
   RATE_LIMIT_MAX: z.coerce.number().int().positive().default(200),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+
+  // Confiança MÍNIMA da classificação de tipo para auto-aplicar
+  // `document_type_id` (aiClassificationAutoApplyEnabled). Mesmo nome/default
+  // do worker (`apps/worker/src/config.ts`) — usado nos gatilhos de
+  // classificação/sugestão de índices controlados diretamente pela API
+  // (POST /documents/:id/classify, PATCH /documents/:id).
+  DMDOC_INDEX_SUGGESTION_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.5),
 });
 
 export type Config = Readonly<z.infer<typeof EnvSchema>>;

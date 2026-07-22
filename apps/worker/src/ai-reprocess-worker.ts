@@ -30,6 +30,8 @@ export interface AiReprocessWorkerDeps {
   /** Modelo de chat configurado — fallback de auditoria do TypeSuggestion. */
   chatModel: string;
   logger: Logger;
+  /** Confiança mínima para auto-aplicar o tipo classificado (ver `ai-reprocess.ts`). */
+  typeAutoApplyMinConfidence: number;
 }
 
 /**
@@ -56,7 +58,13 @@ function createAiReprocessProcessor(deps: AiReprocessWorkerDeps) {
     try {
       await runAiReprocessDocument(
         { tenantId, documentId, steps },
-        { sql: deps.sql, llmProvider: deps.llmProvider, chatModel: deps.chatModel, logger: deps.logger },
+        {
+          sql: deps.sql,
+          llmProvider: deps.llmProvider,
+          chatModel: deps.chatModel,
+          logger: deps.logger,
+          typeAutoApplyMinConfidence: deps.typeAutoApplyMinConfidence,
+        },
       );
     } catch (err: unknown) {
       // Pré-condição do documento falhou (sem texto/inexistente) OU erro
