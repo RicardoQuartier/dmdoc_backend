@@ -33,7 +33,9 @@ async function setPlatformSettings(flags: AiFeatureFlags): Promise<void> {
     UPDATE platform_settings
        SET ai_classification_enabled = ${flags.classificationEnabled},
            ai_title_suggestion_enabled = ${flags.titleSuggestionEnabled},
-           ai_index_suggestion_enabled = ${flags.indexSuggestionEnabled}
+           ai_index_suggestion_enabled = ${flags.indexSuggestionEnabled},
+           ai_tag_generation_enabled = ${flags.tagGenerationEnabled},
+           ai_tag_auto_apply_enabled = ${flags.tagAutoApplyEnabled}
   `;
 }
 
@@ -42,7 +44,9 @@ async function setTenantSettings(tenantId: string, flags: AiFeatureFlags): Promi
     UPDATE tenants
        SET ai_classification_enabled = ${flags.classificationEnabled},
            ai_title_suggestion_enabled = ${flags.titleSuggestionEnabled},
-           ai_index_suggestion_enabled = ${flags.indexSuggestionEnabled}
+           ai_index_suggestion_enabled = ${flags.indexSuggestionEnabled},
+           ai_tag_generation_enabled = ${flags.tagGenerationEnabled},
+           ai_tag_auto_apply_enabled = ${flags.tagAutoApplyEnabled}
      WHERE id = ${tenantId}
   `;
 }
@@ -51,6 +55,8 @@ const ALL_TRUE: AiFeatureFlags = {
   classificationEnabled: true,
   titleSuggestionEnabled: true,
   indexSuggestionEnabled: true,
+  tagGenerationEnabled: true,
+  tagAutoApplyEnabled: true,
 };
 
 beforeAll(async () => {
@@ -84,6 +90,8 @@ describe('resolveAiFeatureFlags', () => {
       classificationEnabled: true,
       titleSuggestionEnabled: true,
       indexSuggestionEnabled: true,
+      tagGenerationEnabled: true,
+      tagAutoApplyEnabled: true,
     });
   });
 
@@ -92,6 +100,8 @@ describe('resolveAiFeatureFlags', () => {
       classificationEnabled: false,
       titleSuggestionEnabled: false,
       indexSuggestionEnabled: false,
+      tagGenerationEnabled: false,
+      tagAutoApplyEnabled: false,
     });
     await setTenantSettings(TEST_TENANT_ID, ALL_TRUE);
 
@@ -101,6 +111,8 @@ describe('resolveAiFeatureFlags', () => {
       classificationEnabled: false,
       titleSuggestionEnabled: false,
       indexSuggestionEnabled: false,
+      tagGenerationEnabled: false,
+      tagAutoApplyEnabled: false,
     });
   });
 
@@ -110,6 +122,8 @@ describe('resolveAiFeatureFlags', () => {
       classificationEnabled: false,
       titleSuggestionEnabled: false,
       indexSuggestionEnabled: false,
+      tagGenerationEnabled: false,
+      tagAutoApplyEnabled: false,
     });
 
     const result = await resolveAiFeatureFlags(sql, TEST_TENANT_ID);
@@ -118,6 +132,8 @@ describe('resolveAiFeatureFlags', () => {
       classificationEnabled: false,
       titleSuggestionEnabled: false,
       indexSuggestionEnabled: false,
+      tagGenerationEnabled: false,
+      tagAutoApplyEnabled: false,
     });
   });
 
@@ -126,11 +142,15 @@ describe('resolveAiFeatureFlags', () => {
       classificationEnabled: false,
       titleSuggestionEnabled: false,
       indexSuggestionEnabled: false,
+      tagGenerationEnabled: false,
+      tagAutoApplyEnabled: false,
     });
     await setTenantSettings(TEST_TENANT_ID, {
       classificationEnabled: false,
       titleSuggestionEnabled: false,
       indexSuggestionEnabled: false,
+      tagGenerationEnabled: false,
+      tagAutoApplyEnabled: false,
     });
 
     const result = await resolveAiFeatureFlags(sql, TEST_TENANT_ID);
@@ -139,6 +159,8 @@ describe('resolveAiFeatureFlags', () => {
       classificationEnabled: false,
       titleSuggestionEnabled: false,
       indexSuggestionEnabled: false,
+      tagGenerationEnabled: false,
+      tagAutoApplyEnabled: false,
     });
   });
 
@@ -147,11 +169,15 @@ describe('resolveAiFeatureFlags', () => {
       classificationEnabled: true,
       titleSuggestionEnabled: false,
       indexSuggestionEnabled: true,
+      tagGenerationEnabled: true,
+      tagAutoApplyEnabled: true,
     });
     await setTenantSettings(TEST_TENANT_ID, {
       classificationEnabled: false,
       titleSuggestionEnabled: true,
       indexSuggestionEnabled: true,
+      tagGenerationEnabled: true,
+      tagAutoApplyEnabled: true,
     });
 
     const result = await resolveAiFeatureFlags(sql, TEST_TENANT_ID);
@@ -160,6 +186,8 @@ describe('resolveAiFeatureFlags', () => {
       classificationEnabled: false, // true AND false
       titleSuggestionEnabled: false, // false AND true
       indexSuggestionEnabled: true, // true AND true
+      tagGenerationEnabled: true,
+      tagAutoApplyEnabled: true,
     });
   });
 

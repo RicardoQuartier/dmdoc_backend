@@ -157,20 +157,24 @@ export async function classifyDocument(
     embeddingsUsd: 0,
     suggestionUsd: 0,
     classificationUsd: 0,
+    tagGenerationUsd: 0,
     totalUsd: 0,
   };
   const costUsd = result.usage.costUsd;
   const newClassificationUsd = existingBreakdown.classificationUsd + costUsd;
+  const existingTagGenerationUsd = existingBreakdown.tagGenerationUsd ?? 0;
   const newCostBreakdown: CostBreakdown = {
     extractionUsd: existingBreakdown.extractionUsd,
     embeddingsUsd: existingBreakdown.embeddingsUsd,
     suggestionUsd: existingBreakdown.suggestionUsd,
     classificationUsd: newClassificationUsd,
+    tagGenerationUsd: existingTagGenerationUsd,
     totalUsd:
       existingBreakdown.extractionUsd +
       existingBreakdown.embeddingsUsd +
       existingBreakdown.suggestionUsd +
-      newClassificationUsd,
+      newClassificationUsd +
+      existingTagGenerationUsd,
   };
 
   // jsonb sempre via `sql.json(...)` — NUNCA `JSON.stringify` (evita

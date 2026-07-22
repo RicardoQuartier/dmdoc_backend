@@ -82,12 +82,19 @@ export type SearchChunkIndexValue = z.infer<typeof SearchChunkIndexValueSchema>;
  *
  * `indexValues` traz apenas os índices "que aparecem na busca" (showOnSearch)
  * do documento, com rótulo, tipo e valor, na ordem de exibição do campo.
+ *
+ * `tags` são as tags CONFIRMADAS do documento (`documents.tags`) — usadas para
+ * renderizar os chips coloridos no card de resultado (Fase 9 / E-3). As tags
+ * SUGERIDAS pela IA (`document_content.suggested_tags`) nunca aparecem aqui: só
+ * o confirmado pelo usuário vale na busca. Array vazio quando o documento não
+ * tem tags.
  */
 export const SearchChunkSchema = z.object({
   documentId: z.string(),
   documentName: z.string().nullable(),
   title: z.string().nullable(),
   indexValues: z.array(SearchChunkIndexValueSchema),
+  tags: z.array(z.string()),
   tenantId: z.string().nullable(),
   documentTypeName: z.string().nullable(),
   pageNumber: z.number().nullable(),

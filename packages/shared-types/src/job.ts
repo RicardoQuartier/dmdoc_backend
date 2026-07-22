@@ -45,3 +45,52 @@ export const TenantDeletionJobDataSchema = z.object({
 });
 
 export type TenantDeletionJobData = z.infer<typeof TenantDeletionJobDataSchema>;
+
+/**
+ * Etapas de IA reprocessáveis em massa (épico E-4 / T-24).
+ *
+ * Cada etapa reaproveita uma feature de IA já existente e é INDEPENDENTE:
+ * - `title`   → classificação de tipo + título sugerido (mesma chamada de LLM,
+ *               `classify-document-type-v3`); consultiva, nunca toca o tipo/título
+ *               confirmado pelo usuário.
+ * - `indexes` → sugestão de valores de índice (Fase 7) sobre o tipo CONFIRMADO
+ *               do documento; consultiva, grava só `document_content.index_suggestion`.
+ * - `tags`    → geração automática de tags (Fase 9 / E-3); consultiva, grava só
+ *               `document_content.suggested_tags` (nunca `documents.tags`).
+ *
+ * O conjunto é extensível — novas features de IA entram aqui sem quebrar o
+ * contrato do job.
+ */
+export const AI_REPROCESS_STEPS = ['title', 'indexes', 'tags'] as const;
+
+export const AiReprocessStepSchema = z.enum(AI_REPROCESS_STEPS);
+
+export type AiReprocessStep = z.infer<typeof AiReprocessStepSchema>;
+
+/**
+ * Payload de um job de reprocessamento de IA em massa (épico E-4 / T-24) na
+ * fila BullMQ dedicada `ai-reprocess`.
+ *
+ * Enfileirado pela API (`POST /documents/bulk-reprocess-ai`) — UM job por
+ * documento do lote — e consumido pelo worker dedicado, que roda só as etapas
+ * de IA pedidas em `steps` (sem re-extrair, re-embeddar nem apagar chunks).
+ *
+ * Como o restante do contrato de jobs, é a única fonte de verdade do payload:
+ * o produtor valida com `AiReprocessJobDataSchema` antes de enfileirar; o
+ * worker revalida no início do handler.
+ *
+ * Campos:
+ * - `tenantId` / `documentId`: identificam o documento (isolamento multi-tenant).
+ * - `batchId`: lote (`ai_reprocess_batch`) ao qual este job pertence — usado
+ *   para incrementar os contadores de progresso ao concluir o documento.
+ * - `steps`: subconjunto NÃO-vazio de `AI_REPROCESS_STEPS` já filtrado pelas
+ *   feature flags efetivas do tenant na API (o worker ainda re-checa por etapa).
+ */
+export const AiReprocessJobDataSchema = z.object({
+  tenantId: z.string().uuid(),
+  documentId: z.string().uuid(),
+  batchId: z.string().uuid(),
+  steps: z.array(AiReprocessStepSchema).min(1),
+});
+
+export type AiReprocessJobData = z.infer<typeof AiReprocessJobDataSchema>;

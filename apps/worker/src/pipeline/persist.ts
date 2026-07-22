@@ -129,6 +129,7 @@ export async function persistProcessingResult(
     embeddingsUsd: totalEmbeddingsUsd,
     suggestionUsd: 0,
     classificationUsd,
+    tagGenerationUsd: 0,
     totalUsd: totalEmbeddingsUsd + classificationUsd,
   };
 

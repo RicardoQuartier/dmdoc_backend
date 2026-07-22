@@ -109,6 +109,83 @@ export const PublicIndexSuggestionSchema = z.object({
 export type PublicIndexSuggestion = z.infer<typeof PublicIndexSuggestionSchema>;
 
 /**
+ * Teto de tags geradas por IA por documento (Fase 9 / E-3, pedido do Owner:
+ * "até no máximo 30"). Também aplicado no schema de saída do LLM
+ * (`generate-tags.ts`). Excedente é truncado no núcleo, nunca rejeitado.
+ */
+export const MAX_GENERATED_TAGS = 30;
+
+/** Tamanho máximo (em caracteres) de uma tag — defensivo contra tag-lixo. */
+export const MAX_TAG_LENGTH = 60;
+
+/**
+ * Sugestão de TAGS gerada por LLM (Fase 9 / E-3) — CONSULTIVA.
+ *
+ * Embutido em `DocumentContent.suggestedTags`. Espelha o padrão de
+ * `IndexSuggestion`/`TypeSuggestion`: além das tags, registra o modelo usado, a
+ * versão do prompt, o instante e a resposta bruta do LLM para auditoria.
+ *
+ * A sugestão NUNCA sobrescreve `documents.tags` (tags CONFIRMADAS pelo
+ * usuário) — a decisão do usuário sempre vence e sobrevive a reprocessamento.
+ * O worker/endpoint sob demanda apenas gravam aqui; a confirmação é um gesto
+ * explícito do usuário (aceitar no card de sugestão da tela de detalhe).
+ */
+export const SuggestedTagsSchema = z.object({
+  tags: z.array(z.string().min(1).max(MAX_TAG_LENGTH)).max(MAX_GENERATED_TAGS),
+  model: z.string().min(1),
+  promptVersion: z.string().min(1),
+  generatedAt: z.date(),
+  rawResponse: z.record(z.unknown()),
+});
+
+export type SuggestedTags = z.infer<typeof SuggestedTagsSchema>;
+
+/**
+ * Mescla tags SUGERIDAS pela IA nas tags já CONFIRMADAS de um documento —
+ * núcleo puro (sem banco) reaproveitado pelo worker (gatilho automático no
+ * upload) e pelo endpoint sob demanda quando a 5ª feature de IA
+ * (`aiTagAutoApplyEnabled`, efetivo = plataforma AND empresa) está ligada.
+ *
+ * Mesmas regras do fluxo manual (`handleAddSuggestedTags` no frontend, card
+ * "Tags sugeridas pela IA"): dedupe case-insensitive contra as já confirmadas,
+ * ignora vazias, e respeita o teto de `documents.tags`
+ * (`MAX_GENERATED_TAGS * 2` — folga para 30 da IA + manuais).
+ */
+export function mergeConfirmedTags(existingTags: string[], suggestedTags: string[]): string[] {
+  const existingLower = new Set(existingTags.map((t) => t.toLowerCase()));
+  const merged = [...existingTags];
+  for (const tag of suggestedTags) {
+    const clean = tag.trim();
+    if (clean === '' || existingLower.has(clean.toLowerCase())) continue;
+    if (merged.length >= MAX_GENERATED_TAGS * 2) break;
+    existingLower.add(clean.toLowerCase());
+    merged.push(clean);
+  }
+  return merged;
+}
+
+/**
+ * Subconjunto SEGURO da sugestão de tags exposto ao usuário comum no
+ * `GET /documents/:id` e no `POST /documents/:id/generate-tags` (Fase 9).
+ *
+ * Contém só o que o card de sugestão da tela de detalhe precisa — as tags e o
+ * instante da geração. Campos de auditoria/operação (`model`, `promptVersion`,
+ * `rawResponse`) NUNCA vazam no endpoint público; ficam restritos ao
+ * `GET /documents/:id/debug` (SUPER_ADMIN).
+ *
+ * `generatedAt` é validado como string ISO porque no JSONB persistido a data é
+ * gravada serializada (mesmo tratamento de `PublicIndexSuggestionSchema`). O
+ * `parse` do Zod descarta as chaves desconhecidas, então validar o JSONB bruto
+ * com este schema já remove os campos sensíveis.
+ */
+export const PublicSuggestedTagsSchema = z.object({
+  tags: z.array(z.string()),
+  generatedAt: z.string(),
+});
+
+export type PublicSuggestedTags = z.infer<typeof PublicSuggestedTagsSchema>;
+
+/**
  * Breakdown de custo em dólares para o processamento de um documento.
  *
  * Embutido em `DocumentContent.costBreakdown`. Campos separados por etapa
@@ -121,6 +198,9 @@ export const CostBreakdownSchema = z.object({
   embeddingsUsd: z.number().nonnegative(),
   suggestionUsd: z.number().nonnegative(),
   classificationUsd: z.number().nonnegative().default(0),
+  // Custo da geração automática de tags por IA (Fase 9 / E-3). Default 0 para
+  // compatibilidade com breakdowns persistidos antes desta etapa existir.
+  tagGenerationUsd: z.number().nonnegative().default(0),
   totalUsd: z.number().nonnegative(),
 });
 
@@ -145,6 +225,7 @@ export const DocumentContentSchema = z.object({
   extraction: ExtractionResultSchema,
   indexSuggestion: IndexSuggestionSchema.nullable(),
   typeSuggestion: TypeSuggestionSchema.nullable(),
+  suggestedTags: SuggestedTagsSchema.nullable(),
   costBreakdown: CostBreakdownSchema.nullable(),
 });
 

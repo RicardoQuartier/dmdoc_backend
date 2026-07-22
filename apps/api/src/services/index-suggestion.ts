@@ -143,6 +143,7 @@ export async function suggestDocumentIndexes(
     embeddingsUsd: 0,
     suggestionUsd: 0,
     classificationUsd: 0,
+    tagGenerationUsd: 0,
     totalUsd: 0,
   };
 
@@ -164,16 +165,19 @@ export async function suggestDocumentIndexes(
   };
 
   const newSuggestionUsd = existingBreakdown.suggestionUsd + core.costUsd;
+  const existingTagGenerationUsd = existingBreakdown.tagGenerationUsd ?? 0;
   const newCostBreakdown: CostBreakdown = {
     extractionUsd: existingBreakdown.extractionUsd,
     embeddingsUsd: existingBreakdown.embeddingsUsd,
     suggestionUsd: newSuggestionUsd,
     classificationUsd: existingBreakdown.classificationUsd,
+    tagGenerationUsd: existingTagGenerationUsd,
     totalUsd:
       existingBreakdown.extractionUsd +
       existingBreakdown.embeddingsUsd +
       newSuggestionUsd +
-      existingBreakdown.classificationUsd,
+      existingBreakdown.classificationUsd +
+      existingTagGenerationUsd,
   };
 
   // Payload separado para persistência: `sql.json` exige `JSONValue` (sem

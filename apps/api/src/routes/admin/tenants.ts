@@ -26,6 +26,8 @@ const PatchTenantBodySchema = z.object({
   aiClassificationEnabled: z.boolean().optional(),
   aiTitleSuggestionEnabled: z.boolean().optional(),
   aiIndexSuggestionEnabled: z.boolean().optional(),
+  aiTagGenerationEnabled: z.boolean().optional(),
+  aiTagAutoApplyEnabled: z.boolean().optional(),
 });
 
 const ListTenantsQuerySchema = z.object({
@@ -103,13 +105,15 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       ai_classification_enabled: boolean;
       ai_title_suggestion_enabled: boolean;
       ai_index_suggestion_enabled: boolean;
+      ai_tag_generation_enabled: boolean;
+      ai_tag_auto_apply_enabled: boolean;
     };
 
     let rows: TenantRow[];
     if (cursor !== undefined) {
       rows = await sql<TenantRow[]>`
         SELECT id, name, disk_quota_bytes, user_quota, active, created_at,
-               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
+               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled
         FROM tenants
         WHERE deleted = false AND id > ${cursor}
         ORDER BY id ASC
@@ -118,7 +122,7 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
     } else {
       rows = await sql<TenantRow[]>`
         SELECT id, name, disk_quota_bytes, user_quota, active, created_at,
-               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
+               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled
         FROM tenants
         WHERE deleted = false
         ORDER BY id ASC
@@ -141,6 +145,8 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       aiClassificationEnabled: r.ai_classification_enabled,
       aiTitleSuggestionEnabled: r.ai_title_suggestion_enabled,
       aiIndexSuggestionEnabled: r.ai_index_suggestion_enabled,
+      aiTagGenerationEnabled: r.ai_tag_generation_enabled,
+      aiTagAutoApplyEnabled: r.ai_tag_auto_apply_enabled,
     }));
 
     return reply.status(200).send({ items, nextCursor });
@@ -166,6 +172,8 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       ai_classification_enabled: boolean;
       ai_title_suggestion_enabled: boolean;
       ai_index_suggestion_enabled: boolean;
+      ai_tag_generation_enabled: boolean;
+      ai_tag_auto_apply_enabled: boolean;
     };
 
     const toResponse = (r: TenantRow) => ({
@@ -178,12 +186,14 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       aiClassificationEnabled: r.ai_classification_enabled,
       aiTitleSuggestionEnabled: r.ai_title_suggestion_enabled,
       aiIndexSuggestionEnabled: r.ai_index_suggestion_enabled,
+      aiTagGenerationEnabled: r.ai_tag_generation_enabled,
+      aiTagAutoApplyEnabled: r.ai_tag_auto_apply_enabled,
     });
 
     if (Object.keys(updates).length === 0) {
       const rows = await sql<TenantRow[]>`
         SELECT id, name, disk_quota_bytes, user_quota, active, created_at,
-               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
+               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled
         FROM tenants
         WHERE id = ${id}
         LIMIT 1
@@ -200,7 +210,9 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
     const touchesAiFlags =
       updates.aiClassificationEnabled !== undefined ||
       updates.aiTitleSuggestionEnabled !== undefined ||
-      updates.aiIndexSuggestionEnabled !== undefined;
+      updates.aiIndexSuggestionEnabled !== undefined ||
+      updates.aiTagGenerationEnabled !== undefined ||
+      updates.aiTagAutoApplyEnabled !== undefined;
     const touchesSettings =
       updates.name !== undefined ||
       updates.diskQuotaBytes !== undefined ||
@@ -211,7 +223,7 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
     if (touchesAiFlags || touchesSettings) {
       const beforeRows = await sql<TenantRow[]>`
         SELECT id, name, disk_quota_bytes, user_quota, active, created_at,
-               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
+               ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled
         FROM tenants
         WHERE id = ${id}
         LIMIT 1
@@ -255,13 +267,21 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
       setParts.push(`ai_index_suggestion_enabled = $${paramIdx++}`);
       values.push(updates.aiIndexSuggestionEnabled);
     }
+    if (updates.aiTagGenerationEnabled !== undefined) {
+      setParts.push(`ai_tag_generation_enabled = $${paramIdx++}`);
+      values.push(updates.aiTagGenerationEnabled);
+    }
+    if (updates.aiTagAutoApplyEnabled !== undefined) {
+      setParts.push(`ai_tag_auto_apply_enabled = $${paramIdx++}`);
+      values.push(updates.aiTagAutoApplyEnabled);
+    }
 
     const query = `
       UPDATE tenants
       SET ${setParts.join(', ')}
       WHERE id = $1
       RETURNING id, name, disk_quota_bytes, user_quota, active, created_at,
-                ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled
+                ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled
     `;
 
     let rows: TenantRow[];
@@ -302,6 +322,18 @@ export const adminTenantsRoutes: FastifyPluginAsync = async (app) => {
         changes['aiIndexSuggestionEnabled'] = {
           before: before.ai_index_suggestion_enabled,
           after: r.ai_index_suggestion_enabled,
+        };
+      }
+      if (updates.aiTagGenerationEnabled !== undefined) {
+        changes['aiTagGenerationEnabled'] = {
+          before: before.ai_tag_generation_enabled,
+          after: r.ai_tag_generation_enabled,
+        };
+      }
+      if (updates.aiTagAutoApplyEnabled !== undefined) {
+        changes['aiTagAutoApplyEnabled'] = {
+          before: before.ai_tag_auto_apply_enabled,
+          after: r.ai_tag_auto_apply_enabled,
         };
       }
 

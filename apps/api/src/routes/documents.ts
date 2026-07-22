@@ -8,6 +8,12 @@ import {
   DOCUMENT_EVENTS_COLLECTION,
   newId,
   resolveAiFeatureFlags,
+  createAiReprocessBatch,
+  getAiReprocessBatch,
+  getAiReprocessBatchGlobal,
+  getAiReprocessBatchInTenants,
+  type AiReprocessBatchRecord,
+  type AiReprocessBatchStep,
 } from '@dmdoc/db-pg';
 import type { TenantDocument } from '@dmdoc/db-pg';
 import type { Sql } from '@dmdoc/db-pg';
@@ -22,8 +28,16 @@ import {
   DocumentProcessingJobDataSchema,
   PublicTypeSuggestionSchema,
   PublicIndexSuggestionSchema,
+  PublicSuggestedTagsSchema,
+  MAX_GENERATED_TAGS,
+  MAX_TAG_LENGTH,
+  mergeConfirmedTags,
   ROLE_LEVEL,
   RoleSchema,
+  AiReprocessJobDataSchema,
+  AI_REPROCESS_STEPS,
+  AiReprocessStepSchema,
+  type AiReprocessStep,
 } from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
 import {
@@ -41,6 +55,7 @@ import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
 import { getConfig, type Config } from '../config.js';
 import { suggestDocumentIndexes } from '../services/index-suggestion.js';
 import { classifyDocument } from '../services/classify-document.js';
+import { generateDocumentTags } from '../services/tag-generation.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais que mapeiam as tabelas do PostgreSQL (spec §5.3)
@@ -228,7 +243,15 @@ const PatchDocumentBodySchema = z.object({
   // confirmado (volta ao fallback `originalFilename`); ausente = não mexe.
   title: z.string().min(1).max(500).nullable().optional(),
   indexValues: z.record(z.union([z.string(), z.number(), z.null()])).optional(),
-  tags: z.array(z.string()).optional(),
+  // Tags CONFIRMADAS pelo usuário (manuais + sugeridas por IA que ele aceitou).
+  // Teto coerente: até 60 tags por documento (30 da IA + folga para manuais),
+  // cada tag não-vazia e limitada em tamanho — barra abuso sem atrapalhar o uso
+  // real. As tags SUGERIDAS pela IA vivem em `document_content.suggested_tags`
+  // (consultivas) e nunca entram aqui automaticamente — só por confirmação.
+  tags: z
+    .array(z.string().trim().min(1).max(MAX_TAG_LENGTH))
+    .max(MAX_GENERATED_TAGS * 2)
+    .optional(),
 });
 
 /** Schema dos params de rotas `/documents/:id/*` que exigem um UUID válido. */
@@ -245,6 +268,33 @@ const DocumentIdParamsSchema = z.object({
 const BulkReassignUploaderBodySchema = z.object({
   documentIds: z.array(z.string().uuid()).min(1).max(500),
   toUserId: z.string().uuid(),
+});
+
+/**
+ * Teto de documentos por disparo de reprocessamento de IA em massa (épico E-4).
+ * Mesmo teto do bulk-reassign e do `pageSize` máximo de `GET /documents` (500) —
+ * o front resolve "selecionar todos os resultados do filtro" enviando os ids da
+ * página (até 500), então o teto casa naturalmente com o volume máximo de uma
+ * seleção. Barra o disparo acidental da empresa inteira num clique (aviso de
+ * custo — ver regra "Rastreamento de custo de IA por empresa").
+ */
+const BULK_REPROCESS_AI_MAX = 500;
+
+/**
+ * Schema do body do POST /documents/bulk-reprocess-ai.
+ *
+ * `documentIds`: lista EXPLÍCITA de documentos a reprocessar (1..500). A UX de
+ * "selecionar todos do filtro" é resolvida no front expandindo o filtro em ids
+ * (limitado ao mesmo teto), mantendo o backend simples e o escopo/ACL validado
+ * por documento.
+ *
+ * `steps`: subconjunto NÃO-vazio de {title, indexes, tags}. Ausente ⇒ todas as
+ * etapas. O backend ainda INTERSECTA com as feature flags efetivas do tenant —
+ * só enfileira as etapas realmente habilitadas.
+ */
+const BulkReprocessAiBodySchema = z.object({
+  documentIds: z.array(z.string().uuid()).min(1).max(BULK_REPROCESS_AI_MAX),
+  steps: z.array(AiReprocessStepSchema).min(1).optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -1144,9 +1194,11 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         extraction: { pageCount?: number } | null;
         type_suggestion: unknown;
         index_suggestion: unknown;
+        suggested_tags: unknown;
+        full_text: string | null;
       }>
     >`
-      SELECT extraction, type_suggestion, index_suggestion
+      SELECT extraction, type_suggestion, index_suggestion, suggested_tags, full_text
       FROM document_content
       WHERE document_id = ${doc.id}
         AND tenant_id = ${doc.tenant_id}
@@ -1185,6 +1237,24 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const indexSuggestion =
       rawIndexSuggestion !== null ? PublicIndexSuggestionSchema.parse(rawIndexSuggestion) : null;
 
+    // Subconjunto SEGURO da sugestão de TAGS por IA (Fase 9 / E-3). Só `tags` +
+    // `generatedAt`; o `parse` do PublicSuggestedTagsSchema descarta model,
+    // promptVersion e rawResponse — esses ficam só no /debug. É o que o card de
+    // sugestão da tela de detalhe usa. Null enquanto o worker ainda não gerou
+    // (coluna nula). NUNCA se confunde com `documents.tags` (as confirmadas,
+    // que já vão em `rowToDocument`).
+    const rawSuggestedTags = contentRows[0]?.suggested_tags ?? null;
+    const suggestedTags =
+      rawSuggestedTags !== null ? PublicSuggestedTagsSchema.parse(rawSuggestedTags) : null;
+
+    // Texto completo extraído (nativo ou OCR) usado para busca/embeddings (T-23).
+    // Exposto no próprio detalhe reusando EXATAMENTE o mesmo controle de acesso
+    // acima (assertCanReadDepartment) — sem novo nível de acesso. É `null` quando
+    // não há linha em document_content (documento ainda processando, PENDING/
+    // PROCESSING, ou processamento falhou sem gerar texto). O card de leitura na
+    // tela de detalhe trata esse `null` como estado vazio, nunca como erro.
+    const fullText = contentRows[0]?.full_text ?? null;
+
     // Valor EFETIVO (plataforma AND empresa) da feature de título sugerido por
     // IA (T-18) — o frontend usa isso para decidir se mostra o indicador de
     // sugestão pendente na tela de detalhes, sem precisar "descobrir"
@@ -1205,7 +1275,10 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       pageCount,
       typeSuggestion,
       indexSuggestion,
+      suggestedTags,
+      fullText,
       titleSuggestionEnabled: aiFlags.titleSuggestionEnabled,
+      tagGenerationEnabled: aiFlags.tagGenerationEnabled,
     });
   });
 
@@ -1796,6 +1869,220 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
   );
 
   // =========================================================================
+  // POST /documents/bulk-reprocess-ai — reprocessamento de IA em massa (E-4)
+  // =========================================================================
+  /**
+   * Dispara o reprocessamento de IA (título/tipo, índices, tags) de um LOTE de
+   * documentos: cria o registro de lote (`ai_reprocess_batch`) e enfileira UM
+   * job na fila dedicada `ai-reprocess` por documento (assíncrono — nunca
+   * bloqueia num lote grande). Retorna o `batchId` para o front acompanhar o
+   * progresso via `GET /documents/bulk-reprocess-ai/:batchId`.
+   *
+   * ESCOPO/PERMISSÃO (inegociável): só documentos que o ator pode ESCREVER —
+   * `assertCanWriteDepartment` por documento (mesmo choke point do reprocess
+   * individual: UPLOADER+ com ACL do departamento). Documento fora de escopo
+   * (outro tenant, sem ACL, USER) resolve para 404, nunca 403 — não vaza
+   * existência. O lote é escopado por UM tenant.
+   *
+   * FEATURE FLAGS: só enfileira as etapas efetivamente habilitadas para a
+   * empresa (`resolveAiFeatureFlags`, plataforma AND empresa). Nenhuma ligada
+   * dentre as pedidas ⇒ 422 (nada a fazer).
+   */
+  app.post(
+    '/documents/bulk-reprocess-ai',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      const userId = request.user!.sub;
+      const role = request.user!.role;
+      const sql = app.db;
+
+      const { documentIds, steps: requestedStepsRaw } = BulkReprocessAiBodySchema.parse(request.body);
+
+      // ------------------------------------------------------------------
+      // 1. Resolve os documentos DENTRO do escopo do ator (multi-tenant).
+      //    Documento fora do escopo → 404 genérico (nunca revela qual id).
+      // ------------------------------------------------------------------
+      interface ScopedDocRow { id: string; tenant_id: string; department_id: string }
+      let foundDocs: ScopedDocRow[];
+
+      if (role === 'SUPER_ADMIN') {
+        foundDocs = await sql<ScopedDocRow[]>`
+          SELECT id, tenant_id, department_id
+          FROM documents
+          WHERE id = ANY(${documentIds}::uuid[])
+            AND deleted = false
+        `;
+      } else if (role === 'MULTI_TENANT_ADMIN') {
+        const allowed = request.user?.allowedTenantIds ?? [];
+        foundDocs = allowed.length === 0
+          ? []
+          : await sql<ScopedDocRow[]>`
+              SELECT id, tenant_id, department_id
+              FROM documents
+              WHERE id = ANY(${documentIds}::uuid[])
+                AND tenant_id = ANY(${allowed}::uuid[])
+                AND deleted = false
+            `;
+      } else {
+        const scopedTenantId = request.tenantId as string;
+        foundDocs = await sql<ScopedDocRow[]>`
+          SELECT id, tenant_id, department_id
+          FROM documents
+          WHERE id = ANY(${documentIds}::uuid[])
+            AND tenant_id = ${scopedTenantId}
+            AND deleted = false
+        `;
+      }
+
+      if (foundDocs.length !== documentIds.length) {
+        // Algum id não existe ou está fora do escopo do ator → 404 genérico.
+        throw new NotFoundError('Documento não encontrado');
+      }
+
+      // ------------------------------------------------------------------
+      // 2. Todos os documentos precisam pertencer à MESMA empresa (o lote é
+      //    escopado por tenant). Para SUPER_ADMIN/MTA, seleção cross-tenant
+      //    é uso inválido da API (não vazamento) → 422.
+      // ------------------------------------------------------------------
+      const distinctTenantIds = [...new Set(foundDocs.map((d) => d.tenant_id))];
+      if (distinctTenantIds.length > 1) {
+        throw new ValidationError('Todos os documentos devem pertencer à mesma empresa');
+      }
+      const tenantId = distinctTenantIds[0]!;
+
+      // ------------------------------------------------------------------
+      // 3. ACL por documento — mesmo choke point do reprocess individual.
+      //    USER (nível < UPLOADER) ou sem ACL do departamento → 404.
+      // ------------------------------------------------------------------
+      for (const doc of foundDocs) {
+        await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
+      }
+
+      // ------------------------------------------------------------------
+      // 4. Feature flags efetivas → etapas realmente habilitadas.
+      // ------------------------------------------------------------------
+      const flags = await resolveAiFeatureFlags(sql, tenantId);
+      const requestedSteps: AiReprocessStep[] = requestedStepsRaw ?? [...AI_REPROCESS_STEPS];
+      const enabledSteps = requestedSteps.filter((step) => {
+        if (step === 'title') return flags.classificationEnabled || flags.titleSuggestionEnabled;
+        if (step === 'indexes') return flags.indexSuggestionEnabled;
+        return flags.tagGenerationEnabled; // 'tags'
+      });
+
+      if (enabledSteps.length === 0) {
+        throw new ValidationError(
+          'Nenhuma etapa de IA está habilitada para a empresa — nada a reprocessar'
+        );
+      }
+
+      // ------------------------------------------------------------------
+      // 5. Cria o lote e enfileira 1 job por documento (assíncrono).
+      // ------------------------------------------------------------------
+      const batch = await createAiReprocessBatch(sql, {
+        tenantId,
+        createdBy: userId,
+        total: foundDocs.length,
+        steps: enabledSteps as AiReprocessBatchStep[],
+      });
+
+      if (app.aiReprocessQueue !== null) {
+        await app.aiReprocessQueue.addBulk(
+          foundDocs.map((doc) => ({
+            name: 'reprocess-ai',
+            data: AiReprocessJobDataSchema.parse({
+              tenantId,
+              documentId: doc.id,
+              batchId: batch.id,
+              steps: enabledSteps,
+            }),
+          }))
+        );
+      } else {
+        request.log.warn(
+          { tenantId, batchId: batch.id, count: foundDocs.length },
+          'fila ai-reprocess não configurada — lote criado sem enfileirar jobs'
+        );
+      }
+
+      // ------------------------------------------------------------------
+      // 6. AuditLog (não-bloqueante).
+      // ------------------------------------------------------------------
+      const auditLogger = new AuditLogger(sql);
+      try {
+        await auditLogger.record({
+          tenantId,
+          userId,
+          action: 'document.bulk_reprocess_ai',
+          resource: `documents/bulk-reprocess-ai/${batch.id}`,
+          metadata: {
+            batchId: batch.id,
+            documentIds,
+            count: foundDocs.length,
+            steps: enabledSteps,
+          },
+        });
+      } catch (auditError) {
+        request.log.error(
+          { err: auditError, tenantId, userId, batchId: batch.id, count: foundDocs.length },
+          'falha ao registrar audit log de reprocessamento de IA em massa'
+        );
+      }
+
+      request.log.info(
+        { tenantId, userId, batchId: batch.id, count: foundDocs.length, steps: enabledSteps, traceId: request.id },
+        'lote de reprocessamento de IA enfileirado'
+      );
+
+      return reply.status(202).send({
+        batchId: batch.id,
+        total: batch.total,
+        steps: enabledSteps,
+      });
+    }
+  );
+
+  // =========================================================================
+  // GET /documents/bulk-reprocess-ai/:batchId — status do lote (polling, E-4)
+  // =========================================================================
+  /**
+   * Retorna o progresso de um lote de reprocessamento de IA (`total/done/failed/
+   * status/steps`) para o polling do front. ESCOPADO ao tenant do ator: lote de
+   * outra empresa → 404 (nunca revela existência).
+   */
+  app.get(
+    '/documents/bulk-reprocess-ai/:batchId',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      const role = request.user!.role;
+      const sql = app.db;
+
+      const { batchId } = z.object({ batchId: z.string().uuid() }).parse(request.params);
+
+      let batch: AiReprocessBatchRecord | null;
+      if (role === 'SUPER_ADMIN') {
+        batch = await getAiReprocessBatchGlobal(sql, batchId);
+      } else if (role === 'MULTI_TENANT_ADMIN') {
+        batch = await getAiReprocessBatchInTenants(sql, request.user?.allowedTenantIds ?? [], batchId);
+      } else {
+        batch = await getAiReprocessBatch(sql, request.tenantId as string, batchId);
+      }
+
+      if (batch === null) {
+        throw new NotFoundError('Lote de reprocessamento não encontrado');
+      }
+
+      return reply.status(200).send({
+        batchId: batch.id,
+        total: batch.total,
+        done: batch.done,
+        failed: batch.failed,
+        status: batch.status,
+        steps: batch.steps,
+      });
+    }
+  );
+
+  // =========================================================================
   // DELETE /documents/:id — exclusão lógica + limpeza de chunks/S3
   // =========================================================================
   app.delete('/documents/:id', { preHandler: app.authenticate }, async (request, reply) => {
@@ -2247,6 +2534,125 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       },
       suggestedTitle: result.suggestedTitle,
       costUsd: result.costUsd,
+    });
+  });
+
+  // =========================================================================
+  // POST /documents/:id/generate-tags — geração de tags por IA sob demanda
+  // (Fase 9 / E-3 / GH #36). Investiga o texto do documento já processado e
+  // gera até 30 tags. Persiste `document_content.suggested_tags` (e acumula
+  // custo); com a 5ª feature de IA (`aiTagAutoApplyEnabled`) ligada, também
+  // mescla automaticamente em `documents.tags` (as confirmadas) — sem exigir
+  // clique manual, nunca removendo tags já confirmadas.
+  // Espelha o guard/escopo de `POST /documents/:id/suggest-indexes`.
+  // =========================================================================
+  app.post('/documents/:id/generate-tags', { preHandler: app.authenticate }, async (request, reply) => {
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const sql = app.db;
+
+    const { id } = DocumentIdParamsSchema.parse(request.params);
+
+    // ------------------------------------------------------------------
+    // 1. Resolve o documento respeitando o escopo do role (mesmo padrão de
+    //    GET/PATCH/DELETE/suggest-indexes) — documento de outro tenant sempre
+    //    vira 404, nunca 403 (spec §10, invariante 4).
+    // ------------------------------------------------------------------
+    let doc: DocumentRow | null;
+    if (role === 'SUPER_ADMIN') {
+      doc = await findDocumentGlobally(sql, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
+      doc = await repo.findById(id);
+    }
+
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    const tenantId = doc.tenant_id;
+
+    // Geração de tags é uma ESCRITA (persiste `suggested_tags` e incrementa
+    // custo) — exige a mesma permissão de escrita no departamento usada em
+    // PATCH/DELETE/suggest-indexes/classify.
+    await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
+
+    const log = request.log.child({ tenantId, documentId: id, userId, traceId: request.id });
+
+    // ------------------------------------------------------------------
+    // 2. Feature flag de IA (Fase 9) — valor EFETIVO (plataforma AND empresa)
+    //    checado ANTES de qualquer custo de LLM. Desligada ⇒ 403.
+    // ------------------------------------------------------------------
+    const aiFlags = await resolveAiFeatureFlags(sql, tenantId);
+    if (!aiFlags.tagGenerationEnabled) {
+      log.info({}, 'geração de tags por IA desabilitada para esta empresa — LLM não chamado');
+      throw new ForbiddenError('Geração de tags por IA está desabilitada para esta empresa');
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Chama o service (valida a pré-condição de documento processado —
+    //    NotFoundError propaga para o error handler central, mapeando para 404).
+    //    Falha do provedor de LLM (chave inválida/ausente, provedor fora do ar)
+    //    vira 502 — não é bug do DMDoc, é upstream.
+    // ------------------------------------------------------------------
+    let result: Awaited<ReturnType<typeof generateDocumentTags>>;
+    try {
+      result = await generateDocumentTags({ tenantId, documentId: id }, { sql, llmProvider, logger: log });
+    } catch (err) {
+      if (err instanceof LLMError) {
+        log.error({ err }, 'geração de tags falhou por erro do provedor de LLM');
+        throw new UpstreamServiceError(
+          'Não foi possível gerar as tags agora — falha ao chamar o provedor de IA. Tente novamente em instantes.'
+        );
+      }
+      throw err;
+    }
+
+    log.info(
+      { tagsGenerated: result.tags.length, costUsd: result.costUsd },
+      'geração de tags sob demanda retornada'
+    );
+
+    // ------------------------------------------------------------------
+    // 3.1. Aplicação automática (5ª feature de IA, `aiTagAutoApplyEnabled`) —
+    //      quando ligada, mescla as tags recém-sugeridas em `documents.tags`
+    //      (dedupe case-insensitive, teto de 60), sem exigir o clique manual
+    //      do usuário no card "Tags sugeridas pela IA". Nunca remove tags já
+    //      confirmadas. Mesma lógica do gatilho automático do worker.
+    // ------------------------------------------------------------------
+    let appliedTags: string[] | undefined;
+    if (aiFlags.tagAutoApplyEnabled && result.tags.length > 0) {
+      const docRows = await sql<Array<{ tags: string[] }>>`
+        SELECT tags FROM documents WHERE id = ${id} AND tenant_id = ${tenantId} LIMIT 1
+      `;
+      const currentTags = docRows[0]?.tags ?? [];
+      const merged = mergeConfirmedTags(currentTags, result.tags);
+      if (merged.length !== currentTags.length) {
+        await sql`UPDATE documents SET tags = ${merged} WHERE id = ${id} AND tenant_id = ${tenantId}`;
+        appliedTags = merged;
+        log.info(
+          { tagsBefore: currentTags.length, tagsAfter: merged.length },
+          'tags sugeridas aplicadas automaticamente (aiTagAutoApplyEnabled)'
+        );
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Resposta 200 — subconjunto público (tags + generatedAt) + custo desta
+    //    chamada. Campos de auditoria (model/promptVersion/rawResponse) não vazam.
+    //    `appliedTags` só aparece quando a aplicação automática efetivamente
+    //    mudou `documents.tags` (undefined nos demais casos).
+    // ------------------------------------------------------------------
+    return reply.status(200).send({
+      suggestedTags: {
+        tags: result.tags,
+        generatedAt: result.generatedAt,
+      },
+      costUsd: result.costUsd,
+      ...(appliedTags !== undefined ? { appliedTags } : {}),
     });
   });
 };

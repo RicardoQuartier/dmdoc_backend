@@ -1508,6 +1508,107 @@ describe('GET /documents/:id — typeSuggestion (Fase 8)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /documents/:id — texto extraído (fullText) — T-23 / GH #34
+// ---------------------------------------------------------------------------
+
+describe('GET /documents/:id — fullText (T-23)', () => {
+  const SECRET_TEXT =
+    'CONTRATO CONFIDENCIAL — clausula secreta do tenant A que jamais pode vazar';
+
+  /**
+   * Cria um documento READY em TENANT_A/DEPT_A. Quando `fullText` é uma string,
+   * insere a linha de document_content correspondente; quando é `null`, o
+   * documento fica SEM linha de document_content (simula PENDING/PROCESSING ou
+   * falha sem conteúdo) — o GET deve devolver `fullText: null`.
+   */
+  async function seedDocWithFullText(
+    fullText: string | null,
+    status: 'READY' | 'PROCESSING' | 'FAILED' = 'READY'
+  ): Promise<string> {
+    const docId = newId();
+    const hash = 'e'.repeat(64);
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
+        'texto.pdf', 'texto.pdf', ${hash}, 2048, 'application/pdf',
+        ${`tenants/${TENANT_A}/documents/${hash}/texto.pdf`}, ${status}, NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NOW(), 0, false
+      )
+    `;
+    if (fullText !== null) {
+      await testDb.db`
+        INSERT INTO document_content (document_id, tenant_id, full_text, extraction)
+        VALUES (
+          ${docId}, ${TENANT_A}, ${fullText},
+          ${testDb.db.json({ engine: 'native', engineVersion: '1.0.0', durationMs: 10, ocrPages: [], pageCount: 3, extractedAt: new Date().toISOString() })}
+        )
+      `;
+    }
+    return docId;
+  }
+
+  it('documento READY com texto extraído → fullText com o conteúdo completo', async () => {
+    const docId = await seedDocWithFullText(SECRET_TEXT);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().fullText).toBe(SECRET_TEXT);
+  });
+
+  it('documento sem document_content (ainda processando) → fullText: null', async () => {
+    const docId = await seedDocWithFullText(null, 'PROCESSING');
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().fullText).toBeNull();
+  });
+
+  it('documento FAILED sem texto → fullText: null (nunca erro)', async () => {
+    const docId = await seedDocWithFullText(null, 'FAILED');
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().fullText).toBeNull();
+  });
+
+  it('usuário de outro tenant → 404, texto extraído nunca vaza', async () => {
+    const docId = await seedDocWithFullText(SECRET_TEXT);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminB}` },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+    expect(res.payload).not.toContain('fullText');
+    expect(res.payload).not.toContain(SECRET_TEXT);
+    expect(res.payload).not.toContain('clausula secreta');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET /documents/:id — sugestão automática de valores de índice (T-16, Gatilho 1)
 // ---------------------------------------------------------------------------
 
@@ -3264,5 +3365,168 @@ describe('PATCH /documents/:id — sugestão automática de índices ao definir 
     expect(res.statusCode).toBe(200);
     expect(res.json()).not.toHaveProperty('suggestedIndexFields');
     expect(fakeLlmChat).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /documents/:id/generate-tags — geração de tags por IA sob demanda
+// (Fase 9 / E-3 / GH #36). CONSULTIVO: persiste document_content.suggested_tags
+// e NUNCA toca documents.tags. Gated pela 4ª flag (tagGenerationEnabled).
+// ---------------------------------------------------------------------------
+
+describe('POST /documents/:id/generate-tags (Fase 9 / E-3)', () => {
+  function tagsChatResult(tags: string[], costUsd = 0.0003): ChatResult {
+    return {
+      content: JSON.stringify({ tags }),
+      model: 'gpt-4o-mini',
+      usage: { promptTokens: 400, completionTokens: 30, totalTokens: 430, costUsd },
+    };
+  }
+
+  /** Cria um documento READY com conteúdo processado no tenant/dept indicados. */
+  async function seedDoc(opts: { tenantId?: string; departmentId?: string; withContent?: boolean } = {}): Promise<string> {
+    const tenantId = opts.tenantId ?? TENANT_A;
+    const departmentId = opts.departmentId ?? DEPT_A_ID;
+    const withContent = opts.withContent ?? true;
+    const docId = newId();
+    const hash = crypto.randomBytes(32).toString('hex');
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${tenantId}, ${departmentId}, NULL,
+        'tags.pdf', 'tags.pdf', ${hash}, 2048, 'application/pdf',
+        ${`tenants/${tenantId}/documents/${hash}/tags.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_A_ID}, NOW(), NOW(), 0, false
+      )
+    `;
+    if (withContent) {
+      await testDb.db`
+        INSERT INTO document_content (document_id, tenant_id, full_text, extraction, cost_breakdown)
+        VALUES (
+          ${docId}, ${tenantId}, 'Contrato de locação e boleto bancário no valor de R$ 1.234,56.',
+          ${testDb.db.json({ engine: 'native', engineVersion: '1.0.0', durationMs: 10, ocrPages: [], pageCount: 1, extractedAt: new Date().toISOString() })},
+          ${testDb.db.json({ extractionUsd: 0, embeddingsUsd: 0.01, suggestionUsd: 0, classificationUsd: 0, tagGenerationUsd: 0, totalUsd: 0.01 })}
+        )
+      `;
+    }
+    return docId;
+  }
+
+  async function setTenantTagFlag(tenantId: string, enabled: boolean): Promise<void> {
+    await testDb.db`UPDATE tenants SET ai_tag_generation_enabled = ${enabled} WHERE id = ${tenantId}`;
+  }
+
+  beforeEach(() => {
+    fakeLlmChat.mockReset();
+  });
+
+  afterEach(async () => {
+    // Restaura o toggle para não vazar estado entre testes do mesmo arquivo.
+    await setTenantTagFlag(TENANT_A, true);
+  });
+
+  it('sucesso: gera tags, persiste suggested_tags e NÃO toca documents.tags; acumula custo', async () => {
+    const docId = await seedDoc();
+    fakeLlmChat.mockResolvedValueOnce(tagsChatResult(['Contrato', 'Boleto', 'R$ 1.234,56']));
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/generate-tags`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.suggestedTags.tags).toEqual(['Contrato', 'Boleto', 'R$ 1.234,56']);
+    expect(body.costUsd).toBeCloseTo(0.0003, 6);
+
+    // Persistiu a sugestão consultiva.
+    const contentRows = await testDb.db<Array<{ suggested_tags: { tags: string[] } | null; cost_breakdown: { tagGenerationUsd: number } | null }>>`
+      SELECT suggested_tags, cost_breakdown FROM document_content WHERE document_id = ${docId}
+    `;
+    expect(contentRows[0]!.suggested_tags!.tags).toEqual(['Contrato', 'Boleto', 'R$ 1.234,56']);
+    expect(contentRows[0]!.cost_breakdown!.tagGenerationUsd).toBeCloseTo(0.0003, 6);
+
+    // NUNCA tocou as tags confirmadas.
+    const docRows = await testDb.db<Array<{ tags: string[]; cost_usd_cents: number }>>`
+      SELECT tags, cost_usd_cents FROM documents WHERE id = ${docId}
+    `;
+    expect(docRows[0]!.tags).toEqual([]);
+    expect(docRows[0]!.cost_usd_cents).toBeGreaterThan(0);
+  });
+
+  it('feature desligada para a empresa → 403 antes de qualquer custo de IA', async () => {
+    const docId = await seedDoc();
+    await setTenantTagFlag(TENANT_A, false);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/generate-tags`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(fakeLlmChat).not.toHaveBeenCalled();
+  });
+
+  it('documento de outra empresa → 404 (nunca 403)', async () => {
+    const docId = await seedDoc({ tenantId: TENANT_B, departmentId: DEPT_B_ID });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/generate-tags`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(fakeLlmChat).not.toHaveBeenCalled();
+  });
+
+  it('GET /documents/:id expõe suggestedTags e tagGenerationEnabled após a geração', async () => {
+    const docId = await seedDoc();
+    fakeLlmChat.mockResolvedValueOnce(tagsChatResult(['Locação', 'Boleto']));
+
+    await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/generate-tags`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.suggestedTags.tags).toEqual(['Locação', 'Boleto']);
+    expect(body.tagGenerationEnabled).toBe(true);
+    // Não vaza campos de auditoria no subconjunto público.
+    expect(body.suggestedTags).not.toHaveProperty('model');
+    expect(body.suggestedTags).not.toHaveProperty('rawResponse');
+  });
+
+  it('PATCH confirma as tags escolhidas em documents.tags (persistência do confirmado)', async () => {
+    const docId = await seedDoc();
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { tags: ['Contrato', 'Boleto'] },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().tags).toEqual(['Contrato', 'Boleto']);
+
+    const docRows = await testDb.db<Array<{ tags: string[] }>>`
+      SELECT tags FROM documents WHERE id = ${docId}
+    `;
+    expect(docRows[0]!.tags).toEqual(['Contrato', 'Boleto']);
   });
 });

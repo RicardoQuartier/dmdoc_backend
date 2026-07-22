@@ -88,6 +88,14 @@ export const tenants = pgTable('tenants', {
   aiClassificationEnabled: boolean('ai_classification_enabled').notNull().default(true),
   aiTitleSuggestionEnabled: boolean('ai_title_suggestion_enabled').notNull().default(true),
   aiIndexSuggestionEnabled: boolean('ai_index_suggestion_enabled').notNull().default(true),
+  // 4ª feature de IA (Fase 9 / E-3): geração automática de tags por documento.
+  // Mesmo esquema de dois níveis das anteriores — efetivo = plataforma AND empresa.
+  aiTagGenerationEnabled: boolean('ai_tag_generation_enabled').notNull().default(true),
+  // 5ª feature de IA: aplica automaticamente as tags sugeridas em `documents.tags`
+  // (merge com dedupe case-insensitive, respeitando o teto de 60), sem exigir
+  // confirmação manual do usuário. Mesmo esquema de dois níveis — efetivo =
+  // plataforma AND empresa. Default ligado (decisão de produto).
+  aiTagAutoApplyEnabled: boolean('ai_tag_auto_apply_enabled').notNull().default(true),
 });
 
 // ---------------------------------------------------------------------------
@@ -107,6 +115,10 @@ export const platformSettings = pgTable('platform_settings', {
   aiClassificationEnabled: boolean('ai_classification_enabled').notNull().default(true),
   aiTitleSuggestionEnabled: boolean('ai_title_suggestion_enabled').notNull().default(true),
   aiIndexSuggestionEnabled: boolean('ai_index_suggestion_enabled').notNull().default(true),
+  // Kill switch global da 4ª feature de IA (Fase 9 / E-3): geração de tags.
+  aiTagGenerationEnabled: boolean('ai_tag_generation_enabled').notNull().default(true),
+  // Kill switch global da 5ª feature de IA: aplicação automática de tags sugeridas.
+  aiTagAutoApplyEnabled: boolean('ai_tag_auto_apply_enabled').notNull().default(true),
   updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' })
     .notNull()
     .default(sql`now()`),
@@ -384,6 +396,10 @@ export const documentContent = pgTable('document_content', {
   extraction: jsonb('extraction').notNull(),
   indexSuggestion: jsonb('index_suggestion'),
   typeSuggestion: jsonb('type_suggestion'),
+  // Sugestão CONSULTIVA de tags por IA (Fase 9 / E-3). Nula até o pipeline de
+  // geração rodar. { tags, model, promptVersion, generatedAt, rawResponse }.
+  // NUNCA se confunde com `documents.tags` (tags confirmadas pelo usuário).
+  suggestedTags: jsonb('suggested_tags'),
   costBreakdown: jsonb('cost_breakdown'),
 });
 
@@ -493,6 +509,49 @@ export const departmentTemplates = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// ai_reprocess_batch
+// ---------------------------------------------------------------------------
+
+/**
+ * Registro de um LOTE de reprocessamento de IA em massa (épico E-4 / T-24).
+ *
+ * Criado pela API (`POST /documents/bulk-reprocess-ai`) que enfileira UM job
+ * de IA por documento; os contadores `done`/`failed` são incrementados
+ * atomicamente pelo worker à medida que cada documento conclui. O lote é
+ * escopado por `tenant_id` (isolamento multi-tenant — o status de um lote de
+ * outra empresa nunca é legível).
+ *
+ * `status`: 'running' enquanto `done + failed < total`; 'completed' quando
+ * `done + failed = total` (transição feita no mesmo UPDATE atômico do contador).
+ * `steps`: as etapas de IA efetivamente enfileiradas (já filtradas pelas
+ * feature flags do tenant na API).
+ */
+export const aiReprocessBatches = pgTable(
+  'ai_reprocess_batch',
+  {
+    id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    // Ator que disparou o lote. Nullable para sobreviver à purga de usuário
+    // (mesmo princípio append-only de document_events.uploaded_by_id).
+    createdBy: uuid('created_by').references(() => users.id),
+    total: integer('total').notNull(),
+    done: integer('done').notNull().default(0),
+    failed: integer('failed').notNull().default(0),
+    status: text('status').notNull().default('running'), // 'running' | 'completed'
+    steps: text('steps').array().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .default(sql`now()`),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .default(sql`now()`),
+  },
+  (t) => [index('ai_reprocess_batch_by_tenant').on(t.tenantId)],
+);
+
+// ---------------------------------------------------------------------------
 // audit_logs
 // ---------------------------------------------------------------------------
 
@@ -561,3 +620,6 @@ export type NewDepartmentTemplate = typeof departmentTemplates.$inferInsert;
 
 export type AuditLog = typeof auditLogs.$inferSelect;
 export type NewAuditLog = typeof auditLogs.$inferInsert;
+
+export type AiReprocessBatch = typeof aiReprocessBatches.$inferSelect;
+export type NewAiReprocessBatch = typeof aiReprocessBatches.$inferInsert;

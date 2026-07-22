@@ -117,7 +117,12 @@ type UnsafeParams = Parameters<Sql['unsafe']>[1];
  * Busca documentos na tabela `documents` pelos campos `original_filename` e `tags`.
  *
  * Tokeniza a query em palavras (≥ 2 chars) e para cada palavra verifica:
- *   original_filename ILIKE '%word%'  OR  word = ANY(tags)
+ *   original_filename ILIKE '%word%'  OR  alguma tag ILIKE '%word%'
+ *   OR  algum valor de índice ILIKE '%word%'
+ *
+ * O casamento por TAG é case-insensitive e por substring (via `unnest(tags)` +
+ * `ILIKE`), não igualdade exata — assim digitar parte de uma tag confirmada na
+ * busca livre já traz o documento (Fase 9 / E-3, tags como material buscável).
  *
  * As condições por palavra são combinadas com OR, replicando o comportamento do
  * regex alternado do MongoDB. Retorna até 10 IDs de documentos (READY, não
@@ -148,7 +153,7 @@ export async function documentMetadataSearch(
     bindings.push(word);
     const idx = paramIndex++;
     wordParts.push(
-      `(original_filename ILIKE '%' || $${idx}::text || '%' OR $${idx}::text = ANY(tags) OR EXISTS (SELECT 1 FROM jsonb_each_text(index_values) kv WHERE kv.value ILIKE '%' || $${idx}::text || '%' OR REPLACE(kv.value, '.', ',') ILIKE '%' || $${idx}::text || '%'))`
+      `(original_filename ILIKE '%' || $${idx}::text || '%' OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE t ILIKE '%' || $${idx}::text || '%') OR EXISTS (SELECT 1 FROM jsonb_each_text(index_values) kv WHERE kv.value ILIKE '%' || $${idx}::text || '%' OR REPLACE(kv.value, '.', ',') ILIKE '%' || $${idx}::text || '%'))`
     );
   }
 

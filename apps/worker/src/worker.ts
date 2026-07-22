@@ -16,6 +16,7 @@ import {
 import { runPipeline, type PipelineDeps } from './pipeline/index.js';
 import { createWorkerS3 } from './s3.js';
 import { createTenantDeletionWorker } from './tenant-deletion-worker.js';
+import { createAiReprocessWorker } from './ai-reprocess-worker.js';
 
 /**
  * Concorrência do worker (spec §8).
@@ -160,9 +161,24 @@ async function main(): Promise<void> {
     'worker de exclusão de tenant iniciado e ouvindo a fila'
   );
 
+  // Worker de reprocessamento de IA em massa (épico E-4 / T-24). Consome a fila
+  // `ai-reprocess` e roda só as etapas de IA (título/tipo, índices, tags) por
+  // documento, contabilizando o progresso no lote (`ai_reprocess_batch`).
+  const aiReprocessWorker = createAiReprocessWorker({
+    sql,
+    llmProvider,
+    chatModel: config.LLM_MODEL,
+    logger,
+  });
+
+  logger.info(
+    { queue: 'ai-reprocess' },
+    'worker de reprocessamento de IA iniciado e ouvindo a fila'
+  );
+
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, 'encerrando worker');
-    await Promise.all([worker.close(), tenantDeletionWorker.close()]);
+    await Promise.all([worker.close(), tenantDeletionWorker.close(), aiReprocessWorker.close()]);
     extractionPushConn.disconnect();
     await sql.end();
     process.exit(0);

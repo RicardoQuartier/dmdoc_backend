@@ -2,11 +2,13 @@ import { Queue, type ConnectionOptions } from 'bullmq';
 import {
   type DocumentProcessingJobData,
   type TenantDeletionJobData,
+  type AiReprocessJobData,
 } from '@dmdoc/shared-types';
 
 export type {
   DocumentProcessingJobData,
   TenantDeletionJobData,
+  AiReprocessJobData,
 } from '@dmdoc/shared-types';
 
 /**
@@ -64,6 +66,37 @@ export function createTenantDeletionQueue(
     defaultJobOptions: {
       attempts: 3,
       backoff: { type: 'exponential', delay: 5000 },
+    },
+  });
+}
+
+/**
+ * Nome da fila DEDICADA de reprocessamento de IA em massa (épico E-4 / T-24).
+ *
+ * Fila separada da `document-processing` porque o payload e o processor são
+ * distintos: aqui roda-se SÓ as etapas de IA (título/tipo, índices, tags) sobre
+ * documentos já processados — sem re-extrair, re-embeddar nem apagar chunks.
+ * Misturar na fila de processamento quebraria o processor existente, que valida
+ * `DocumentProcessingJobDataSchema` para todo job daquela fila.
+ */
+export const AI_REPROCESS_QUEUE = 'ai-reprocess';
+
+/**
+ * Fábrica da fila de reprocessamento de IA em massa.
+ *
+ * `attempts: 1` (SEM retry): cada job incrementa EXATAMENTE uma vez o contador
+ * do lote (`done`/`failed`). Um retry re-incrementaria e corromperia o total —
+ * por isso a fila não re-tenta. Falhas de LLM por etapa já são best-effort
+ * dentro do processor (não derrubam o job), então retry traria pouco ganho e
+ * muito risco de contagem dupla.
+ */
+export function createAiReprocessQueue(
+  connection: ConnectionOptions
+): Queue<AiReprocessJobData> {
+  return new Queue<AiReprocessJobData>(AI_REPROCESS_QUEUE, {
+    connection,
+    defaultJobOptions: {
+      attempts: 1,
     },
   });
 }

@@ -27,6 +27,10 @@ export interface AiFeatureFlags {
   classificationEnabled: boolean;
   titleSuggestionEnabled: boolean;
   indexSuggestionEnabled: boolean;
+  /** Geração automática de tags por documento (Fase 9 / E-3). */
+  tagGenerationEnabled: boolean;
+  /** Aplicação automática das tags sugeridas em `documents.tags`, sem confirmação manual. */
+  tagAutoApplyEnabled: boolean;
 }
 
 /**
@@ -52,9 +56,13 @@ interface AiFeatureFlagsRow {
   platform_classification_enabled: boolean;
   platform_title_suggestion_enabled: boolean;
   platform_index_suggestion_enabled: boolean;
+  platform_tag_generation_enabled: boolean;
+  platform_tag_auto_apply_enabled: boolean;
   tenant_classification_enabled: boolean;
   tenant_title_suggestion_enabled: boolean;
   tenant_index_suggestion_enabled: boolean;
+  tenant_tag_generation_enabled: boolean;
+  tenant_tag_auto_apply_enabled: boolean;
 }
 
 /**
@@ -75,9 +83,13 @@ export async function resolveAiFeatureFlags(sql: Sql, tenantId: string): Promise
       ps.ai_classification_enabled   AS platform_classification_enabled,
       ps.ai_title_suggestion_enabled AS platform_title_suggestion_enabled,
       ps.ai_index_suggestion_enabled AS platform_index_suggestion_enabled,
+      ps.ai_tag_generation_enabled   AS platform_tag_generation_enabled,
+      ps.ai_tag_auto_apply_enabled   AS platform_tag_auto_apply_enabled,
       t.ai_classification_enabled    AS tenant_classification_enabled,
       t.ai_title_suggestion_enabled  AS tenant_title_suggestion_enabled,
-      t.ai_index_suggestion_enabled  AS tenant_index_suggestion_enabled
+      t.ai_index_suggestion_enabled  AS tenant_index_suggestion_enabled,
+      t.ai_tag_generation_enabled    AS tenant_tag_generation_enabled,
+      t.ai_tag_auto_apply_enabled    AS tenant_tag_auto_apply_enabled
     FROM platform_settings ps
     CROSS JOIN tenants t
     WHERE t.id = ${tenantId}
@@ -94,5 +106,7 @@ export async function resolveAiFeatureFlags(sql: Sql, tenantId: string): Promise
     classificationEnabled: row.platform_classification_enabled && row.tenant_classification_enabled,
     titleSuggestionEnabled: row.platform_title_suggestion_enabled && row.tenant_title_suggestion_enabled,
     indexSuggestionEnabled: row.platform_index_suggestion_enabled && row.tenant_index_suggestion_enabled,
+    tagGenerationEnabled: row.platform_tag_generation_enabled && row.tenant_tag_generation_enabled,
+    tagAutoApplyEnabled: row.platform_tag_auto_apply_enabled && row.tenant_tag_auto_apply_enabled,
   };
 }

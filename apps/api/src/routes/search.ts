@@ -27,6 +27,7 @@ type DocMetaRow = {
   title: string | null;
   document_type_id: string | null;
   index_values: Record<string, string | number | null> | null;
+  tags: string[] | null;
 };
 
 /** Campo de índice showOnSearch de um tipo de documento (query em lote). */
@@ -43,6 +44,7 @@ type DocMeta = {
   originalFilename: string;
   title: string | null;
   indexValues: SearchChunkIndexValue[];
+  tags: string[];
 };
 
 // ---------------------------------------------------------------------------
@@ -415,7 +417,7 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
             : sql``;
 
       const docRows = await sql<DocMetaRow[]>`
-        SELECT d.id, d.original_filename, d.title, d.document_type_id, d.index_values
+        SELECT d.id, d.original_filename, d.title, d.document_type_id, d.index_values, d.tags
         FROM documents d
         WHERE d.id = ANY(${uniqueDocIds}::uuid[])
           AND d.deleted = false
@@ -467,6 +469,7 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
           originalFilename: d.original_filename,
           title: d.title,
           indexValues,
+          tags: d.tags ?? [],
         });
       }
     }
@@ -478,6 +481,7 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
         documentName: meta?.originalFilename ?? null,
         title: meta?.title ?? null,
         indexValues: meta?.indexValues ?? [],
+        tags: meta?.tags ?? [],
         tenantId: r.tenantId,
         documentTypeName: r.documentTypeName,
         pageNumber: r.pageNumber,

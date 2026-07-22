@@ -45,6 +45,11 @@ declare module 'fastify' {
      */
     tenantDeletionQueue: Queue | null;
     /**
+     * Fila BullMQ de reprocessamento de IA em massa (ai-reprocess, épico E-4).
+     * Null em testes — jobs não são enfileirados (o lote é criado, mas nada roda).
+     */
+    aiReprocessQueue: Queue | null;
+    /**
      * Tamanho máximo permitido para upload de arquivo (em bytes).
      * Derivado de `config.MAX_UPLOAD_MB`.
      */
@@ -73,6 +78,12 @@ export interface BuildAppOptions {
    * Em produção, `server.ts` cria a fila e a injeta aqui.
    */
   tenantDeletionQueue?: Queue | null;
+  /**
+   * Fila BullMQ de reprocessamento de IA em massa (ai-reprocess, épico E-4).
+   * Em testes, passe `null` (ou omita) para desabilitar o enfileiramento.
+   * Em produção, `server.ts` cria a fila e a injeta aqui.
+   */
+  aiReprocessQueue?: Queue | null;
   /**
    * Instância de S3Service a injetar.
    * Em testes, passe um mock. Em produção é criado a partir da config.
@@ -131,6 +142,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   // Fila BullMQ de purga de empresas — null quando não injetada (testes)
   app.decorate('tenantDeletionQueue', options.tenantDeletionQueue ?? null);
 
+  // Fila BullMQ de reprocessamento de IA em massa — null quando não injetada (testes)
+  app.decorate('aiReprocessQueue', options.aiReprocessQueue ?? null);
+
   // Serviço S3
   const s3 = options.s3 ?? createS3Service(buildS3Config(config));
   app.decorate('s3', s3);
@@ -186,6 +200,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     const tenantDeletionQueue = options.tenantDeletionQueue;
     app.addHook('onClose', async () => {
       await tenantDeletionQueue.close();
+    });
+  }
+
+  // Fecha a fila de reprocessamento de IA no shutdown
+  if (options.aiReprocessQueue) {
+    const aiReprocessQueue = options.aiReprocessQueue;
+    app.addHook('onClose', async () => {
+      await aiReprocessQueue.close();
     });
   }
 

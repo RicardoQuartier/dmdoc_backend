@@ -131,19 +131,23 @@ export async function suggestIndexesStep(
       embeddingsUsd: 0,
       suggestionUsd: 0,
       classificationUsd: 0,
+      tagGenerationUsd: 0,
       totalUsd: 0,
     };
     const newSuggestionUsd = existingBreakdown.suggestionUsd + core.costUsd;
+    const existingTagGenerationUsd = existingBreakdown.tagGenerationUsd ?? 0;
     const newCostBreakdown: CostBreakdown = {
       extractionUsd: existingBreakdown.extractionUsd,
       embeddingsUsd: existingBreakdown.embeddingsUsd,
       suggestionUsd: newSuggestionUsd,
       classificationUsd: existingBreakdown.classificationUsd,
+      tagGenerationUsd: existingTagGenerationUsd,
       totalUsd:
         existingBreakdown.extractionUsd +
         existingBreakdown.embeddingsUsd +
         newSuggestionUsd +
-        existingBreakdown.classificationUsd,
+        existingBreakdown.classificationUsd +
+        existingTagGenerationUsd,
     };
 
     const suggestedAt = new Date();
