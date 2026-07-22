@@ -21,9 +21,12 @@ export interface PersistParams {
    * `documents.suggested_title`. `null` quando a classificação foi pulada/falhou,
    * quando a feature de título está desligada ou quando o LLM não inferiu título.
    *
-   * INVARIANTE: o worker grava APENAS `suggested_title` — NUNCA toca a coluna
-   * `title` (o título confirmado pelo usuário). Reprocessar sobrescreve a
-   * sugestão (inclusive para `null`), mas jamais altera o título confirmado.
+   * O passo 4 abaixo grava SEMPRE `suggested_title` (reprocessar sobrescreve a
+   * sugestão, inclusive para `null`). O passo 4.1 abaixo, com
+   * `aiTitleAutoApplyEnabled` ligada, SUBSTITUI também a coluna `title`
+   * (confirmada) por este valor quando não-nulo — não é mais uma invariante de
+   * "nunca toca `title`" (decisão do Owner, 2026-07-22): auto-aplicação agora
+   * sobrescreve.
    */
   suggestedTitle: string | null;
   /** Custo em USD da(s) chamada(s) de LLM da classificação (0 se não houve). */
@@ -144,7 +147,8 @@ export async function persistProcessingResult(
   // classificação foi pulada/falhou; caso contrário grava o objeto (a `Date`
   // `suggestedAt` é serializada como ISO string pelo JSON, como a API espera).
   // Idempotência: no reprocessamento o ON CONFLICT sobrescreve `type_suggestion`
-  // — mas `documents.document_type_id` (escolha manual) NUNCA é tocado aqui.
+  // — `documents.document_type_id` não é tocado NESTA statement (a
+  // auto-aplicação, se ligada, roda depois, na seção 4.1 abaixo).
   const typeSuggestionJson =
     typeSuggestion === null
       ? null
@@ -177,9 +181,9 @@ export async function persistProcessingResult(
   log.debug('document_content atualizado');
 
   // 4. Atualizar documento para READY.
-  //    INVARIANTE (wiki "Título de exibição sugerido por IA"): o worker grava
-  //    APENAS `suggested_title` — a coluna `title` (título confirmado pelo
-  //    usuário) NUNCA é tocada aqui. `suggested_title` é text simples (não
+  //    Esta statement grava APENAS `suggested_title` — a coluna `title` não é
+  //    tocada AQUI (a auto-aplicação, quando ligada, roda na seção 4.1 logo
+  //    abaixo, numa statement separada). `suggested_title` é text simples (não
   //    jsonb): interpolado direto, sem `sql.json`/`JSON.stringify`. `null`
   //    sobrescreve qualquer sugestão anterior no reprocessamento (idempotência
   //    coerente com `type_suggestion`).
@@ -194,16 +198,16 @@ export async function persistProcessingResult(
   `;
 
   // 4.1 Auto-aplicação de TIPO e TÍTULO (pedido do Owner, 2026-07-22) — mesmo
-  //     princípio da auto-aplicação de tags (`aiTagAutoApplyEnabled`): quando
-  //     as flags dedicadas estão ligadas (efetivo = plataforma AND empresa),
-  //     preenche `document_type_id`/`title` quando ainda VAZIOS. Cobre tanto o
-  //     upload (documento sempre novo, campos sempre NULL) quanto o
-  //     reprocessamento individual via `POST /documents/:id/reprocess` (reusa
-  //     este MESMO pipeline sobre um documento já existente, que pode já ter
-  //     tipo/título confirmados) — cada UPDATE decide contra o estado ATUAL da
-  //     linha (`WHERE ... IS NULL` / `COALESCE(coluna, ...)`), nunca contra um
-  //     valor lido antecipadamente, então nunca sobrescreve uma confirmação já
-  //     existente (inclusive concorrente).
+  //     princípio da auto-aplicação de tags (`aiTagAutoApplyEnabled`), mas com
+  //     SOBRESCRITA (decisão do Owner, 2026-07-22): quando as flags dedicadas
+  //     estão ligadas (efetivo = plataforma AND empresa), `document_type_id`/
+  //     `title` são SUBSTITUÍDOS pela sugestão mais recente, mesmo já havendo
+  //     um valor confirmado — cobre tanto o upload (documento sempre novo)
+  //     quanto o reprocessamento individual via `POST /documents/:id/reprocess`
+  //     (reusa este MESMO pipeline sobre um documento já existente). Só NÃO
+  //     sobrescreve quando a sugestão desta rodada vier vazia/nula/abaixo do
+  //     limiar de confiança — nesse caso o valor já confirmado é preservado
+  //     (o gate abaixo garante isso: sem sugestão válida, o UPDATE nem roda).
   const aiFlags = await resolveAiFeatureFlags(sql, tenantId);
 
   if (
@@ -217,14 +221,13 @@ export async function persistProcessingResult(
       SET document_type_id = ${typeSuggestion.documentTypeId}
       WHERE id = ${documentId}
         AND tenant_id = ${tenantId}
-        AND document_type_id IS NULL
     `;
   }
 
   if (aiFlags.titleAutoApplyEnabled && suggestedTitle !== null) {
     await sql`
       UPDATE documents
-      SET title = COALESCE(title, ${suggestedTitle})
+      SET title = ${suggestedTitle}
       WHERE id = ${documentId}
         AND tenant_id = ${tenantId}
     `;

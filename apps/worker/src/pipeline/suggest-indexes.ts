@@ -50,13 +50,14 @@ export interface SuggestIndexesStepDeps {
  *
  * Grava `document_content.index_suggestion` (sugestão) — nunca toca
  * `document_type_id`. AUTO-APLICAÇÃO (gate: `aiIndexAutoApplyEnabled`): mescla
- * os valores sugeridos em `documents.index_values`, campo a campo, só quando o
- * tipo CONFIRMADO atual do documento é EXATAMENTE o tipo usado nesta sugestão
- * (o sugerido) — evita aplicar índices de um tipo que não se tornou (ainda) o
- * oficial (ex.: `aiClassificationAutoApplyEnabled` desligada, confiança abaixo
- * do limiar de auto-aplicação de tipo mas acima do limiar de índices, ou o
- * documento já tinha outro tipo confirmado manualmente antes). Nunca
- * sobrescreve um valor já confirmado.
+ * os valores sugeridos em `documents.index_values`, campo a campo, COM
+ * SOBRESCRITA (substitui um valor já confirmado quando a sugestão vier
+ * preenchida), só quando o tipo CONFIRMADO atual do documento é EXATAMENTE o
+ * tipo usado nesta sugestão (o sugerido) — evita aplicar índices de um tipo
+ * que não se tornou (ainda) o oficial (ex.: `aiClassificationAutoApplyEnabled`
+ * desligada, confiança abaixo do limiar de auto-aplicação de tipo mas acima do
+ * limiar de índices, ou o documento já tinha outro tipo confirmado manualmente
+ * antes).
  *
  * BEST-EFFORT: qualquer erro (LLM fora do ar, resposta inválida, banco) é
  * logado como `warn` e NÃO derruba o pipeline — o documento já está READY.

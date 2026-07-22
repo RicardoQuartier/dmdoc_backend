@@ -563,10 +563,14 @@ export interface MergeSuggestedIndexValuesResult {
  * Mescla valores de índice SUGERIDOS pela IA nos valores já CONFIRMADOS de um
  * documento — núcleo puro (sem banco), reaproveitado por TODOS os pontos de
  * auto-aplicação (upload/reprocessamento individual, reprocessamento em lote,
- * `PATCH /documents/:id` ao definir o tipo, endpoint sob demanda). Só preenche
- * campos ainda vazios (`undefined`/`null`/string vazia) — nunca sobrescreve um
- * valor já confirmado manualmente. Mesma regra do merge manual de tags
- * (`mergeConfirmedTags` em `@dmdoc/shared-types`).
+ * `PATCH /documents/:id` ao definir o tipo, endpoint sob demanda).
+ *
+ * COM SOBRESCRITA (decisão do Owner, 2026-07-22): um campo sugerido substitui
+ * o valor já confirmado, mesmo que este já esteja preenchido — só é ignorado
+ * quando a sugestão desta rodada vier vazia (`rawValue === ''`) ou quando o
+ * valor coercionado for idêntico ao já confirmado (não conta como aplicação).
+ * Isso preserva o valor confirmado exatamente quando a IA não tem nada de novo
+ * a oferecer para aquele campo nesta rodada.
  */
 export function mergeSuggestedIndexValues(
   currentIndexValues: Record<string, string | number | null>,
@@ -577,11 +581,11 @@ export function mergeSuggestedIndexValues(
   const merged: Record<string, string | number | null> = { ...currentIndexValues };
   let appliedCount = 0;
   for (const [fieldName, rawValue] of Object.entries(suggestedValues)) {
-    const existing = merged[fieldName];
-    const isEmpty = existing === undefined || existing === null || existing === '';
-    if (!isEmpty || rawValue === '') continue;
+    if (rawValue === '') continue;
     const fieldType = fieldTypeByName.get(fieldName);
-    merged[fieldName] = fieldType ? coerceIndexValueForField(fieldType, rawValue) : rawValue;
+    const newValue = fieldType ? coerceIndexValueForField(fieldType, rawValue) : rawValue;
+    if (merged[fieldName] === newValue) continue;
+    merged[fieldName] = newValue;
     appliedCount += 1;
   }
   return { merged, appliedCount };

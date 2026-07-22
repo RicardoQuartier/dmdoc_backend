@@ -1699,8 +1699,9 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     // o NOVO tipo — aguardando (o usuário verá os valores pré-preenchidos na
     // resposta). Best-effort: respeita `indexSuggestionEnabled`, grava
     // `document_content.index_suggestion`; com `aiIndexAutoApplyEnabled`
-    // ligada, também mescla em `documents.index_values` (só campos vazios —
-    // aqui o tipo já é sempre o CONFIRMADO, sem o problema do "tipo órfão" do
+    // ligada, também mescla em `documents.index_values` COM SOBRESCRITA (campo
+    // a campo, substitui valor já confirmado quando a sugestão vier preenchida
+    // — aqui o tipo já é sempre o CONFIRMADO, sem o problema do "tipo órfão" do
     // gatilho automático de upload). NUNCA quebra o PATCH — falha de IA ⇒ 200
     // com o tipo salvo, sem sugestão.
     // -----------------------------------------------------------------------
@@ -2358,7 +2359,8 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
   // worker. Requer `documentTypeId` já definido (checado pelo próprio service
   // `suggestDocumentIndexes`, que lança `ValidationError` caso contrário). Com
   // `aiIndexAutoApplyEnabled` ligada, mescla os valores sugeridos em
-  // `documents.index_values` (só os campos ainda vazios).
+  // `documents.index_values` COM SOBRESCRITA (campo a campo, substitui um
+  // valor já confirmado quando a sugestão desta rodada vier preenchida).
   // =========================================================================
   app.post('/documents/:id/suggest-indexes', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
@@ -2451,11 +2453,13 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     // 3.1 Aplicação automática (gate: aiIndexAutoApplyEnabled) — o tipo aqui já
     //     é sempre o CONFIRMADO (pré-condição do próprio service), então não há
     //     o problema do "tipo órfão" do gatilho automático de upload. Mescla os
-    //     valores sugeridos em `documents.index_values`, campo a campo, só nos
-    //     que ainda estão vazios — nunca sobrescreve um valor já confirmado.
-    //     Busca `index_values` FRESCO (não o `doc` resolvido no passo 1, que
-    //     pode estar desatualizado após a chamada ao LLM) para minimizar a
-    //     janela de corrida com um PATCH concorrente.
+    //     valores sugeridos em `documents.index_values`, campo a campo, COM
+    //     SOBRESCRITA — substitui um valor já confirmado quando a sugestão
+    //     desta rodada vier preenchida; só preserva o valor atual quando a IA
+    //     não sugerir nada de novo para aquele campo. Busca `index_values`
+    //     FRESCO (não o `doc` resolvido no passo 1, que pode estar
+    //     desatualizado após a chamada ao LLM) para minimizar a janela de
+    //     corrida com um PATCH concorrente.
     // ------------------------------------------------------------------
     let appliedIndexValues: Record<string, string | number | null> | undefined;
     if (aiFlags.indexAutoApplyEnabled) {
@@ -2500,8 +2504,9 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
   // processado. Persiste `document_content.type_suggestion` (e o
   // `documents.suggested_title`, quando a feature de título está ligada); com
   // `aiClassificationAutoApplyEnabled`/`aiTitleAutoApplyEnabled` ligadas,
-  // também preenche `document_type_id`/`title` quando ainda vazios (nunca
-  // sobrescreve uma escolha manual já existente).
+  // SUBSTITUI `document_type_id`/`title` pela sugestão desta rodada mesmo já
+  // havendo uma escolha confirmada — só preserva o valor atual quando a
+  // sugestão desta rodada vier vazia/nula ou (tipo) com confiança insuficiente.
   // Espelha o guard/escopo de `POST /documents/:id/suggest-indexes`.
   // =========================================================================
   app.post('/documents/:id/classify', { preHandler: app.authenticate }, async (request, reply) => {
@@ -2593,11 +2598,11 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
 
     // ------------------------------------------------------------------
     // 3.1 Aplicação automática de TIPO e TÍTULO (aiClassificationAutoApplyEnabled
-    //     / aiTitleAutoApplyEnabled) — mesmo padrão de auto-apply já usado em
-    //     POST /documents/:id/generate-tags: preenche document_type_id/title
-    //     quando ainda VAZIOS, sem exigir clique manual do usuário. Cada UPDATE
-    //     é guiado por WHERE ... IS NULL / COALESCE — race-safe contra um PATCH
-    //     concorrente. Nunca sobrescreve uma confirmação já existente.
+    //     / aiTitleAutoApplyEnabled), COM SOBRESCRITA (decisão do Owner,
+    //     2026-07-22): substitui document_type_id/title pela sugestão desta
+    //     rodada mesmo já havendo um valor confirmado. Só preserva o valor
+    //     atual quando a sugestão desta rodada vier vazia/nula ou (no caso do
+    //     tipo) com confiança abaixo do limiar — o gate abaixo garante isso.
     // ------------------------------------------------------------------
     let appliedType: { documentTypeId: string; documentTypeName: string | null } | undefined;
     if (
@@ -2610,7 +2615,6 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         SET document_type_id = ${result.typeSuggestion.documentTypeId}
         WHERE id = ${id}
           AND tenant_id = ${tenantId}
-          AND document_type_id IS NULL
       `;
       if (applied.count > 0) {
         appliedType = {
@@ -2624,10 +2628,9 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     if (aiFlags.titleAutoApplyEnabled && result.suggestedTitle !== null) {
       const applied = await sql`
         UPDATE documents
-        SET title = COALESCE(title, ${result.suggestedTitle})
+        SET title = ${result.suggestedTitle}
         WHERE id = ${id}
           AND tenant_id = ${tenantId}
-          AND title IS NULL
       `;
       if (applied.count > 0) {
         appliedTitle = result.suggestedTitle;

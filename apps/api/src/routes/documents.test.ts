@@ -2927,8 +2927,12 @@ describe('PATCH /documents/:id — título de exibição (Fase 8.1)', () => {
 
 // ---------------------------------------------------------------------------
 // POST /documents/:id/classify — classificação automática de tipo por IA
-// (Fase 8, entregável #61). Re-sugere o tipo sob demanda; CONSULTIVO — nunca
-// sobrescreve documents.document_type_id.
+// (Fase 8, entregável #61). Re-sugere o tipo sob demanda; sempre PERSISTE a
+// sugestão consultiva (type_suggestion/suggested_title) e, com as flags de
+// auto-aplicação ligadas, SOBRESCREVE document_type_id/title CONFIRMADOS pela
+// sugestão desta rodada (decisão do Owner, 2026-07-22) — só preserva o valor
+// já confirmado quando a sugestão desta rodada vier vazia/nula (ou, no caso
+// do tipo, com confiança abaixo do limiar).
 // ---------------------------------------------------------------------------
 
 describe('POST /documents/:id/classify (Fase 8)', () => {
@@ -3045,9 +3049,10 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     expect(body.appliedTitle).toBe('Contrato de Serviço');
 
     // Persistência: type_suggestion/suggested_title (consultivo) E
-    // document_type_id/title (confirmados, auto-aplicados por serem os
-    // primeiros valores — nunca sobrescrevem uma confirmação manual já
-    // existente, ver teste "não sobrescreve um tipo manual JÁ definido").
+    // document_type_id/title (confirmados, auto-aplicados aqui por serem os
+    // primeiros valores — mas a SOBRESCRITA vale mesmo quando já há uma
+    // confirmação manual anterior, ver teste "SOBRESCREVE um tipo manual JÁ
+    // definido quando a IA sugere um novo tipo com confiança suficiente").
     const rows = await testDb.db<
       Array<{
         document_type_id: string | null;
@@ -3161,9 +3166,11 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     expect(body.typeSuggestion.confidence).toBe(0);
   });
 
-  it('não sobrescreve um tipo manual JÁ definido', async () => {
+  it('SOBRESCREVE um tipo manual JÁ definido quando a IA sugere um novo tipo com confiança suficiente', async () => {
     await makeTypeVisibleInDeptA();
     const docId = await seedProcessedDoc({ documentTypeId: GLOBAL_DOC_TYPE_ID });
+    // Título já confirmado manualmente antes da reclassificação.
+    await testDb.db`UPDATE documents SET title = 'Título confirmado manualmente' WHERE id = ${docId}`;
     fakeLlmChat.mockResolvedValueOnce(
       chatResult({ documentTypeName: 'Contrato A', confidence: 0.95, suggestedTitle: 'Novo Título' })
     );
@@ -3175,12 +3182,48 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     });
 
     expect(res.statusCode).toBe(200);
-    // A IA sugeriu 'Contrato A' (DOC_TYPE_ID), mas o tipo manual permanece.
-    expect(res.json().typeSuggestion.documentTypeId).toBe(DOC_TYPE_ID);
-    const rows = await testDb.db<Array<{ document_type_id: string | null }>>`
-      SELECT document_type_id FROM documents WHERE id = ${docId}
+    const body = res.json();
+    // A IA sugeriu 'Contrato A' (DOC_TYPE_ID) com confiança suficiente.
+    expect(body.typeSuggestion.documentTypeId).toBe(DOC_TYPE_ID);
+    // SOBRESCRITA (decisão do Owner, 2026-07-22): document_type_id/title
+    // CONFIRMADOS são substituídos pela sugestão desta rodada, mesmo já
+    // havendo uma escolha manual anterior.
+    expect(body.appliedType).toEqual({ documentTypeId: DOC_TYPE_ID, documentTypeName: 'Contrato A' });
+    expect(body.appliedTitle).toBe('Novo Título');
+    const rows = await testDb.db<Array<{ document_type_id: string | null; title: string | null }>>`
+      SELECT document_type_id, title FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]!.document_type_id).toBe(DOC_TYPE_ID);
+    expect(rows[0]!.title).toBe('Novo Título');
+  });
+
+  it('preserva o tipo E o título confirmados quando a reclassificação não encontra tipo/título nesta rodada', async () => {
+    await makeTypeVisibleInDeptA();
+    const docId = await seedProcessedDoc({ documentTypeId: GLOBAL_DOC_TYPE_ID });
+    await testDb.db`UPDATE documents SET title = 'Título confirmado manualmente' WHERE id = ${docId}`;
+    // LLM devolve um nome fora do catálogo (documentTypeId vira null) e nenhum título.
+    fakeLlmChat.mockResolvedValueOnce(
+      chatResult({ documentTypeName: 'Nota Fiscal Eletrônica', confidence: 0.8, suggestedTitle: null })
+    );
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/documents/${docId}/classify`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.typeSuggestion.documentTypeId).toBeNull();
+    expect(body.suggestedTitle).toBeNull();
+    // Sem sugestão válida nesta rodada ⇒ nada aplicado, tipo/título preservados.
+    expect(body).not.toHaveProperty('appliedType');
+    expect(body).not.toHaveProperty('appliedTitle');
+    const rows = await testDb.db<Array<{ document_type_id: string | null; title: string | null }>>`
+      SELECT document_type_id, title FROM documents WHERE id = ${docId}
     `;
     expect(rows[0]!.document_type_id).toBe(GLOBAL_DOC_TYPE_ID);
+    expect(rows[0]!.title).toBe('Título confirmado manualmente');
   });
 
   it('nenhum tipo: LLM devolve nome fora do catálogo → sugestão null persistida', async () => {
@@ -3264,7 +3307,10 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
 // ===========================================================================
 // GATILHO 2 (Fase 7, T-16): PATCH /documents/:id que DEFINE/TROCA o tipo dispara
 // a sugestão automática de índices (aguardando, best-effort, respeitando a
-// feature). CONSULTIVO: grava só `index_suggestion`, nunca valores confirmados.
+// feature). Sempre grava `index_suggestion` (consultivo); com
+// `aiIndexAutoApplyEnabled` ligada (default), também SOBRESCREVE
+// `index_values` campo a campo (decisão do Owner, 2026-07-22) — só preserva
+// um campo específico quando a sugestão desta rodada não o incluir.
 // ===========================================================================
 describe('PATCH /documents/:id — sugestão automática de índices ao definir tipo (Fase 7)', () => {
   /** ChatResult fake do provedor para a sugestão de índices (formato suggest-indexes-v1). */
@@ -3369,6 +3415,68 @@ describe('PATCH /documents/:id — sugestão automática de índices ao definir 
     `;
     expect(content[0]!.index_suggestion).not.toBeNull();
     expect((content[0]!.index_suggestion!['values'] as Record<string, string>)['Cliente']).toBe('ACME Ltda');
+  });
+
+  it('SOBRESCREVE um valor de índice já confirmado quando a IA sugere um novo valor nesta rodada', async () => {
+    await seedIndexFields();
+    const docId = await seedProcessedDocNoType();
+    // "Cliente" já tinha um valor confirmado manualmente antes de definir o tipo.
+    await testDb.db`
+      UPDATE documents SET index_values = ${testDb.db.json({ Cliente: 'Valor antigo confirmado' })}
+      WHERE id = ${docId}
+    `;
+    fakeLlmChat.mockResolvedValueOnce(
+      suggestChatResult([{ name: 'Cliente', value: 'ACME Ltda', confidence: 0.92 }])
+    );
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { documentTypeId: DOC_TYPE_ID },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Record<string, unknown>;
+    // SOBRESCRITA (decisão do Owner, 2026-07-22): a sugestão desta rodada
+    // substitui o valor de "Cliente" já confirmado.
+    expect(body.appliedIndexValues).toEqual({ Cliente: 'ACME Ltda' });
+
+    const rows = await testDb.db<Array<{ index_values: Record<string, unknown> }>>`
+      SELECT index_values FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]!.index_values).toEqual({ Cliente: 'ACME Ltda' });
+  });
+
+  it('PRESERVA um campo de índice específico já confirmado quando a IA não sugere nada de novo para ele nesta rodada', async () => {
+    await seedIndexFields();
+    const docId = await seedProcessedDocNoType();
+    await testDb.db`
+      UPDATE documents SET index_values = ${testDb.db.json({ Cliente: 'Valor antigo confirmado', Valor: 999 })}
+      WHERE id = ${docId}
+    `;
+    // A IA só sugere "Cliente" nesta rodada — "Valor" fica de fora.
+    fakeLlmChat.mockResolvedValueOnce(
+      suggestChatResult([{ name: 'Cliente', value: 'ACME Ltda', confidence: 0.92 }])
+    );
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { documentTypeId: DOC_TYPE_ID },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Record<string, unknown>;
+    // "Cliente" sobrescrito pela sugestão desta rodada; "Valor" preservado
+    // (a IA não sugeriu nada de novo para ele nesta rodada).
+    expect(body.appliedIndexValues).toEqual({ Cliente: 'ACME Ltda', Valor: 999 });
+
+    const rows = await testDb.db<Array<{ index_values: Record<string, unknown> }>>`
+      SELECT index_values FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]!.index_values).toEqual({ Cliente: 'ACME Ltda', Valor: 999 });
   });
 
   it('NÃO auto-aplica em index_values quando aiIndexAutoApplyEnabled está desligada para a empresa', async () => {

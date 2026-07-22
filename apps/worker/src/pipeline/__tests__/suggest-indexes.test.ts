@@ -30,6 +30,11 @@ vi.mock('@dmdoc/llm-provider', () => ({
   suggestIndexValues: suggestIndexValuesMock,
   SUGGEST_INDEXES_PROMPT: { version: 'suggest-indexes-v1' },
   // Implementação real (lógica pura) — vale exercitar o merge de verdade.
+  // COM SOBRESCRITA (decisão do Owner, 2026-07-22): espelha
+  // `mergeSuggestedIndexValues` de `@dmdoc/llm-provider` — substitui um campo
+  // já confirmado quando a sugestão desta rodada vier preenchida; só preserva
+  // quando a sugestão vier vazia para aquele campo ou o valor coercionado for
+  // idêntico ao já confirmado.
   mergeSuggestedIndexValues: (
     currentIndexValues: Record<string, string | number | null>,
     suggestedValues: Record<string, string>,
@@ -39,12 +44,12 @@ vi.mock('@dmdoc/llm-provider', () => ({
     const merged: Record<string, string | number | null> = { ...currentIndexValues };
     let appliedCount = 0;
     for (const [fieldName, rawValue] of Object.entries(suggestedValues)) {
-      const existing = merged[fieldName];
-      const isEmpty = existing === undefined || existing === null || existing === '';
-      if (!isEmpty || rawValue === '') continue;
+      if (rawValue === '') continue;
       const fieldType = fieldTypeByName.get(fieldName);
-      merged[fieldName] =
+      const newValue =
         fieldType === 'NUMBER' ? (Number.isFinite(Number(rawValue)) ? Number(rawValue) : rawValue) : rawValue;
+      if (merged[fieldName] === newValue) continue;
+      merged[fieldName] = newValue;
       appliedCount += 1;
     }
     return { merged, appliedCount };
@@ -322,6 +327,44 @@ describe('suggestIndexesStep — auto-aplicação de índices (gate: aiIndexAuto
     const indexUpdate = documentsUpdates.find((u) => u.query.includes('index_values = ?'));
     expect(indexUpdate).toBeDefined();
     expect(indexUpdate!.values[0]).toEqual({ Cliente: 'ACME Ltda' });
+  });
+
+  it('SOBRESCREVE um campo de índice já confirmado quando o tipo confirmado é o sugerido e a sugestão vem preenchida', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValue({ indexSuggestionEnabled: true, indexAutoApplyEnabled: true });
+    suggestIndexValuesMock.mockResolvedValue(coreResult());
+    const { sql, documentsUpdates } = makeSqlStub({
+      doc: { document_type_id: SUGGESTED_TYPE_ID, index_values: { Cliente: 'Valor antigo confirmado' } },
+    });
+
+    await suggestIndexesStep(
+      { tenantId: TENANT_ID, documentId: DOCUMENT_ID, typeSuggestion: makeTypeSuggestion(), minConfidence: 0.5 },
+      { sql, llmProvider: {} as never, logger: makeSilentLogger() },
+    );
+
+    const indexUpdate = documentsUpdates.find((u) => u.query.includes('index_values = ?'));
+    expect(indexUpdate).toBeDefined();
+    expect(indexUpdate!.values[0]).toEqual({ Cliente: 'ACME Ltda' });
+  });
+
+  it('PRESERVA um campo de índice específico já confirmado quando a sugestão desta rodada não o inclui', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValue({ indexSuggestionEnabled: true, indexAutoApplyEnabled: true });
+    // Esta rodada só sugere "Cliente" — "Fornecedor" fica de fora.
+    suggestIndexValuesMock.mockResolvedValue(coreResult());
+    const { sql, documentsUpdates } = makeSqlStub({
+      doc: {
+        document_type_id: SUGGESTED_TYPE_ID,
+        index_values: { Cliente: 'Valor antigo', Fornecedor: 'Fornecedor confirmado antes' },
+      },
+    });
+
+    await suggestIndexesStep(
+      { tenantId: TENANT_ID, documentId: DOCUMENT_ID, typeSuggestion: makeTypeSuggestion(), minConfidence: 0.5 },
+      { sql, llmProvider: {} as never, logger: makeSilentLogger() },
+    );
+
+    const indexUpdate = documentsUpdates.find((u) => u.query.includes('index_values = ?'));
+    expect(indexUpdate).toBeDefined();
+    expect(indexUpdate!.values[0]).toEqual({ Cliente: 'ACME Ltda', Fornecedor: 'Fornecedor confirmado antes' });
   });
 
   it('NÃO aplica quando o tipo confirmado é outro (órfão) — índice de um tipo que não é o oficial', async () => {

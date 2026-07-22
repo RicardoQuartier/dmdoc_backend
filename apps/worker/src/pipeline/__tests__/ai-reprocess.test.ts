@@ -37,6 +37,11 @@ vi.mock('@dmdoc/llm-provider', () => ({
     }
     return raw;
   },
+  // COM SOBRESCRITA (decisão do Owner, 2026-07-22): espelha
+  // `mergeSuggestedIndexValues` de `@dmdoc/llm-provider` — substitui um campo
+  // já confirmado quando a sugestão desta rodada vier preenchida; só preserva
+  // quando a sugestão vier vazia para aquele campo, o campo nem aparecer na
+  // sugestão desta rodada, ou o valor coercionado for idêntico ao já confirmado.
   mergeSuggestedIndexValues: (
     currentIndexValues: Record<string, string | number | null>,
     suggestedValues: Record<string, string>,
@@ -46,12 +51,12 @@ vi.mock('@dmdoc/llm-provider', () => ({
     const merged: Record<string, string | number | null> = { ...currentIndexValues };
     let appliedCount = 0;
     for (const [fieldName, rawValue] of Object.entries(suggestedValues)) {
-      const existing = merged[fieldName];
-      const isEmpty = existing === undefined || existing === null || existing === '';
-      if (!isEmpty || rawValue === '') continue;
+      if (rawValue === '') continue;
       const fieldType = fieldTypeByName.get(fieldName);
-      merged[fieldName] =
+      const newValue =
         fieldType === 'NUMBER' ? (Number.isFinite(Number(rawValue)) ? Number(rawValue) : rawValue) : rawValue;
+      if (merged[fieldName] === newValue) continue;
+      merged[fieldName] = newValue;
       appliedCount += 1;
     }
     return { merged, appliedCount };
@@ -325,14 +330,20 @@ describe('runAiReprocessDocument — best-effort por etapa', () => {
   });
 });
 
-describe('runAiReprocessDocument — auto-aplicação de tipo/título (gate por flag)', () => {
-  it('auto-aplica document_type_id quando classificationAutoApplyEnabled está ligada', async () => {
-    const { sql, documentsUpdates } = makeSqlStub();
+describe('runAiReprocessDocument — auto-aplicação de tipo/título (gate por flag, COM SOBRESCRITA)', () => {
+  it('SOBRESCREVE document_type_id quando classificationAutoApplyEnabled está ligada, mesmo já havendo tipo confirmado', async () => {
+    // Documento já tinha um tipo confirmado (diferente do sugerido) — a
+    // reclassificação com confiança suficiente substitui o tipo confirmado.
+    const { sql, documentsUpdates } = makeSqlStub({
+      doc: { department_id: 'dep', document_type_id: 'outro-tipo-confirmado-antes', status: 'READY' },
+    });
     await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['title'] }, makeDeps(sql));
 
     const typeUpdate = documentsUpdates.find((u) => u.query.includes('document_type_id = ?'));
     expect(typeUpdate).toBeDefined();
     expect(typeUpdate!.values[0]).toBe(TYPE_ID);
+    // SOBRESCRITA (decisão do Owner, 2026-07-22): sem WHERE ... IS NULL.
+    expect(typeUpdate!.query).not.toContain('is null');
   });
 
   it('NÃO auto-aplica document_type_id quando classificationAutoApplyEnabled está desligada', async () => {
@@ -354,14 +365,32 @@ describe('runAiReprocessDocument — auto-aplicação de tipo/título (gate por 
     expect(documentsUpdates.find((u) => u.query.includes('document_type_id = ?'))).toBeUndefined();
   });
 
-  it('auto-aplica title (via COALESCE) quando titleAutoApplyEnabled está ligada', async () => {
+  it('preserva document_type_id quando a reclassificação não sugere tipo (documentTypeId null), mesmo com a flag ligada', async () => {
+    classifyDocumentMock.mockResolvedValue({ ...classifyOk(), typeSuggestion: { ...classifyOk().typeSuggestion, documentTypeId: null, confidence: 0 } });
     const { sql, documentsUpdates } = makeSqlStub();
     await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['title'] }, makeDeps(sql));
 
-    const titleUpdate = documentsUpdates.find((u) => u.query.includes('coalesce(title'));
-    expect(titleUpdate).toBeDefined();
-    // suggested_title, cost_usd_cents(+delta), title-a-aplicar, id, tenant_id
-    expect(titleUpdate!.values[2]).toBe('Contrato de Locação');
+    expect(documentsUpdates.find((u) => u.query.includes('document_type_id = ?'))).toBeUndefined();
+  });
+
+  it('SOBRESCREVE title (sem COALESCE) quando titleAutoApplyEnabled está ligada, mesmo já havendo título confirmado', async () => {
+    const { sql, documentsUpdates } = makeSqlStub({
+      doc: { department_id: 'dep', document_type_id: TYPE_ID, status: 'READY', title: 'Título confirmado antes' },
+    });
+    await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['title'] }, makeDeps(sql));
+
+    // Duas UPDATEs separadas: uma sempre grava suggested_title + custo, outra
+    // sobrescreve title só quando titleAutoApplyEnabled && suggestedTitle !== null.
+    const suggestedTitleUpdate = documentsUpdates.find((u) => u.query.includes('suggested_title = ?'));
+    expect(suggestedTitleUpdate).toBeDefined();
+    expect(suggestedTitleUpdate!.values[0]).toBe('Contrato de Locação');
+
+    const titleOverwriteUpdate = documentsUpdates.find((u) => u.query.includes('set title = ?'));
+    expect(titleOverwriteUpdate).toBeDefined();
+    expect(titleOverwriteUpdate!.values[0]).toBe('Contrato de Locação');
+    // SOBRESCRITA (decisão do Owner, 2026-07-22): nem COALESCE nem IS NULL.
+    expect(titleOverwriteUpdate!.query).not.toContain('coalesce');
+    expect(titleOverwriteUpdate!.query).not.toContain('is null');
   });
 
   it('NÃO auto-aplica title quando titleAutoApplyEnabled está desligada (mas suggested_title continua sendo gravado)', async () => {
@@ -369,10 +398,20 @@ describe('runAiReprocessDocument — auto-aplicação de tipo/título (gate por 
     const { sql, documentsUpdates } = makeSqlStub();
     await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['title'] }, makeDeps(sql));
 
-    const titleUpdate = documentsUpdates.find((u) => u.query.includes('coalesce(title'));
-    expect(titleUpdate).toBeDefined();
-    expect(titleUpdate!.values[2]).toBeNull();
-    expect(titleUpdate!.values[0]).toBe('Contrato de Locação'); // suggested_title sempre gravado
+    expect(documentsUpdates.find((u) => u.query.includes('set title = ?'))).toBeUndefined();
+    const suggestedTitleUpdate = documentsUpdates.find((u) => u.query.includes('suggested_title = ?'));
+    expect(suggestedTitleUpdate).toBeDefined();
+    expect(suggestedTitleUpdate!.values[0]).toBe('Contrato de Locação'); // suggested_title sempre gravado
+  });
+
+  it('preserva o title confirmado quando a sugestão desta rodada vier nula, mesmo com titleAutoApplyEnabled ligada', async () => {
+    classifyDocumentMock.mockResolvedValue({ ...classifyOk(), suggestedTitle: null });
+    const { sql, documentsUpdates } = makeSqlStub({
+      doc: { department_id: 'dep', document_type_id: TYPE_ID, status: 'READY', title: 'Título confirmado antes' },
+    });
+    await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['title'] }, makeDeps(sql));
+
+    expect(documentsUpdates.find((u) => u.query.includes('set title = ?'))).toBeUndefined();
   });
 });
 
@@ -396,15 +435,37 @@ describe('runAiReprocessDocument — auto-aplicação de índices (gate por flag
     expect(documentsUpdates.find((u) => u.query.includes('index_values = ?'))).toBeUndefined();
   });
 
-  it('não sobrescreve um campo de índice já confirmado — só preenche o que está vazio', async () => {
+  it('SOBRESCREVE um campo de índice já confirmado quando a sugestão desta rodada vier preenchida', async () => {
     const { sql, documentsUpdates } = makeSqlStub({
       doc: { department_id: 'dep', document_type_id: TYPE_ID, status: 'READY', index_values: { vencimento: '2020-01-01' } },
       indexFields: INDEX_FIELDS,
     });
     await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['indexes'] }, makeDeps(sql));
 
-    // Já preenchido ⇒ merge não altera nada ⇒ nenhum UPDATE de index_values disparado.
-    expect(documentsUpdates.find((u) => u.query.includes('index_values = ?'))).toBeUndefined();
+    // Sugestão desta rodada ('2026-12-31') substitui o valor já confirmado.
+    const indexUpdate = documentsUpdates.find((u) => u.query.includes('index_values = ?'));
+    expect(indexUpdate).toBeDefined();
+    expect(indexUpdate!.values[0]).toEqual({ vencimento: '2026-12-31' });
+  });
+
+  it('PRESERVA um campo de índice específico quando não há sugestão nesta rodada para ele', async () => {
+    // suggestIndexValuesMock (beforeEach) só sugere "vencimento" — "cliente"
+    // fica de fora desta rodada e deve permanecer com o valor já confirmado.
+    const fieldsWithCliente = [...INDEX_FIELDS, { id: 'f2', name: 'cliente', field_type: 'TEXT' as const }];
+    const { sql, documentsUpdates } = makeSqlStub({
+      doc: {
+        department_id: 'dep',
+        document_type_id: TYPE_ID,
+        status: 'READY',
+        index_values: { vencimento: '2020-01-01', cliente: 'ACME confirmado antes' },
+      },
+      indexFields: fieldsWithCliente,
+    });
+    await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['indexes'] }, makeDeps(sql));
+
+    const indexUpdate = documentsUpdates.find((u) => u.query.includes('index_values = ?'));
+    expect(indexUpdate).toBeDefined();
+    expect(indexUpdate!.values[0]).toEqual({ vencimento: '2026-12-31', cliente: 'ACME confirmado antes' });
   });
 
   it('reconsulta o tipo fresco: título e índices no MESMO lote aplicam índices mesmo quando o tipo era null antes e foi auto-aplicado pela etapa title', async () => {
