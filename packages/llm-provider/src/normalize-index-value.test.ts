@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeDatePtBr, normalizeNumberPtBr } from './normalize-index-value.js';
+import { normalizeDatePtBr, normalizeNumberPtBr } from './suggest-index-values.js';
 
 describe('normalizeDatePtBr', () => {
   it('mantém formato ISO já válido', () => {

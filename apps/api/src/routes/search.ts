@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { FastifyPluginAsync, FastifyReply, FastifyBaseLogger } from 'fastify';
 import type { Sql } from '@dmdoc/db-pg';
 import { SearchRequestSchema } from '@dmdoc/shared-types';
-import type { SearchChunk, Citation } from '@dmdoc/shared-types';
+import type { SearchChunk, SearchChunkIndexValue, Citation } from '@dmdoc/shared-types';
 import { hybridSearch, lexicalSearch, vectorSearch, documentMetadataSearch } from '@dmdoc/db-pg';
 import type { ChunkSearchResult } from '@dmdoc/db-pg';
 import { createLLMProvider } from '@dmdoc/llm-provider';
@@ -14,20 +14,35 @@ import { parseCitations } from '../services/citation-parser.js';
 import { RAG_ANSWER_PROMPT } from '../prompts/rag-answer.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
 import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
+import { resolveIndexFieldDisplayLabel } from '../lib/index-fields.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais
 // ---------------------------------------------------------------------------
 
-type DocRow = {
+/** Linha da query em lote de metadados de documento para enriquecer chunks. */
+type DocMetaRow = {
   id: string;
-  tenant_id: string;
-  department_id: string;
+  original_filename: string;
+  title: string | null;
   document_type_id: string | null;
-  tags: string[];
   index_values: Record<string, string | number | null> | null;
-  status: string;
-  deleted: boolean;
+};
+
+/** Campo de índice showOnSearch de um tipo de documento (query em lote). */
+type IndexFieldRow = {
+  document_type_id: string;
+  name: string;
+  label: string | null;
+  field_type: string;
+  sort_order: number;
+};
+
+/** Metadados por documento montados em memória para o enriquecimento. */
+type DocMeta = {
+  originalFilename: string;
+  title: string | null;
+  indexValues: SearchChunkIndexValue[];
 };
 
 // ---------------------------------------------------------------------------
@@ -383,30 +398,94 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
 
     const allSearchResults = [...searchResults, ...metadataChunks];
 
-    // Enriquece chunks com o nome original do documento
+    // Enriquece chunks com nome original, título confirmado e valores de índice
+    // "que aparecem na busca" (showOnSearch). Tudo em LOTE (sem N+1).
     const uniqueDocIds = [...new Set(allSearchResults.map((r) => r.documentId))];
 
-    const docNameMap = new Map<string, string>();
+    const docMetaMap = new Map<string, DocMeta>();
     if (uniqueDocIds.length > 0) {
-      const docRows = await sql<Array<{ id: string; original_filename: string }>>`
-        SELECT id, original_filename
-        FROM documents
-        WHERE id = ANY(${uniqueDocIds}::uuid[])
-          AND deleted = false
+      // Multi-tenancy inegociável: além do documentId (que a busca já autorizou),
+      // aplicamos o MESMO filtro de tenant/allowedTenantIds. Nenhum título/índice
+      // de outra empresa pode entrar por esta query em lote.
+      const tenantFilter =
+        multiTenantIds !== undefined
+          ? sql`AND d.tenant_id = ANY(${multiTenantIds}::uuid[])`
+          : singleTenantId !== undefined
+            ? sql`AND d.tenant_id = ${singleTenantId}`
+            : sql``;
+
+      const docRows = await sql<DocMetaRow[]>`
+        SELECT d.id, d.original_filename, d.title, d.document_type_id, d.index_values
+        FROM documents d
+        WHERE d.id = ANY(${uniqueDocIds}::uuid[])
+          AND d.deleted = false
+          ${tenantFilter}
       `;
-      for (const d of docRows) docNameMap.set(d.id, d.original_filename);
+
+      // Campos de índice showOnSearch dos tipos envolvidos — uma query em lote.
+      const typeIds = [
+        ...new Set(
+          docRows
+            .map((d) => d.document_type_id)
+            .filter((id): id is string => id !== null),
+        ),
+      ];
+
+      const fieldsByType = new Map<string, IndexFieldRow[]>();
+      if (typeIds.length > 0) {
+        const fieldRows = await sql<IndexFieldRow[]>`
+          SELECT document_type_id, name, label, field_type, sort_order
+          FROM document_type_index_fields
+          WHERE document_type_id = ANY(${typeIds}::uuid[])
+            AND show_on_search = true
+            AND deleted = false
+          ORDER BY sort_order ASC
+        `;
+        for (const f of fieldRows) {
+          const list = fieldsByType.get(f.document_type_id) ?? [];
+          list.push(f);
+          fieldsByType.set(f.document_type_id, list);
+        }
+      }
+
+      for (const d of docRows) {
+        const fields =
+          d.document_type_id !== null ? fieldsByType.get(d.document_type_id) ?? [] : [];
+        const values = d.index_values ?? {};
+        const indexValues: SearchChunkIndexValue[] = [];
+        for (const field of fields) {
+          const raw = values[field.name];
+          if (raw === undefined || raw === null) continue;
+          indexValues.push({
+            fieldName: field.name,
+            label: resolveIndexFieldDisplayLabel(field),
+            fieldType: field.field_type,
+            value: raw,
+          });
+        }
+        docMetaMap.set(d.id, {
+          originalFilename: d.original_filename,
+          title: d.title,
+          indexValues,
+        });
+      }
     }
 
-    const chunks: SearchChunk[] = allSearchResults.map((r) => ({
-      documentId: r.documentId,
-      documentName: docNameMap.get(r.documentId) ?? null,
-      tenantId: r.tenantId,
-      documentTypeName: r.documentTypeName,
-      pageNumber: r.pageNumber,
-      chunkIndex: r.chunkIndex,
-      text: r.text,
-      score: r.score,
-    }));
+    const chunks: SearchChunk[] = allSearchResults.map((r) => {
+      const meta = docMetaMap.get(r.documentId);
+      return {
+        documentId: r.documentId,
+        documentName: meta?.originalFilename ?? null,
+        title: meta?.title ?? null,
+        indexValues: meta?.indexValues ?? [],
+        tenantId: r.tenantId,
+        documentTypeName: r.documentTypeName,
+        pageNumber: r.pageNumber,
+        chunkIndex: r.chunkIndex,
+        text: r.text,
+        score: r.score,
+      };
+    });
 
     if (!generateAnswer || chunks.length === 0) {
       log.info({ generateAnswer, chunksFound: chunks.length }, 'busca sem geração de resposta');

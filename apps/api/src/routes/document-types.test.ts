@@ -180,6 +180,50 @@ describe('POST /document-types/:id/index-fields — grava na tabela normalizada'
     expect(legacyRows[0]!.index_fields).toEqual([]);
   });
 
+  it('sem label explícito, displayLabel é derivado do name (T-15)', async () => {
+    const typeId = await createDocType(tokenAdminA);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/document-types/${typeId}/index-fields`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { name: 'numero_nota', fieldType: 'TEXT', required: false, order: 0 },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { indexFields: Array<Record<string, unknown>> };
+    expect(body.indexFields[0]).toMatchObject({
+      name: 'numero_nota',
+      label: null,
+      displayLabel: 'Numero Nota',
+    });
+  });
+
+  it('com label explícito, displayLabel usa o label (T-15)', async () => {
+    const typeId = await createDocType(tokenAdminA);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/document-types/${typeId}/index-fields`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: {
+        name: 'numero_nota',
+        fieldType: 'TEXT',
+        required: false,
+        order: 0,
+        label: 'Número da Nota Fiscal',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { indexFields: Array<Record<string, unknown>> };
+    expect(body.indexFields[0]).toMatchObject({
+      name: 'numero_nota',
+      label: 'Número da Nota Fiscal',
+      displayLabel: 'Número da Nota Fiscal',
+    });
+  });
+
   it('campo também aparece em GET /document-types (batch fetch)', async () => {
     const typeId = await createDocType(tokenAdminA);
 
@@ -268,6 +312,33 @@ describe('PATCH /document-types/:id/index-fields/:fieldId — atualiza a linha n
       SELECT name, required FROM document_type_index_fields WHERE id = ${fieldId}
     `;
     expect(rows[0]).toMatchObject({ name: 'Campo Editado', required: true });
+  });
+
+  it('editar label reflete no displayLabel (T-15)', async () => {
+    const typeId = await createDocType(tokenAdminA);
+    const createRes = await app.inject({
+      method: 'POST',
+      url: `/document-types/${typeId}/index-fields`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { name: 'data_vencimento', fieldType: 'DATE', required: false, order: 0 },
+    });
+    const created = createRes.json() as { indexFields: Array<Record<string, unknown>> };
+    expect(created.indexFields[0]).toMatchObject({ label: null, displayLabel: 'Data Vencimento' });
+    const fieldId = created.indexFields[0]!['id'] as string;
+
+    const patchRes = await app.inject({
+      method: 'PATCH',
+      url: `/document-types/${typeId}/index-fields/${fieldId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { label: 'Data de Vencimento' },
+    });
+
+    expect(patchRes.statusCode).toBe(200);
+    const body = patchRes.json() as { indexFields: Array<Record<string, unknown>> };
+    expect(body.indexFields[0]).toMatchObject({
+      label: 'Data de Vencimento',
+      displayLabel: 'Data de Vencimento',
+    });
   });
 
   it('404 ao editar campo inexistente', async () => {
@@ -612,5 +683,141 @@ describe('POST /document-types — autorização e unicidade de nome', () => {
     });
     expect(res.statusCode).toBe(201);
     expect((res.json() as { isGlobal: boolean }).isGlobal).toBe(true);
+  });
+});
+
+describe('Sinais de reconhecimento por tipo (recognitionKeywords/recognitionRules)', () => {
+  it('cria tipo de empresa com sinais → persiste e retorna os campos', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/document-types',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: {
+        name: 'Boleto',
+        description: 'Cobrança bancária',
+        recognitionKeywords: ['linha digitável', 'código de barras'],
+        recognitionRules: 'NÃO classifique como Recibo se houver linha digitável.',
+        isGlobal: false,
+        departmentIds: [deptAId],
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as {
+      id: string;
+      recognitionKeywords: string[];
+      recognitionRules: string | null;
+    };
+    expect(body.recognitionKeywords).toEqual(['linha digitável', 'código de barras']);
+    expect(body.recognitionRules).toBe('NÃO classifique como Recibo se houver linha digitável.');
+
+    // Persistência real no banco.
+    const rows = await testDb.db<
+      Array<{ recognition_keywords: string[]; recognition_rules: string | null }>
+    >`
+      SELECT recognition_keywords, recognition_rules FROM document_types WHERE id = ${body.id}
+    `;
+    expect(rows[0]!.recognition_keywords).toEqual(['linha digitável', 'código de barras']);
+    expect(rows[0]!.recognition_rules).toBe('NÃO classifique como Recibo se houver linha digitável.');
+  });
+
+  it('tipo criado SEM sinais tem defaults seguros (array vazio, regras null)', async () => {
+    const typeId = await createDocType(tokenAdminA);
+    const rows = await testDb.db<
+      Array<{ recognition_keywords: string[]; recognition_rules: string | null }>
+    >`
+      SELECT recognition_keywords, recognition_rules FROM document_types WHERE id = ${typeId}
+    `;
+    expect(rows[0]!.recognition_keywords).toEqual([]);
+    expect(rows[0]!.recognition_rules).toBeNull();
+  });
+
+  it('PATCH atualiza os sinais do tipo', async () => {
+    const typeId = await createDocType(tokenAdminA);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/document-types/${typeId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: {
+        recognitionKeywords: ['cnpj', 'valor total'],
+        recognitionRules: 'Fatura tem vencimento; Recibo não.',
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { recognitionKeywords: string[]; recognitionRules: string | null };
+    expect(body.recognitionKeywords).toEqual(['cnpj', 'valor total']);
+    expect(body.recognitionRules).toBe('Fatura tem vencimento; Recibo não.');
+  });
+
+  it('GET /document-types retorna os sinais de cada tipo', async () => {
+    const create = await app.inject({
+      method: 'POST',
+      url: '/document-types',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: {
+        name: 'Fatura',
+        recognitionKeywords: ['vencimento'],
+        isGlobal: false,
+        departmentIds: [deptAId],
+      },
+    });
+    expect(create.statusCode).toBe(201);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/document-types',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const list = res.json() as Array<{ name: string; recognitionKeywords: string[] }>;
+    const fatura = list.find((t) => t.name === 'Fatura');
+    expect(fatura?.recognitionKeywords).toEqual(['vencimento']);
+  });
+
+  it('rejeita quando o número de palavras-chave excede o teto', async () => {
+    const tooMany = Array.from({ length: 25 }, (_, i) => `kw${i}`);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/document-types',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: {
+        name: 'Tipo Excessivo',
+        recognitionKeywords: tooMany,
+        isGlobal: false,
+        departmentIds: [deptAId],
+      },
+    });
+    expect(res.statusCode).toBe(422);
+  });
+
+  it('rejeita quando as regras excedem o teto de caracteres', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/document-types',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: {
+        name: 'Tipo Regra Longa',
+        recognitionRules: 'x'.repeat(501),
+        isGlobal: false,
+        departmentIds: [deptAId],
+      },
+    });
+    expect(res.statusCode).toBe(422);
+  });
+
+  it('isolamento multi-tenant: admin de B não edita sinais de tipo de A (404)', async () => {
+    const typeId = await createDocType(tokenAdminA);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/document-types/${typeId}`,
+      headers: { authorization: `Bearer ${tokenAdminB}` },
+      payload: { recognitionKeywords: ['invasor'] },
+    });
+    expect(res.statusCode).toBe(404);
+
+    // Sinais do tipo de A permanecem intactos (nenhum vazamento de escrita).
+    const rows = await testDb.db<Array<{ recognition_keywords: string[] }>>`
+      SELECT recognition_keywords FROM document_types WHERE id = ${typeId}
+    `;
+    expect(rows[0]!.recognition_keywords).toEqual([]);
   });
 });

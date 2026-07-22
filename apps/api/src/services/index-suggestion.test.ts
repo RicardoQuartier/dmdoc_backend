@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { newId } from '@dmdoc/db-pg';
 import type { ChatResult, LLMProvider } from '@dmdoc/llm-provider';
 import { startTestDb, seedUser, type TestDb } from '../test/helpers.js';
+import { ValidationError } from '../errors/index.js';
 import { suggestDocumentIndexes } from './index-suggestion.js';
 
 // ---------------------------------------------------------------------------
@@ -166,5 +167,73 @@ describe('suggestDocumentIndexes — campos alucinados nunca vazam', () => {
     expect(result.fields.map((f) => f.name)).toEqual(['Cliente', 'Valor']);
     expect(result.fields.every((f) => f.value === null && f.confidence === 0)).toBe(true);
     expect(JSON.stringify(result.fields)).not.toContain('Inexistente');
+  });
+});
+
+/**
+ * Caminho do WORKER (gatilho automático): o service aceita um `documentTypeId`
+ * EXPLÍCITO (o tipo SUGERIDO pela classificação). Nesse caso NÃO lê nem exige
+ * `documents.document_type_id` — CONSULTIVO, roda antes de o usuário confirmar
+ * o tipo. Sem o explícito (caminho on-demand), o comportamento antigo é mantido.
+ */
+describe('suggestDocumentIndexes — documentTypeId explícito (caminho do worker)', () => {
+  /** Doc READY com conteúdo, mas SEM tipo confirmado (document_type_id NULL). */
+  async function seedReadyDocNoType(): Promise<string> {
+    const docId = newId();
+    const hash = crypto.randomBytes(32).toString('hex');
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docId}, ${TENANT}, ${DEPT_ID}, ${null},
+        'contrato.pdf', 'contrato.pdf', ${hash}, 2048, 'application/pdf',
+        ${`tenants/${TENANT}/documents/${hash}/contrato.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${UPLOADER_ID}, NOW(), NOW(), 0, false
+      )
+    `;
+    await testDb.db`
+      INSERT INTO document_content (document_id, tenant_id, full_text, extraction)
+      VALUES (${docId}, ${TENANT}, 'texto completo do contrato', ${testDb.db.json({ engine: 'native', pageCount: 1 })})
+    `;
+    return docId;
+  }
+
+  it('usa o tipo SUGERIDO explícito sem exigir document_type_id confirmado', async () => {
+    const docId = await seedReadyDocNoType();
+    const llm = mockLlm(
+      JSON.stringify({ fields: [{ name: 'Cliente', value: 'ACME Ltda', confidence: 0.9 }] })
+    );
+
+    const result = await suggestDocumentIndexes(
+      { tenantId: TENANT, documentId: docId, documentTypeId: DOC_TYPE_ID },
+      { sql: testDb.db, llmProvider: llm, logger: silentLogger }
+    );
+
+    // Casou os campos do tipo SUGERIDO, mesmo com document_type_id NULL no doc.
+    expect(result.fields.map((f) => f.name)).toEqual(['Cliente', 'Valor']);
+    expect(result.fields.find((f) => f.name === 'Cliente')?.value).toBe('ACME Ltda');
+
+    // CONSULTIVO: não tocou o tipo confirmado (segue NULL).
+    const rows = await testDb.db<Array<{ document_type_id: string | null }>>`
+      SELECT document_type_id FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]!.document_type_id).toBeNull();
+  });
+
+  it('on-demand (sem tipo explícito): lança ValidationError quando o doc não tem tipo', async () => {
+    const docId = await seedReadyDocNoType();
+    const llm = mockLlm(JSON.stringify({ fields: [] }));
+
+    await expect(
+      suggestDocumentIndexes(
+        { tenantId: TENANT, documentId: docId },
+        { sql: testDb.db, llmProvider: llm, logger: silentLogger }
+      )
+    ).rejects.toBeInstanceOf(ValidationError);
+    // Sem tipo ⇒ nem chega a chamar o LLM.
+    expect(llm.chat).not.toHaveBeenCalled();
   });
 });

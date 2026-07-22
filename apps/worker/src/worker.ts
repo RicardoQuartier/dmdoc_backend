@@ -140,6 +140,7 @@ async function main(): Promise<void> {
     logger,
     chunkTargetTokens: config.CHUNK_TARGET_TOKENS,
     chunkOverlapTokens: config.CHUNK_OVERLAP_TOKENS,
+    indexSuggestionMinConfidence: config.DMDOC_INDEX_SUGGESTION_MIN_CONFIDENCE,
   };
 
   const worker = createDocumentWorker(deps);

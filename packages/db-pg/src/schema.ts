@@ -225,6 +225,14 @@ export const documentTypes = pgTable(
     tenantId: uuid('tenant_id').references(() => tenants.id),
     name: text('name').notNull(),
     description: text('description'),
+    // Sinais estruturados de reconhecimento por tipo (Fase 8, epic E-1) — usados
+    // pelo prompt classify-document-type para desambiguar tipos parecidos
+    // (ex.: Boleto × Fatura × Recibo). CONSULTIVOS: só reforçam a classificação.
+    recognitionKeywords: text('recognition_keywords')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    recognitionRules: text('recognition_rules'),
     isGlobal: boolean('is_global').notNull().default(false),
     deleted: boolean('deleted').notNull().default(false),
     createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
@@ -244,6 +252,9 @@ export const documentTypes = pgTable(
 /**
  * Campo de índice de um tipo de documento.
  * Campo `order` renomeado para `sort_order` (palavra reservada em SQL).
+ * `label` (T-15): rótulo amigável opcional digitado pelo admin — quando NULL,
+ * o rótulo exibido é derivado do `name` (ver `deriveIndexFieldLabel` em
+ * `apps/api/src/lib/index-fields.ts`).
  */
 export const documentTypeIndexFields = pgTable(
   'document_type_index_fields',
@@ -256,6 +267,7 @@ export const documentTypeIndexFields = pgTable(
     fieldType: text('field_type').notNull(), // 'TEXT' | 'DATE' | 'NUMBER'
     required: boolean('required').notNull().default(false),
     aiExtractionHint: text('ai_extraction_hint'),
+    label: text('label'),
     sortOrder: integer('sort_order').notNull().default(0),
     showOnSearch: boolean('show_on_search').notNull().default(true),
     deleted: boolean('deleted').notNull().default(false),

@@ -86,6 +86,29 @@ export const PublicTypeSuggestionSchema = TypeSuggestionSchema.pick({
 export type PublicTypeSuggestion = z.infer<typeof PublicTypeSuggestionSchema>;
 
 /**
+ * Subconjunto SEGURO da sugestão de valores de índice exposto ao usuário comum
+ * no `GET /documents/:id` (Fase 7 — gatilhos automáticos da T-16).
+ *
+ * Contém apenas o que a tela de qualificação/revisão precisa para pré-preencher
+ * os campos: os valores sugeridos (já normalizados/validados pelo worker) e o
+ * instante da sugestão. Campos de auditoria/operação (`model`, `promptVersion`,
+ * `rawResponse`) NUNCA vazam no endpoint público; ficam restritos ao
+ * `GET /documents/:id/debug` (SUPER_ADMIN), que devolve o `IndexSuggestion`
+ * completo.
+ *
+ * `suggestedAt` é validado como string ISO porque no JSONB persistido a data é
+ * gravada serializada (diferente do `IndexSuggestionSchema`, que usa `z.date()`
+ * para o modelo de domínio). O `parse` do Zod descarta as chaves desconhecidas,
+ * então validar o JSONB bruto com este schema já remove os campos sensíveis.
+ */
+export const PublicIndexSuggestionSchema = z.object({
+  values: z.record(z.string()),
+  suggestedAt: z.string(),
+});
+
+export type PublicIndexSuggestion = z.infer<typeof PublicIndexSuggestionSchema>;
+
+/**
  * Breakdown de custo em dólares para o processamento de um documento.
  *
  * Embutido em `DocumentContent.costBreakdown`. Campos separados por etapa

@@ -60,6 +60,12 @@ const EnvSchema = z.object({
   // Limites de chunking (spec §12)
   CHUNK_TARGET_TOKENS: z.coerce.number().int().positive().default(500),
   CHUNK_OVERLAP_TOKENS: z.coerce.number().int().nonnegative().default(50),
+
+  // Sugestão automática de índices por IA (Fase 7, gatilho no worker).
+  // Confiança MÍNIMA da classificação de tipo (Fase 8) para disparar a sugestão
+  // de índices sobre o TIPO SUGERIDO. Abaixo do limiar a etapa é pulada (a
+  // sugestão continua disponível sob demanda ou ao confirmar o tipo no PATCH).
+  DMDOC_INDEX_SUGGESTION_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.5),
 });
 
 export type Config = Readonly<z.infer<typeof EnvSchema>>;

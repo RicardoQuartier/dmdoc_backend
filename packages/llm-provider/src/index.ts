@@ -15,8 +15,23 @@ export { createLLMProvider, type LLMProviderConfig } from './factory.js';
 export {
   classifyDocumentType,
   CLASSIFY_DOCUMENT_TYPE_PROMPT,
+  MAX_RECOGNITION_KEYWORDS_PER_TYPE,
+  MAX_RECOGNITION_RULES_CHARS,
   type ClassifyDocumentTypeInput,
   type ClassificationResult,
   type DocumentTypeCatalogItem,
   type AiClassificationFlags,
 } from './classify-document-type.js';
+export {
+  suggestIndexValues,
+  validateIndexValues,
+  normalizeDatePtBr,
+  normalizeNumberPtBr,
+  SUGGEST_INDEXES_PROMPT,
+  SuggestIndexesResponseSchema,
+  type IndexFieldRow,
+  type SuggestedIndexField,
+  type SuggestIndexValuesInput,
+  type SuggestIndexValuesResult,
+  type SuggestIndexesResponse,
+} from './suggest-index-values.js';

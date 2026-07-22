@@ -79,10 +79,11 @@ beforeAll(async () => {
     (${DEPT_A2}, ${TENANT_A}, 'Juridico A', 0),
     (${DEPT_B1}, ${TENANT_B}, 'Financeiro B', 0)`;
 
-  // Tipos globais (tenant_id NULL).
-  await sql`INSERT INTO document_types (id, tenant_id, name, description, is_global, department_ids) VALUES
-    (${GLOBAL_VISIBLE}, NULL, 'Contrato Global', 'Contrato padrao da plataforma', true, NULL),
-    (${GLOBAL_HIDDEN}, NULL, 'Boleto Global', 'Boleto padrao da plataforma', true, NULL)`;
+  // Tipos globais (tenant_id NULL). GLOBAL_VISIBLE carrega sinais de
+  // reconhecimento (Fase 8, epic E-1) para provar que fluem pelo catálogo.
+  await sql`INSERT INTO document_types (id, tenant_id, name, description, recognition_keywords, recognition_rules, is_global, department_ids) VALUES
+    (${GLOBAL_VISIBLE}, NULL, 'Contrato Global', 'Contrato padrao da plataforma', ${['clausula', 'partes contratantes']}::text[], 'NAO classifique como Recibo.', true, NULL),
+    (${GLOBAL_HIDDEN}, NULL, 'Boleto Global', 'Boleto padrao da plataforma', '{}'::text[], NULL, true, NULL)`;
 
   // Configs de visibilidade de tipos globais por tenant/departamento.
   // Tenant A vê GLOBAL_VISIBLE em DEPT_A1 e GLOBAL_HIDDEN só em DEPT_A2.
@@ -121,10 +122,15 @@ describe('resolveDepartmentDocumentTypeCatalog', () => {
       id: GLOBAL_VISIBLE,
       name: 'Contrato Global',
       description: 'Contrato padrao da plataforma',
+      recognitionKeywords: ['clausula', 'partes contratantes'],
+      recognitionRules: 'NAO classifique como Recibo.',
     });
 
     const nf = result.find((r) => r.id === TYPE_A_DEPT1);
     expect(nf?.description).toBe('NF do financeiro');
+    // Tipo de empresa sem sinais definidos: defaults seguros do banco.
+    expect(nf?.recognitionKeywords).toEqual([]);
+    expect(nf?.recognitionRules).toBeNull();
   });
 
   it('(b) NÃO retorna tipo (global ou empresa) de outro departamento', async () => {
