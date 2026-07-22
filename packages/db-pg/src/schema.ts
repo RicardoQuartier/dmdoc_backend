@@ -91,6 +91,11 @@ export const tenants = pgTable('tenants', {
   // 4ª feature de IA (Fase 9 / E-3): geração automática de tags por documento.
   // Mesmo esquema de dois níveis das anteriores — efetivo = plataforma AND empresa.
   aiTagGenerationEnabled: boolean('ai_tag_generation_enabled').notNull().default(true),
+  // 5ª feature de IA: aplica automaticamente as tags sugeridas em `documents.tags`
+  // (merge com dedupe case-insensitive, respeitando o teto de 60), sem exigir
+  // confirmação manual do usuário. Mesmo esquema de dois níveis — efetivo =
+  // plataforma AND empresa. Default ligado (decisão de produto).
+  aiTagAutoApplyEnabled: boolean('ai_tag_auto_apply_enabled').notNull().default(true),
 });
 
 // ---------------------------------------------------------------------------
@@ -112,6 +117,8 @@ export const platformSettings = pgTable('platform_settings', {
   aiIndexSuggestionEnabled: boolean('ai_index_suggestion_enabled').notNull().default(true),
   // Kill switch global da 4ª feature de IA (Fase 9 / E-3): geração de tags.
   aiTagGenerationEnabled: boolean('ai_tag_generation_enabled').notNull().default(true),
+  // Kill switch global da 5ª feature de IA: aplicação automática de tags sugeridas.
+  aiTagAutoApplyEnabled: boolean('ai_tag_auto_apply_enabled').notNull().default(true),
   updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' })
     .notNull()
     .default(sql`now()`),

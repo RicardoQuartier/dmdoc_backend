@@ -27,6 +27,9 @@ export const TenantSchema = z.object({
   aiIndexSuggestionEnabled: z.boolean().default(true),
   // 4ª feature de IA (Fase 9 / E-3): geração automática de tags por documento.
   aiTagGenerationEnabled: z.boolean().default(true),
+  // 5ª feature de IA: aplica automaticamente as tags sugeridas em `documents.tags`
+  // (sem exigir confirmação manual). Default ligado (decisão de produto).
+  aiTagAutoApplyEnabled: z.boolean().default(true),
 });
 
 export type Tenant = z.infer<typeof TenantSchema>;
@@ -44,6 +47,7 @@ export const PlatformSettingsSchema = z.object({
   aiTitleSuggestionEnabled: z.boolean().default(true),
   aiIndexSuggestionEnabled: z.boolean().default(true),
   aiTagGenerationEnabled: z.boolean().default(true),
+  aiTagAutoApplyEnabled: z.boolean().default(true),
   updatedAt: z.date(),
 });
 

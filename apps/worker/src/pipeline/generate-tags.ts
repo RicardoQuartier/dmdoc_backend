@@ -2,7 +2,7 @@ import type { Sql, JSONValue } from 'postgres';
 import type { Logger } from 'pino';
 import { resolveAiFeatureFlags } from '@dmdoc/db-pg';
 import { generateTags, type LLMProvider } from '@dmdoc/llm-provider';
-import type { CostBreakdown } from '@dmdoc/shared-types';
+import { mergeConfirmedTags, type CostBreakdown } from '@dmdoc/shared-types';
 
 /**
  * Parâmetros da etapa de geração automática de tags por IA (Fase 9 / E-3) no
@@ -33,8 +33,11 @@ export interface GenerateTagsStepDeps {
  * Dispara SOMENTE quando `tagGenerationEnabled` (plataforma AND empresa) está
  * ligada. Feature desligada ⇒ pula sem custo (não é erro).
  *
- * CONSULTIVA: grava apenas `document_content.suggested_tags` (sugestão) — NUNCA
- * escreve em `documents.tags` (as tags CONFIRMADAS pelo usuário).
+ * CONSULTIVA por padrão: grava `document_content.suggested_tags` (sugestão) e,
+ * só quando a 5ª feature de IA (`aiTagAutoApplyEnabled`, efetivo = plataforma
+ * AND empresa) estiver ligada, também mescla automaticamente em
+ * `documents.tags` (as tags CONFIRMADAS) — dedupe case-insensitive, nunca
+ * remove tags já confirmadas manualmente.
  *
  * BEST-EFFORT: qualquer erro (LLM fora do ar, resposta inválida, banco) é logado
  * como `warn` e NÃO derruba o pipeline — o documento já está READY.
@@ -148,6 +151,27 @@ export async function generateTagsStep(
       },
       'geração automática de tags concluída'
     );
+
+    // 5. Aplicação automática (5ª feature de IA): só roda se a etapa acima
+    //    persistiu sugestão. Mescla em `documents.tags` (dedupe case-insensitive,
+    //    teto de 60) — NUNCA sobrescreve, só adiciona. Continua best-effort: uma
+    //    falha aqui não desfaz a sugestão já persistida acima.
+    if (flags.tagAutoApplyEnabled && core.tags.length > 0) {
+      const docRows = await sql<Array<{ tags: string[] }>>`
+        SELECT tags FROM documents WHERE id = ${documentId} AND tenant_id = ${tenantId} LIMIT 1
+      `;
+      const currentTags = docRows[0]?.tags ?? [];
+      const merged = mergeConfirmedTags(currentTags, core.tags);
+      if (merged.length !== currentTags.length) {
+        await sql`
+          UPDATE documents SET tags = ${merged} WHERE id = ${documentId} AND tenant_id = ${tenantId}
+        `;
+        log.info(
+          { tagsBefore: currentTags.length, tagsAfter: merged.length },
+          'tags sugeridas aplicadas automaticamente (aiTagAutoApplyEnabled)'
+        );
+      }
+    }
   } catch (err: unknown) {
     // Best-effort: NUNCA derruba o pipeline. O documento já está READY.
     log.warn(

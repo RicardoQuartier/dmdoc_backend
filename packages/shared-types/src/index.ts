@@ -60,6 +60,7 @@ export {
   type PublicSuggestedTags,
   MAX_GENERATED_TAGS,
   MAX_TAG_LENGTH,
+  mergeConfirmedTags,
   CostBreakdownSchema,
   type CostBreakdown,
   DocumentContentSchema,

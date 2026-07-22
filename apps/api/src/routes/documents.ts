@@ -31,6 +31,7 @@ import {
   PublicSuggestedTagsSchema,
   MAX_GENERATED_TAGS,
   MAX_TAG_LENGTH,
+  mergeConfirmedTags,
   ROLE_LEVEL,
   RoleSchema,
   AiReprocessJobDataSchema,
@@ -2539,8 +2540,10 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
   // =========================================================================
   // POST /documents/:id/generate-tags — geração de tags por IA sob demanda
   // (Fase 9 / E-3 / GH #36). Investiga o texto do documento já processado e
-  // gera até 30 tags. CONSULTIVO: persiste `document_content.suggested_tags`
-  // (e acumula custo), NUNCA escreve em `documents.tags` (as confirmadas).
+  // gera até 30 tags. Persiste `document_content.suggested_tags` (e acumula
+  // custo); com a 5ª feature de IA (`aiTagAutoApplyEnabled`) ligada, também
+  // mescla automaticamente em `documents.tags` (as confirmadas) — sem exigir
+  // clique manual, nunca removendo tags já confirmadas.
   // Espelha o guard/escopo de `POST /documents/:id/suggest-indexes`.
   // =========================================================================
   app.post('/documents/:id/generate-tags', { preHandler: app.authenticate }, async (request, reply) => {
@@ -2614,8 +2617,34 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     );
 
     // ------------------------------------------------------------------
+    // 3.1. Aplicação automática (5ª feature de IA, `aiTagAutoApplyEnabled`) —
+    //      quando ligada, mescla as tags recém-sugeridas em `documents.tags`
+    //      (dedupe case-insensitive, teto de 60), sem exigir o clique manual
+    //      do usuário no card "Tags sugeridas pela IA". Nunca remove tags já
+    //      confirmadas. Mesma lógica do gatilho automático do worker.
+    // ------------------------------------------------------------------
+    let appliedTags: string[] | undefined;
+    if (aiFlags.tagAutoApplyEnabled && result.tags.length > 0) {
+      const docRows = await sql<Array<{ tags: string[] }>>`
+        SELECT tags FROM documents WHERE id = ${id} AND tenant_id = ${tenantId} LIMIT 1
+      `;
+      const currentTags = docRows[0]?.tags ?? [];
+      const merged = mergeConfirmedTags(currentTags, result.tags);
+      if (merged.length !== currentTags.length) {
+        await sql`UPDATE documents SET tags = ${merged} WHERE id = ${id} AND tenant_id = ${tenantId}`;
+        appliedTags = merged;
+        log.info(
+          { tagsBefore: currentTags.length, tagsAfter: merged.length },
+          'tags sugeridas aplicadas automaticamente (aiTagAutoApplyEnabled)'
+        );
+      }
+    }
+
+    // ------------------------------------------------------------------
     // 4. Resposta 200 — subconjunto público (tags + generatedAt) + custo desta
     //    chamada. Campos de auditoria (model/promptVersion/rawResponse) não vazam.
+    //    `appliedTags` só aparece quando a aplicação automática efetivamente
+    //    mudou `documents.tags` (undefined nos demais casos).
     // ------------------------------------------------------------------
     return reply.status(200).send({
       suggestedTags: {
@@ -2623,6 +2652,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         generatedAt: result.generatedAt,
       },
       costUsd: result.costUsd,
+      ...(appliedTags !== undefined ? { appliedTags } : {}),
     });
   });
 };

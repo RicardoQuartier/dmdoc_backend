@@ -141,6 +141,30 @@ export const SuggestedTagsSchema = z.object({
 export type SuggestedTags = z.infer<typeof SuggestedTagsSchema>;
 
 /**
+ * Mescla tags SUGERIDAS pela IA nas tags já CONFIRMADAS de um documento —
+ * núcleo puro (sem banco) reaproveitado pelo worker (gatilho automático no
+ * upload) e pelo endpoint sob demanda quando a 5ª feature de IA
+ * (`aiTagAutoApplyEnabled`, efetivo = plataforma AND empresa) está ligada.
+ *
+ * Mesmas regras do fluxo manual (`handleAddSuggestedTags` no frontend, card
+ * "Tags sugeridas pela IA"): dedupe case-insensitive contra as já confirmadas,
+ * ignora vazias, e respeita o teto de `documents.tags`
+ * (`MAX_GENERATED_TAGS * 2` — folga para 30 da IA + manuais).
+ */
+export function mergeConfirmedTags(existingTags: string[], suggestedTags: string[]): string[] {
+  const existingLower = new Set(existingTags.map((t) => t.toLowerCase()));
+  const merged = [...existingTags];
+  for (const tag of suggestedTags) {
+    const clean = tag.trim();
+    if (clean === '' || existingLower.has(clean.toLowerCase())) continue;
+    if (merged.length >= MAX_GENERATED_TAGS * 2) break;
+    existingLower.add(clean.toLowerCase());
+    merged.push(clean);
+  }
+  return merged;
+}
+
+/**
  * Subconjunto SEGURO da sugestão de tags exposto ao usuário comum no
  * `GET /documents/:id` e no `POST /documents/:id/generate-tags` (Fase 9).
  *

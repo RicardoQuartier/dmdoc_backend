@@ -78,6 +78,13 @@
       "when": 1785181600000,
       "tag": "0011_ai_reprocess_batch",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1785268000000,
+      "tag": "0012_ai_tag_auto_apply",
+      "breakpoints": true
     }
   ]
 }
