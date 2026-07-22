@@ -1989,7 +1989,7 @@ describe('POST /documents — emissão de evento em document_events', () => {
 // GET /documents — ordenação, filtros novos (departmentIds/uploadedById) e
 // paginação por cursor composto (keyset). Ver plano da tela de listagem.
 // ---------------------------------------------------------------------------
-describe('GET /documents — ordenação, filtros e paginação por cursor', () => {
+describe('GET /documents — ordenação, filtros, busca textual e paginação por página', () => {
   const DEPT_A2_ID = newId();
   const USER_ANA_ID = newId();
   const USER_BRUNO_ID = newId();
@@ -2081,8 +2081,10 @@ describe('GET /documents — ordenação, filtros e paginação por cursor', () 
 
   interface ListDocsResponse {
     items: Array<Record<string, unknown>>;
-    nextCursor: string | null;
+    page: number;
+    pageSize: number;
     total: number;
+    pageCount: number;
   }
 
   async function listDocs(query: string, token = tokenAdminA): Promise<ListDocsResponse> {
@@ -2096,15 +2098,15 @@ describe('GET /documents — ordenação, filtros e paginação por cursor', () 
   }
 
   it('ordena por filename ASC e DESC', async () => {
-    const asc = await listDocs('?sortBy=filename&sortDir=asc&limit=10');
+    const asc = await listDocs('?sortBy=filename&sortDir=asc&pageSize=10');
     expect(asc.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID, DOC_BETA_ID, DOC_DELTA_ID, DOC_GAMMA_ID]);
 
-    const desc = await listDocs('?sortBy=filename&sortDir=desc&limit=10');
+    const desc = await listDocs('?sortBy=filename&sortDir=desc&pageSize=10');
     expect(desc.items.map((d) => d['id'])).toEqual([DOC_GAMMA_ID, DOC_DELTA_ID, DOC_BETA_ID, DOC_ALPHA_ID]);
   });
 
   it('ordena por status ASC e DESC (com empate entre dois READY, tiebreak por id)', async () => {
-    const asc = await listDocs('?sortBy=status&sortDir=asc&limit=10');
+    const asc = await listDocs('?sortBy=status&sortDir=asc&pageSize=10');
     expect(asc.items.map((d) => d['status'])).toEqual(['FAILED', 'PENDING', 'READY', 'READY']);
     expect(asc.items[0]?.['id']).toBe(DOC_DELTA_ID);
     expect(asc.items[1]?.['id']).toBe(DOC_BETA_ID);
@@ -2112,45 +2114,45 @@ describe('GET /documents — ordenação, filtros e paginação por cursor', () 
       [DOC_ALPHA_ID, DOC_GAMMA_ID].sort()
     );
 
-    const desc = await listDocs('?sortBy=status&sortDir=desc&limit=10');
+    const desc = await listDocs('?sortBy=status&sortDir=desc&pageSize=10');
     expect(desc.items.map((d) => d['status'])).toEqual(['READY', 'READY', 'PENDING', 'FAILED']);
     expect(desc.items[2]?.['id']).toBe(DOC_BETA_ID);
     expect(desc.items[3]?.['id']).toBe(DOC_DELTA_ID);
   });
 
   it('ordena por sizeBytes ASC e DESC', async () => {
-    const asc = await listDocs('?sortBy=sizeBytes&sortDir=asc&limit=10');
+    const asc = await listDocs('?sortBy=sizeBytes&sortDir=asc&pageSize=10');
     expect(asc.items.map((d) => d['id'])).toEqual([DOC_DELTA_ID, DOC_ALPHA_ID, DOC_BETA_ID, DOC_GAMMA_ID]);
 
-    const desc = await listDocs('?sortBy=sizeBytes&sortDir=desc&limit=10');
+    const desc = await listDocs('?sortBy=sizeBytes&sortDir=desc&pageSize=10');
     expect(desc.items.map((d) => d['id'])).toEqual([DOC_GAMMA_ID, DOC_BETA_ID, DOC_ALPHA_ID, DOC_DELTA_ID]);
   });
 
   it('ordena por uploadedAt ASC e DESC (default da rota é uploadedAt desc)', async () => {
-    const asc = await listDocs('?sortBy=uploadedAt&sortDir=asc&limit=10');
+    const asc = await listDocs('?sortBy=uploadedAt&sortDir=asc&pageSize=10');
     expect(asc.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID, DOC_BETA_ID, DOC_GAMMA_ID, DOC_DELTA_ID]);
 
-    const byDefault = await listDocs('?limit=10');
+    const byDefault = await listDocs('?pageSize=10');
     expect(byDefault.items.map((d) => d['id'])).toEqual([DOC_DELTA_ID, DOC_GAMMA_ID, DOC_BETA_ID, DOC_ALPHA_ID]);
   });
 
   it('ordena por departmentName ASC e DESC', async () => {
-    const asc = await listDocs('?sortBy=departmentName&sortDir=asc&limit=10');
+    const asc = await listDocs('?sortBy=departmentName&sortDir=asc&pageSize=10');
     expect(asc.items[0]?.['id']).toBe(DOC_GAMMA_ID); // único doc em "Comercial A"
     expect(asc.items.slice(1).map((d) => d['id']).sort()).toEqual(
       [DOC_ALPHA_ID, DOC_BETA_ID, DOC_DELTA_ID].sort()
     );
 
-    const desc = await listDocs('?sortBy=departmentName&sortDir=desc&limit=10');
+    const desc = await listDocs('?sortBy=departmentName&sortDir=desc&pageSize=10');
     expect(desc.items[3]?.['id']).toBe(DOC_GAMMA_ID);
   });
 
   it('ordena por uploadedByName ASC e DESC', async () => {
-    const asc = await listDocs('?sortBy=uploadedByName&sortDir=asc&limit=10');
+    const asc = await listDocs('?sortBy=uploadedByName&sortDir=asc&pageSize=10');
     expect(asc.items[0]?.['uploadedByName']).toBe('Ana Uploader');
     expect(asc.items[3]?.['uploadedByName']).toBe('Carla Uploader');
 
-    const desc = await listDocs('?sortBy=uploadedByName&sortDir=desc&limit=10');
+    const desc = await listDocs('?sortBy=uploadedByName&sortDir=desc&pageSize=10');
     expect(desc.items[0]?.['uploadedByName']).toBe('Carla Uploader');
     expect(desc.items[3]?.['uploadedByName']).toBe('Ana Uploader');
   });
@@ -2179,7 +2181,7 @@ describe('GET /documents — ordenação, filtros e paginação por cursor', () 
       )
     `;
 
-    const asc = await listDocs('?sortBy=companyName&sortDir=asc&limit=10', mtaToken);
+    const asc = await listDocs('?sortBy=companyName&sortDir=asc&pageSize=10', mtaToken);
     expect(asc.total).toBe(5);
     // "Empresa A" < "Empresa B" — os 4 docs de A vêm antes do único de B
     expect(asc.items.slice(0, 4).map((d) => d['id']).sort()).toEqual(
@@ -2187,68 +2189,63 @@ describe('GET /documents — ordenação, filtros e paginação por cursor', () 
     );
     expect(asc.items[4]?.['id']).toBe(docBId);
 
-    const desc = await listDocs('?sortBy=companyName&sortDir=desc&limit=10', mtaToken);
+    const desc = await listDocs('?sortBy=companyName&sortDir=desc&pageSize=10', mtaToken);
     expect(desc.items[0]?.['id']).toBe(docBId);
   });
 
   it('ordena por documentTypeName ASC e DESC, com nulos sempre por último', async () => {
-    const asc = await listDocs('?sortBy=documentTypeName&sortDir=asc&limit=10');
+    const asc = await listDocs('?sortBy=documentTypeName&sortDir=asc&pageSize=10');
     expect(asc.items[0]?.['id']).toBe(DOC_ALPHA_ID); // "Contrato A"
     expect(asc.items[1]?.['id']).toBe(DOC_GAMMA_ID); // "Tipo Global"
     expect(asc.items[2]?.['documentTypeName']).toBeNull();
     expect(asc.items[3]?.['documentTypeName']).toBeNull();
     expect(asc.items.slice(2).map((d) => d['id']).sort()).toEqual([DOC_BETA_ID, DOC_DELTA_ID].sort());
 
-    const desc = await listDocs('?sortBy=documentTypeName&sortDir=desc&limit=10');
+    const desc = await listDocs('?sortBy=documentTypeName&sortDir=desc&pageSize=10');
     expect(desc.items[0]?.['id']).toBe(DOC_GAMMA_ID);
     expect(desc.items[1]?.['id']).toBe(DOC_ALPHA_ID);
     expect(desc.items[2]?.['documentTypeName']).toBeNull();
     expect(desc.items[3]?.['documentTypeName']).toBeNull();
   });
 
-  it('paginação keyset: 2 páginas por filename ASC sem pular/duplicar itens', async () => {
-    const page1 = await listDocs('?sortBy=filename&sortDir=asc&limit=2');
+  it('paginação por página: page 1 e page 2 por filename ASC sem pular/duplicar itens', async () => {
+    const page1 = await listDocs('?sortBy=filename&sortDir=asc&page=1&pageSize=2');
     expect(page1.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID, DOC_BETA_ID]);
-    expect(page1.nextCursor).not.toBeNull();
+    expect(page1.page).toBe(1);
+    expect(page1.pageSize).toBe(2);
     expect(page1.total).toBe(4);
+    expect(page1.pageCount).toBe(2);
 
-    const page2 = await listDocs(
-      `?sortBy=filename&sortDir=asc&limit=2&cursor=${encodeURIComponent(page1.nextCursor as string)}`
-    );
+    const page2 = await listDocs('?sortBy=filename&sortDir=asc&page=2&pageSize=2');
     expect(page2.items.map((d) => d['id'])).toEqual([DOC_DELTA_ID, DOC_GAMMA_ID]);
-    expect(page2.nextCursor).toBeNull();
+    expect(page2.page).toBe(2);
+    expect(page2.total).toBe(4);
+    expect(page2.pageCount).toBe(2);
 
     const allIds = [...page1.items, ...page2.items].map((d) => d['id']);
     expect(new Set(allIds).size).toBe(4);
   });
 
-  it('paginação keyset: 2 páginas por sizeBytes DESC sem pular/duplicar itens', async () => {
-    const page1 = await listDocs('?sortBy=sizeBytes&sortDir=desc&limit=3');
+  it('paginação por página: page 1 e page 2 por sizeBytes DESC sem pular/duplicar itens', async () => {
+    const page1 = await listDocs('?sortBy=sizeBytes&sortDir=desc&page=1&pageSize=3');
     expect(page1.items.map((d) => d['id'])).toEqual([DOC_GAMMA_ID, DOC_BETA_ID, DOC_ALPHA_ID]);
-    expect(page1.nextCursor).not.toBeNull();
+    expect(page1.pageCount).toBe(2);
 
-    const page2 = await listDocs(
-      `?sortBy=sizeBytes&sortDir=desc&limit=3&cursor=${encodeURIComponent(page1.nextCursor as string)}`
-    );
+    const page2 = await listDocs('?sortBy=sizeBytes&sortDir=desc&page=2&pageSize=3');
     expect(page2.items.map((d) => d['id'])).toEqual([DOC_DELTA_ID]);
-    expect(page2.nextCursor).toBeNull();
 
     const allIds = [...page1.items, ...page2.items].map((d) => d['id']);
     expect(new Set(allIds).size).toBe(4);
   });
 
-  it('paginação keyset: 2 páginas por documentTypeName ASC preserva nulos por último ao virar página', async () => {
-    const page1 = await listDocs('?sortBy=documentTypeName&sortDir=asc&limit=3');
+  it('paginação por página: page 1 e page 2 por documentTypeName ASC preserva nulos por último ao virar página', async () => {
+    const page1 = await listDocs('?sortBy=documentTypeName&sortDir=asc&page=1&pageSize=3');
     expect(page1.items).toHaveLength(3);
     expect(page1.items[0]?.['id']).toBe(DOC_ALPHA_ID);
     expect(page1.items[1]?.['id']).toBe(DOC_GAMMA_ID);
-    expect(page1.nextCursor).not.toBeNull();
 
-    const page2 = await listDocs(
-      `?sortBy=documentTypeName&sortDir=asc&limit=3&cursor=${encodeURIComponent(page1.nextCursor as string)}`
-    );
+    const page2 = await listDocs('?sortBy=documentTypeName&sortDir=asc&page=2&pageSize=3');
     expect(page2.items).toHaveLength(1);
-    expect(page2.nextCursor).toBeNull();
 
     const allIds = [...page1.items, ...page2.items].map((d) => d['id']);
     expect(new Set(allIds).size).toBe(4);
@@ -2256,17 +2253,145 @@ describe('GET /documents — ordenação, filtros e paginação por cursor', () 
     expect(allIds.slice(2).sort()).toEqual([DOC_BETA_ID, DOC_DELTA_ID].sort());
   });
 
+  it('página além do total retorna items vazio (200, nunca erro), com page/total/pageCount corretos', async () => {
+    const res = await listDocs('?sortBy=filename&sortDir=asc&page=99&pageSize=2');
+    expect(res.items).toEqual([]);
+    expect(res.page).toBe(99);
+    expect(res.pageSize).toBe(2);
+    expect(res.total).toBe(4);
+    expect(res.pageCount).toBe(2);
+  });
+
+  it('page inválido (0 ou não numérico) → 422', async () => {
+    const zero = await app.inject({
+      method: 'GET',
+      url: '/documents?page=0',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(zero.statusCode).toBe(422);
+
+    const notANumber = await app.inject({
+      method: 'GET',
+      url: '/documents?page=abc',
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(notANumber.statusCode).toBe(422);
+  });
+
+  it('busca textual: match parcial e case-insensitive por nome do arquivo', async () => {
+    const lower = await listDocs('?search=alph&pageSize=10');
+    expect(lower.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID]);
+    expect(lower.total).toBe(1);
+
+    const upperCase = await listDocs('?search=ALPHA&pageSize=10');
+    expect(upperCase.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID]);
+    expect(upperCase.total).toBe(1);
+  });
+
+  it('busca textual: casa também pelo título confirmado quando o nome do arquivo não bate', async () => {
+    await testDb.db`UPDATE documents SET title = 'Contrato Especial XPTO' WHERE id = ${DOC_BETA_ID}`;
+
+    const res = await listDocs('?search=especial xpto&pageSize=10');
+    expect(res.items.map((d) => d['id'])).toEqual([DOC_BETA_ID]);
+    expect(res.total).toBe(1);
+  });
+
+  it('busca textual: termo com "_" não vira wildcard de caractere único do ILIKE', async () => {
+    const docUnderscoreId = newId();
+    const docOtherId = newId();
+    await seedDoc({
+      id: docUnderscoreId, filename: 'nota_fiscal.pdf', status: 'READY', sizeBytes: 100,
+      uploadedAt: new Date(BASE_TIME + 300_000), uploadedById: USER_ANA_ID,
+      departmentId: DEPT_A_ID, documentTypeId: null, hash: 'f'.repeat(64),
+    });
+    // Sem o escape, o padrão "%ta_fi%" (com "_" tratado como wildcard de 1
+    // caractere) casaria também com "notaXfiscal.pdf" — precisa NÃO casar.
+    await seedDoc({
+      id: docOtherId, filename: 'notaXfiscal.pdf', status: 'READY', sizeBytes: 100,
+      uploadedAt: new Date(BASE_TIME + 360_000), uploadedById: USER_ANA_ID,
+      departmentId: DEPT_A_ID, documentTypeId: null, hash: 'g'.repeat(64),
+    });
+
+    const res = await listDocs('?search=ta_fi&pageSize=10');
+    expect(res.items.map((d) => d['id'])).toEqual([docUnderscoreId]);
+    expect(res.total).toBe(1);
+  });
+
+  it('busca textual: termo com "%" não vira wildcard do ILIKE', async () => {
+    const docPercentId = newId();
+    const docOtherId = newId();
+    await seedDoc({
+      id: docPercentId, filename: 'invoice100%.pdf', status: 'READY', sizeBytes: 100,
+      uploadedAt: new Date(BASE_TIME + 300_000), uploadedById: USER_ANA_ID,
+      departmentId: DEPT_A_ID, documentTypeId: null, hash: 'f'.repeat(64),
+    });
+    // Sem o escape, o padrão "%100%%" (com "%" tratado como wildcard) casaria
+    // também com "invoice100X.pdf" — precisa NÃO casar.
+    await seedDoc({
+      id: docOtherId, filename: 'invoice100X.pdf', status: 'READY', sizeBytes: 100,
+      uploadedAt: new Date(BASE_TIME + 360_000), uploadedById: USER_ANA_ID,
+      departmentId: DEPT_A_ID, documentTypeId: null, hash: 'g'.repeat(64),
+    });
+
+    const res = await listDocs('?search=100%25&pageSize=10'); // "100%" URL-encoded
+    expect(res.items.map((d) => d['id'])).toEqual([docPercentId]);
+    expect(res.total).toBe(1);
+  });
+
+  it('busca textual combinada com filtro de status — total reflete a interseção', async () => {
+    // "alpha" só casa com DOC_ALPHA_ID (status READY) — status=READY não muda
+    // o resultado; status=FAILED some com ele (interseção vazia).
+    const res = await listDocs('?search=alpha&status=READY&pageSize=10');
+    expect(res.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID]);
+    expect(res.total).toBe(1);
+
+    const noMatch = await listDocs('?search=alpha&status=FAILED&pageSize=10');
+    expect(noMatch.items).toEqual([]);
+    expect(noMatch.total).toBe(0);
+  });
+
+  it('busca textual combinada com filtro de departamento — total reflete a interseção', async () => {
+    // gamma.pdf está em DEPT_A2_ID; alpha/beta/delta estão em DEPT_A_ID.
+    const res = await listDocs(`?search=.pdf&departmentIds=${DEPT_A2_ID}&pageSize=10`);
+    expect(res.items.map((d) => d['id'])).toEqual([DOC_GAMMA_ID]);
+    expect(res.total).toBe(1);
+  });
+
+  it('busca textual/total nunca vazam documento de outro tenant', async () => {
+    const docBId = newId();
+    const hashB = 'h'.repeat(64);
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docBId}, ${TENANT_B}, ${DEPT_B_ID}, NULL,
+        'alpha-tenant-b.pdf', 'alpha-tenant-b.pdf', ${hashB}, 700, 'application/pdf',
+        ${`tenants/${TENANT_B}/documents/${hashB}/alpha-tenant-b.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_B_ID}, ${new Date(BASE_TIME + 240_000)}, ${new Date(BASE_TIME + 240_000)}, 0, false
+      )
+    `;
+
+    // TENANT_ADMIN de A busca "alpha" — só enxerga o próprio (DOC_ALPHA_ID),
+    // nunca o "alpha-tenant-b.pdf" da Empresa B.
+    const res = await listDocs('?search=alpha&pageSize=10');
+    expect(res.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID]);
+    expect(res.total).toBe(1);
+  });
+
   it('filtra por uploadedById', async () => {
-    const res = await listDocs(`?uploadedById=${USER_ANA_ID}&limit=10`);
+    const res = await listDocs(`?uploadedById=${USER_ANA_ID}&pageSize=10`);
     expect(res.items.map((d) => d['id']).sort()).toEqual([DOC_ALPHA_ID, DOC_DELTA_ID].sort());
     expect(res.total).toBe(2);
   });
 
   it('filtra por departmentIds com múltiplos ids', async () => {
-    const both = await listDocs(`?departmentIds=${DEPT_A_ID},${DEPT_A2_ID}&limit=10`);
+    const both = await listDocs(`?departmentIds=${DEPT_A_ID},${DEPT_A2_ID}&pageSize=10`);
     expect(both.total).toBe(4);
 
-    const onlyA2 = await listDocs(`?departmentIds=${DEPT_A2_ID}&limit=10`);
+    const onlyA2 = await listDocs(`?departmentIds=${DEPT_A2_ID}&pageSize=10`);
     expect(onlyA2.items.map((d) => d['id'])).toEqual([DOC_GAMMA_ID]);
     expect(onlyA2.total).toBe(1);
   });
@@ -2279,27 +2404,6 @@ describe('GET /documents — ordenação, filtros e paginação por cursor', () 
     });
     expect(res.statusCode).toBe(404);
     expect(res.json().error.code).toBe('NOT_FOUND');
-  });
-
-  it('cursor malformado (base64/JSON inválido) → 422', async () => {
-    const res = await app.inject({
-      method: 'GET',
-      url: '/documents?sortBy=filename&sortDir=asc&cursor=not-a-valid-cursor-at-all',
-      headers: { authorization: `Bearer ${tokenAdminA}` },
-    });
-    expect(res.statusCode).toBe(422);
-    expect(res.json().error.code).toBe('VALIDATION_ERROR');
-  });
-
-  it('cursor malformado (payload decodificado sem {v,id}) → 422', async () => {
-    const badCursor = Buffer.from(JSON.stringify({ foo: 'bar' })).toString('base64');
-    const res = await app.inject({
-      method: 'GET',
-      url: `/documents?cursor=${encodeURIComponent(badCursor)}`,
-      headers: { authorization: `Bearer ${tokenAdminA}` },
-    });
-    expect(res.statusCode).toBe(422);
-    expect(res.json().error.code).toBe('VALIDATION_ERROR');
   });
 
   it('trocar sortBy/filtros nunca retorna documento de outro tenant ou fora do ACL do usuário', async () => {

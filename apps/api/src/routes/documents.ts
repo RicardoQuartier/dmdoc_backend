@@ -7,7 +7,6 @@ import {
   DocumentEventsRepository,
   DOCUMENT_EVENTS_COLLECTION,
   newId,
-  normalizeLimit,
   resolveAiFeatureFlags,
 } from '@dmdoc/db-pg';
 import type { TenantDocument } from '@dmdoc/db-pg';
@@ -164,6 +163,21 @@ function splitCsv(value: string): string[] {
     .filter((v) => v.length > 0);
 }
 
+/**
+ * Escapa os caracteres especiais do `ILIKE` (`\`, `%`, `_`) em um termo de
+ * busca livre, para que sejam tratados como texto literal — nunca como
+ * wildcard involuntário digitado pelo usuário (ex.: buscar por "100%" não
+ * deve casar com qualquer coisa começando em "100").
+ *
+ * O `\` precisa ser escapado PRIMEIRO — senão os backslashes introduzidos ao
+ * escapar `%`/`_` seriam escapados de novo. Usado em conjunto com
+ * `ESCAPE '\'` na cláusula SQL (padrão de escape do `LIKE`/`ILIKE` do
+ * PostgreSQL).
+ */
+function escapeLikePattern(term: string): string {
+  return term.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
 /** Schema dos query params do GET /documents. */
 const ListDocumentsQuerySchema = z.object({
   tenantId: z.string().uuid().optional(), // SUPER_ADMIN apenas — filtrar por tenant específico
@@ -182,10 +196,24 @@ const ListDocumentsQuerySchema = z.object({
   uploadedById: z.string().uuid().optional(),
   tags: z.string().optional(), // CSV de tags
   status: z.enum(['PENDING', 'PROCESSING', 'READY', 'FAILED']).optional(),
+  // Busca textual livre — casa contra `original_filename` OU `title` (ILIKE,
+  // case-insensitive). Termo sanitizado via `escapeLikePattern` antes de virar
+  // padrão `%termo%` — nunca concatenado cru na query (sempre bind param).
+  search: z.string().optional(),
   sortBy: z.enum(SORT_BY_KEYS).default('uploadedAt'),
   sortDir: z.enum(['asc', 'desc']).default('desc'),
-  cursor: z.string().optional(),
-  limit: z
+  // Paginação por número de página (OFFSET) — substitui o cursor/keyset
+  // anterior. Decisão de arquitetura (T-21/GH#31): paginação numerada exige
+  // acesso aleatório, incompatível com cursor sequencial; o COUNT(*) completo
+  // já rodava em todo request, então o custo que o OFFSET adiciona já era
+  // pago; o volume por tenant não chega à escala em que OFFSET profundo é um
+  // problema real.
+  page: z
+    .string()
+    .optional()
+    .transform((v) => (v !== undefined ? parseInt(v, 10) : 1))
+    .pipe(z.number().int().min(1)),
+  pageSize: z
     .string()
     .optional()
     .transform((v) => (v !== undefined ? parseInt(v, 10) : 20))
@@ -461,130 +489,8 @@ function rowToDocumentListItem(r: DocumentListRow): Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
-// GET /documents — paginação por cursor composto (keyset)
+// GET /documents — paginação por número de página (OFFSET)
 // ---------------------------------------------------------------------------
-
-/** Valor de ordenação serializado no cursor opaco. */
-type SortCursorValue = string | number | null;
-
-/** Payload decodificado de um cursor de listagem de documentos. */
-interface ListDocumentsCursor {
-  v: SortCursorValue;
-  id: string;
-}
-
-const ListDocumentsCursorSchema = z.object({
-  v: z.union([z.string(), z.number(), z.null()]),
-  id: z.string().uuid(),
-});
-
-/**
- * Codifica um cursor opaco (base64 de `{v, id}`) a partir do valor da coluna
- * de ordenação e do `id` (tiebreaker) do último item da página.
- *
- * O cursor é opaco do ponto de vista do cliente — apenas o servidor conhece
- * o formato interno.
- */
-function encodeListDocumentsCursor(value: SortCursorValue, id: string): string {
-  return Buffer.from(JSON.stringify({ v: value, id })).toString('base64');
-}
-
-/**
- * Decodifica um cursor opaco de `GET /documents`.
- *
- * Lança `ValidationError` (→ 422) se o cursor estiver malformado — base64
- * inválido, JSON inválido, ou payload fora do formato `{v, id}` esperado.
- */
-function decodeListDocumentsCursor(cursor: string): ListDocumentsCursor {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'));
-  } catch {
-    throw new ValidationError('cursor inválido');
-  }
-  const result = ListDocumentsCursorSchema.safeParse(parsed);
-  if (!result.success) {
-    throw new ValidationError('cursor inválido');
-  }
-  return result.data;
-}
-
-/**
- * Extrai, de uma `DocumentListRow`, o valor bruto da coluna de ordenação
- * corrente — usado tanto para codificar o `nextCursor` quanto (indiretamente)
- * para validar o formato esperado do cursor recebido.
- */
-function sortValueForCursor(sortBy: SortByKey, row: DocumentListRow): SortCursorValue {
-  switch (sortBy) {
-    case 'filename':
-      return row.original_filename;
-    case 'status':
-      return row.status;
-    case 'companyName':
-      return row.company_name;
-    case 'documentTypeName':
-      return row.document_type_name;
-    case 'sizeBytes':
-      return Number(row.size_bytes);
-    case 'uploadedAt':
-      return row.uploaded_at.toISOString();
-    case 'departmentName':
-      return row.department_name;
-    case 'uploadedByName':
-      return row.uploaded_by_name;
-  }
-}
-
-/**
- * Cast SQL explícito a aplicar ao valor de cursor de cada coluna ordenável,
- * necessário para colunas cujo tipo não é inferido corretamente a partir de
- * um parâmetro solto (datas e bigint) — mesmo padrão de `audit-logs.ts`.
- */
-function sqlCastForSortColumn(sortBy: SortByKey): string {
-  switch (sortBy) {
-    case 'uploadedAt':
-      return '::timestamptz';
-    case 'sizeBytes':
-      return '::bigint';
-    default:
-      return '';
-  }
-}
-
-/**
- * Monta a condição SQL de keyset (`WHERE`) para a página seguinte de
- * `GET /documents`, dado o valor/`id` do cursor decodificado.
- *
- * Contrato: `(sortExpr, d.id) > (cursorValue, cursorId)` para ASC,
- * `<` para DESC — `d.id` como tiebreaker determinístico.
- *
- * Para colunas nullable (hoje só `documentTypeName`), nulos são sempre
- * ordenados por último (`NULLS LAST`, em ambas direções) — o keyset precisa
- * de um OR-chain de nulidade equivalente:
- *   - cursor não-nulo: próximas linhas = (nulas) OU (não-nulas "depois" do cursor)
- *   - cursor nulo: já estamos no grupo de nulos — próximas linhas = nulas com
- *     id "depois" do cursor
- */
-function buildKeysetCondition(params: {
-  expr: string;
-  nullable: boolean;
-  dirCmp: '>' | '<';
-  valuePlaceholder: string;
-  idPlaceholder: string;
-  isNullCursor: boolean;
-}): string {
-  const { expr, nullable, dirCmp, valuePlaceholder, idPlaceholder, isNullCursor } = params;
-
-  if (!nullable) {
-    return `(${expr} ${dirCmp} ${valuePlaceholder} OR (${expr} = ${valuePlaceholder} AND d.id ${dirCmp} ${idPlaceholder}))`;
-  }
-
-  if (isNullCursor) {
-    return `(${expr} IS NULL AND d.id ${dirCmp} ${idPlaceholder})`;
-  }
-
-  return `(${expr} IS NULL OR ${expr} ${dirCmp} ${valuePlaceholder} OR (${expr} = ${valuePlaceholder} AND d.id ${dirCmp} ${idPlaceholder}))`;
-}
 
 /** Número total de tentativas de `emitUploadEvent` (1 original + 1 retry). */
 const EMIT_UPLOAD_EVENT_MAX_ATTEMPTS = 2;
@@ -1121,63 +1027,50 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       }
     }
 
-    const whereClause = conditions.join(' AND ');
-    const limit = normalizeLimit(query.limit);
+    // Busca textual livre: nome do arquivo OU título confirmado (ILIKE,
+    // case-insensitive). Entra no MESMO array de condições (AND com tenant/
+    // ACL/demais filtros, nunca OR) — combinado corretamente com o isolamento
+    // multi-tenant já resolvido acima. Termo sanitizado via
+    // `escapeLikePattern` (nunca concatenado cru) para que `%`/`_`/`\`
+    // digitados pelo usuário sejam tratados como texto literal, não wildcard.
+    const trimmedSearch = query.search?.trim();
+    if (trimmedSearch !== undefined && trimmedSearch.length > 0) {
+      const searchPattern = `%${escapeLikePattern(trimmedSearch)}%`;
+      const searchParam = addParam(searchPattern);
+      conditions.push(
+        `(d.original_filename ILIKE ${searchParam} ESCAPE '\\' OR d.title ILIKE ${searchParam} ESCAPE '\\')`
+      );
+    }
 
-    // Total (sem cursor, sem JOINs — nenhum filtro depende das tabelas
-    // relacionadas, só a ordenação/exibição da página precisa delas).
+    const whereClause = conditions.join(' AND ');
+
+    // Total (mesmo whereClause — inclui busca/filtros — sem JOINs, pois
+    // nenhuma condição depende das tabelas relacionadas; só a ordenação/
+    // exibição da página precisa delas).
     const countQuery = `SELECT COUNT(*) AS count FROM documents d WHERE ${whereClause}`;
     const countRows = await sql.unsafe<Array<{ count: string }>>(countQuery, params as Parameters<typeof sql.unsafe>[1]);
     const total = parseInt(countRows[0]?.count ?? '0', 10);
 
     // ------------------------------------------------------------------
-    // 3. Página com paginação por cursor composto (keyset)
+    // 3. Página com paginação por número de página (OFFSET)
     // ------------------------------------------------------------------
     const sortBy = query.sortBy;
     const sortDir = query.sortDir;
     const sortColumn = SORT_COLUMNS[sortBy];
     const dirSql = sortDir === 'asc' ? 'ASC' : 'DESC';
-    const dirCmp = sortDir === 'asc' ? '>' : '<';
 
-    const pageConditions = [...conditions];
-    const pageParams = [...params];
-    let pageParamIdx = paramIdx;
-
-    const addPageParam = (val: unknown): string => {
-      pageParams.push(val);
-      return `$${pageParamIdx++}`;
-    };
-
-    if (query.cursor !== undefined) {
-      const decoded = decodeListDocumentsCursor(query.cursor);
-      const isNullCursor = decoded.v === null;
-      if (isNullCursor && !sortColumn.nullable) {
-        // Cursor com valor nulo só é válido para a coluna nullable
-        // (`documentTypeName`) — indica cursor de outro `sortBy` reaproveitado
-        // incorretamente. Nunca deixa isso virar SQL malformado (valuePlaceholder
-        // vazio) — trata como cursor inválido (422).
-        throw new ValidationError('cursor inválido para a coluna de ordenação atual');
-      }
-      const valuePlaceholder = isNullCursor
-        ? ''
-        : `${addPageParam(decoded.v)}${sqlCastForSortColumn(sortBy)}`;
-      const idPlaceholder = addPageParam(decoded.id);
-      pageConditions.push(
-        buildKeysetCondition({
-          expr: sortColumn.expr,
-          nullable: sortColumn.nullable,
-          dirCmp,
-          valuePlaceholder,
-          idPlaceholder,
-          isNullCursor,
-        })
-      );
-    }
-    const limitPlaceholder = addPageParam(limit + 1);
+    const page = query.page;
+    const pageSize = query.pageSize;
+    const offset = (page - 1) * pageSize;
 
     const orderByClause = sortColumn.nullable
       ? `${sortColumn.expr} ${dirSql} NULLS LAST, d.id ${dirSql}`
       : `${sortColumn.expr} ${dirSql}, d.id ${dirSql}`;
+
+    // `whereClause`/`params` já resolvidos acima (mesmos usados no COUNT) —
+    // só acrescentamos LIMIT/OFFSET como parâmetros adicionais.
+    const limitPlaceholder = addParam(pageSize);
+    const offsetPlaceholder = addParam(offset);
 
     const pageQuery = `
       SELECT d.*,
@@ -1190,25 +1083,28 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       LEFT JOIN users u ON u.id = d.uploaded_by_id
       LEFT JOIN document_types dt ON dt.id = d.document_type_id
       LEFT JOIN tenants t ON t.id = d.tenant_id
-      WHERE ${pageConditions.join(' AND ')}
+      WHERE ${whereClause}
       ORDER BY ${orderByClause}
       LIMIT ${limitPlaceholder}
+      OFFSET ${offsetPlaceholder}
     `;
 
-    const docs = await sql.unsafe<DocumentListRow[]>(pageQuery, pageParams as Parameters<typeof sql.unsafe>[1]);
+    const docs = await sql.unsafe<DocumentListRow[]>(pageQuery, params as Parameters<typeof sql.unsafe>[1]);
 
-    const hasMore = docs.length > limit;
-    const page = hasMore ? docs.slice(0, limit) : docs;
-    const last = page.at(-1);
-    const nextCursor =
-      hasMore && last ? encodeListDocumentsCursor(sortValueForCursor(sortBy, last), last.id) : null;
+    const pageCount = Math.ceil(total / pageSize);
 
     request.log.info(
-      { tenantId: effectiveTenantId, userId, total, returned: page.length, sortBy, sortDir },
+      { tenantId: effectiveTenantId, userId, total, returned: docs.length, sortBy, sortDir, page, pageSize },
       'listagem de documentos'
     );
 
-    return reply.status(200).send({ items: page.map(rowToDocumentListItem), nextCursor, total });
+    return reply.status(200).send({
+      items: docs.map(rowToDocumentListItem),
+      page,
+      pageSize,
+      total,
+      pageCount,
+    });
   });
 
   // =========================================================================
