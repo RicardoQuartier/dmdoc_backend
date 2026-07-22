@@ -29,7 +29,17 @@ async function main(): Promise<void> {
     },
   });
 
-  const app = await buildApp({ config, queue, tenantDeletionQueue });
+  // Fila BullMQ de reprocessamento de IA em massa (épico E-4 / T-24).
+  // `attempts: 1` — cada job incrementa EXATAMENTE uma vez o contador do lote;
+  // retry corromperia o total (ver `createAiReprocessQueue` no worker).
+  const aiReprocessQueue = new Queue('ai-reprocess', {
+    connection: { url: config.REDIS_URL },
+    defaultJobOptions: {
+      attempts: 1,
+    },
+  });
+
+  const app = await buildApp({ config, queue, tenantDeletionQueue, aiReprocessQueue });
 
   try {
     await app.listen({ port: config.APP_PORT, host: '0.0.0.0' });

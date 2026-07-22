@@ -56,6 +56,7 @@ export interface TestDb {
 export async function resetDomainTables(db: Sql): Promise<void> {
   await db.unsafe(`
     TRUNCATE TABLE
+      ai_reprocess_batch,
       audit_logs,
       chunks,
       department_permissions,

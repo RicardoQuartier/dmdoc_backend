@@ -35,3 +35,15 @@ export {
   type SuggestIndexValuesResult,
   type SuggestIndexesResponse,
 } from './suggest-index-values.js';
+export {
+  generateTags,
+  normalizeTags,
+  GENERATE_TAGS_PROMPT,
+  GenerateTagsResponseSchema,
+  NormalizedTagsSchema,
+  MAX_GENERATED_TAGS,
+  MAX_TAG_LENGTH,
+  type GenerateTagsInput,
+  type GenerateTagsResult,
+  type GenerateTagsResponse,
+} from './generate-tags.js';

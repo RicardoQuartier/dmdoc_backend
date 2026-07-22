@@ -11,6 +11,7 @@ import { embedChunks } from './embed.js';
 import { classifyDocument } from './classify.js';
 import { persistProcessingResult } from './persist.js';
 import { suggestIndexesStep } from './suggest-indexes.js';
+import { generateTagsStep } from './generate-tags.js';
 
 export interface PipelineDeps {
   s3Bucket: string;
@@ -181,6 +182,14 @@ export async function runPipeline(
       },
       { sql, llmProvider, logger: log }
     );
+
+    // Etapa 7: Geração automática de tags (Fase 9 / E-3) — best-effort e
+    // CONSULTIVA. Roda após o persist (usa `document_content.full_text`),
+    // INDEPENDENTE do tipo (as tags são livres — cobrem PDFs com vários
+    // documentos concatenados). Gated por `tagGenerationEnabled` (plataforma
+    // AND empresa); grava só `document_content.suggested_tags` (nunca
+    // `documents.tags`). NUNCA derruba o pipeline — o documento já está READY.
+    await generateTagsStep({ tenantId, documentId }, { sql, llmProvider, logger: log });
 
     log.info({ jobId: job.id }, 'pipeline concluído com sucesso');
   } catch (err: unknown) {

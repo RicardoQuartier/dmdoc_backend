@@ -128,7 +128,7 @@ beforeEach(async () => {
       (
         ${DOC_A_ID}, ${TENANT_A}, ${DEPT_A_ID}, ${TYPE_A_ID},
         'a.pdf', 'a.pdf', 'Nota Fiscal Confirmada', 'Sugestao IA A',
-        ${hashA}, 1024, 'application/pdf', ${`tenants/${TENANT_A}/${DOC_A_ID}.pdf`}, 'READY', '{}'::text[],
+        ${hashA}, 1024, 'application/pdf', ${`tenants/${TENANT_A}/${DOC_A_ID}.pdf`}, 'READY', ${['jaboticaba', 'contrato-locacao']}::text[],
         ${testDb.db.json({ numero_nota: 'NF-123', emissao: '2026-01-10', valor_interno: 9999 })},
         ${ADMIN_A_ID}, NOW(), NOW(), 0, false
       ),
@@ -142,7 +142,7 @@ beforeEach(async () => {
       (
         ${DOC_B_ID}, ${TENANT_B}, ${DEPT_B_ID}, ${TYPE_B_ID},
         'b.pdf', 'b.pdf', 'Segredo B', 'Sugestao IA B',
-        ${hashB}, 1024, 'application/pdf', ${`tenants/${TENANT_B}/${DOC_B_ID}.pdf`}, 'READY', '{}'::text[],
+        ${hashB}, 1024, 'application/pdf', ${`tenants/${TENANT_B}/${DOC_B_ID}.pdf`}, 'READY', ${['segredo-tag-b']}::text[],
         ${testDb.db.json({ segredo_b: 'CONFIDENCIAL-B' })},
         ${ADMIN_A_ID}, NOW(), NOW(), 0, false
       )
@@ -182,18 +182,23 @@ interface RespChunk {
   documentName: string | null;
   title: string | null;
   indexValues: RespIndexValue[];
+  tags: string[];
   tenantId: string | null;
 }
 
-async function searchNeedle(token: string): Promise<RespChunk[]> {
+async function searchTerm(token: string, term: string): Promise<RespChunk[]> {
   const res = await app.inject({
     method: 'POST',
     url: '/search',
     headers: { authorization: `Bearer ${token}` },
-    payload: { query: NEEDLE, searchMode: 'lexical', generateAnswer: false },
+    payload: { query: term, searchMode: 'lexical', generateAnswer: false },
   });
   expect(res.statusCode).toBe(200);
   return (res.json() as { chunks: RespChunk[] }).chunks;
+}
+
+async function searchNeedle(token: string): Promise<RespChunk[]> {
+  return searchTerm(token, NEEDLE);
 }
 
 describe('POST /search — enriquecimento com title e indexValues (T-12)', () => {
@@ -237,6 +242,35 @@ describe('POST /search — enriquecimento com title e indexValues (T-12)', () =>
     // A sugestão bruta da IA jamais aparece como título em nenhum chunk.
     const raw = JSON.stringify(chunks);
     expect(raw).not.toContain('Sugestao IA nao confirmada');
+  });
+
+  it('expõe as tags CONFIRMADAS do documento no chunk (chips da busca — Fase 9 / E-3)', async () => {
+    const chunks = await searchNeedle(adminAToken);
+
+    const chunkA = chunks.find((c) => c.documentId === DOC_A_ID);
+    expect(chunkA).toBeDefined();
+    expect(chunkA!.tags).toEqual(['jaboticaba', 'contrato-locacao']);
+
+    // Documento sem tags confirmadas vem com array vazio (nunca undefined).
+    const chunkOld = chunks.find((c) => c.documentId === DOC_A_OLD_ID);
+    expect(chunkOld!.tags).toEqual([]);
+  });
+
+  it('busca livre por uma TAG confirmada traz o documento (case-insensitive/substring)', async () => {
+    // "jaboticaba" não aparece em nenhum texto de chunk — só na tag do DOC_A.
+    // Digitar parte da tag em caixa alta deve trazer o documento mesmo assim.
+    const chunks = await searchTerm(adminAToken, 'JABOTI');
+
+    const chunkA = chunks.find((c) => c.documentId === DOC_A_ID);
+    expect(chunkA).toBeDefined();
+    expect(chunkA!.tags).toContain('jaboticaba');
+  });
+
+  it('ISOLAMENTO: buscar pela tag do tenant B não traz o documento de B para o admin de A', async () => {
+    const chunks = await searchTerm(adminAToken, 'segredo-tag-b');
+    expect(chunks.some((c) => c.documentId === DOC_B_ID)).toBe(false);
+    const raw = JSON.stringify(chunks);
+    expect(raw).not.toContain('segredo-tag-b');
   });
 
   it('ISOLAMENTO: admin de A nunca recebe documento, título ou índices do tenant B', async () => {
