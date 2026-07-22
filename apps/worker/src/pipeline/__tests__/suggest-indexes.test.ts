@@ -29,6 +29,26 @@ vi.mock('@dmdoc/db-pg', () => ({
 vi.mock('@dmdoc/llm-provider', () => ({
   suggestIndexValues: suggestIndexValuesMock,
   SUGGEST_INDEXES_PROMPT: { version: 'suggest-indexes-v1' },
+  // Implementação real (lógica pura) — vale exercitar o merge de verdade.
+  mergeSuggestedIndexValues: (
+    currentIndexValues: Record<string, string | number | null>,
+    suggestedValues: Record<string, string>,
+    indexFields: Array<{ name: string; field_type: string }>,
+  ) => {
+    const fieldTypeByName = new Map(indexFields.map((f) => [f.name, f.field_type]));
+    const merged: Record<string, string | number | null> = { ...currentIndexValues };
+    let appliedCount = 0;
+    for (const [fieldName, rawValue] of Object.entries(suggestedValues)) {
+      const existing = merged[fieldName];
+      const isEmpty = existing === undefined || existing === null || existing === '';
+      if (!isEmpty || rawValue === '') continue;
+      const fieldType = fieldTypeByName.get(fieldName);
+      merged[fieldName] =
+        fieldType === 'NUMBER' ? (Number.isFinite(Number(rawValue)) ? Number(rawValue) : rawValue) : rawValue;
+      appliedCount += 1;
+    }
+    return { merged, appliedCount };
+  },
 }));
 
 const { suggestIndexesStep } = await import('../suggest-indexes.js');
@@ -50,12 +70,23 @@ function makeSilentLogger(): Logger {
   return logger as unknown as Logger;
 }
 
+interface SqlStubOptions {
+  /** Estado ATUAL do documento — só relevante para os testes de auto-aplicação. */
+  doc?: { document_type_id: string | null; index_values: Record<string, string | number | null> };
+}
+
 /**
  * Stub de `Sql` (postgres.js tagged template) para a etapa: devolve o conteúdo
  * do documento e os campos de índice; UPDATEs são no-op mas contabilizados.
+ * `documentsUpdates` guarda query estrutural + valores de cada `UPDATE
+ * documents` — usado para inspecionar a auto-aplicação em `index_values`.
  */
-function makeSqlStub(): { sql: Sql; updates: string[] } {
+function makeSqlStub(
+  opts: SqlStubOptions = {},
+): { sql: Sql; updates: string[]; documentsUpdates: Array<{ query: string; values: unknown[] }> } {
+  const doc = opts.doc ?? null;
   const updates: string[] = [];
+  const documentsUpdates: Array<{ query: string; values: unknown[] }> = [];
   const noop = Object.assign([], { count: 0 });
 
   function buildQuery(strings: TemplateStringsArray, values: unknown[]): string {
@@ -65,6 +96,10 @@ function makeSqlStub(): { sql: Sql; updates: string[] } {
       if (i < values.length) q += String(values[i] ?? '');
     }
     return q.toLowerCase();
+  }
+
+  function buildStructuralQuery(strings: TemplateStringsArray): string {
+    return strings.join('?').toLowerCase();
   }
 
   const sqlFn = vi.fn().mockImplementation(
@@ -89,12 +124,16 @@ function makeSqlStub(): { sql: Sql; updates: string[] } {
           },
         ]);
       }
+      if (query.includes('document_type_id') && query.includes('from documents')) {
+        return Promise.resolve(doc === null ? [] : [doc]);
+      }
       if (query.includes('update document_content')) {
         updates.push('document_content');
         return Promise.resolve(noop);
       }
       if (query.includes('update documents')) {
         updates.push('documents');
+        documentsUpdates.push({ query: buildStructuralQuery(strings as TemplateStringsArray), values });
         return Promise.resolve(noop);
       }
       return Promise.resolve(noop);
@@ -102,7 +141,7 @@ function makeSqlStub(): { sql: Sql; updates: string[] } {
   );
   (sqlFn as unknown as Record<string, unknown>)['json'] = (val: unknown) => val;
 
-  return { sql: sqlFn as unknown as Sql, updates };
+  return { sql: sqlFn as unknown as Sql, updates, documentsUpdates };
 }
 
 function makeTypeSuggestion(overrides: Partial<TypeSuggestion> = {}): TypeSuggestion {
@@ -266,5 +305,61 @@ describe('suggestIndexesStep — decisão do gatilho automático (Fase 7)', () =
       )
     ).resolves.toBeUndefined();
     expect(suggestIndexValuesMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('suggestIndexesStep — auto-aplicação de índices (gate: aiIndexAutoApplyEnabled)', () => {
+  it('aplica quando o tipo CONFIRMADO do documento é exatamente o tipo sugerido', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValue({ indexSuggestionEnabled: true, indexAutoApplyEnabled: true });
+    suggestIndexValuesMock.mockResolvedValue(coreResult());
+    const { sql, documentsUpdates } = makeSqlStub({ doc: { document_type_id: SUGGESTED_TYPE_ID, index_values: {} } });
+
+    await suggestIndexesStep(
+      { tenantId: TENANT_ID, documentId: DOCUMENT_ID, typeSuggestion: makeTypeSuggestion(), minConfidence: 0.5 },
+      { sql, llmProvider: {} as never, logger: makeSilentLogger() },
+    );
+
+    const indexUpdate = documentsUpdates.find((u) => u.query.includes('index_values = ?'));
+    expect(indexUpdate).toBeDefined();
+    expect(indexUpdate!.values[0]).toEqual({ Cliente: 'ACME Ltda' });
+  });
+
+  it('NÃO aplica quando o tipo confirmado é outro (órfão) — índice de um tipo que não é o oficial', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValue({ indexSuggestionEnabled: true, indexAutoApplyEnabled: true });
+    suggestIndexValuesMock.mockResolvedValue(coreResult());
+    const { sql, documentsUpdates } = makeSqlStub({ doc: { document_type_id: 'outro-tipo', index_values: {} } });
+
+    await suggestIndexesStep(
+      { tenantId: TENANT_ID, documentId: DOCUMENT_ID, typeSuggestion: makeTypeSuggestion(), minConfidence: 0.5 },
+      { sql, llmProvider: {} as never, logger: makeSilentLogger() },
+    );
+
+    expect(documentsUpdates.find((u) => u.query.includes('index_values = ?'))).toBeUndefined();
+  });
+
+  it('NÃO aplica quando o documento ainda não tem tipo confirmado', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValue({ indexSuggestionEnabled: true, indexAutoApplyEnabled: true });
+    suggestIndexValuesMock.mockResolvedValue(coreResult());
+    const { sql, documentsUpdates } = makeSqlStub({ doc: { document_type_id: null, index_values: {} } });
+
+    await suggestIndexesStep(
+      { tenantId: TENANT_ID, documentId: DOCUMENT_ID, typeSuggestion: makeTypeSuggestion(), minConfidence: 0.5 },
+      { sql, llmProvider: {} as never, logger: makeSilentLogger() },
+    );
+
+    expect(documentsUpdates.find((u) => u.query.includes('index_values = ?'))).toBeUndefined();
+  });
+
+  it('NÃO aplica quando aiIndexAutoApplyEnabled está desligada', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValue({ indexSuggestionEnabled: true, indexAutoApplyEnabled: false });
+    suggestIndexValuesMock.mockResolvedValue(coreResult());
+    const { sql, documentsUpdates } = makeSqlStub({ doc: { document_type_id: SUGGESTED_TYPE_ID, index_values: {} } });
+
+    await suggestIndexesStep(
+      { tenantId: TENANT_ID, documentId: DOCUMENT_ID, typeSuggestion: makeTypeSuggestion(), minConfidence: 0.5 },
+      { sql, llmProvider: {} as never, logger: makeSilentLogger() },
+    );
+
+    expect(documentsUpdates.find((u) => u.query.includes('index_values = ?'))).toBeUndefined();
   });
 });

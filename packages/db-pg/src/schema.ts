@@ -96,6 +96,13 @@ export const tenants = pgTable('tenants', {
   // confirmação manual do usuário. Mesmo esquema de dois níveis — efetivo =
   // plataforma AND empresa. Default ligado (decisão de produto).
   aiTagAutoApplyEnabled: boolean('ai_tag_auto_apply_enabled').notNull().default(true),
+  // 6ª/7ª/8ª features de IA: aplicam automaticamente as sugestões de tipo,
+  // título e índices em documents.document_type_id/title/index_values, sem
+  // exigir confirmação manual do usuário. Mesmo esquema de dois níveis da
+  // aiTagAutoApplyEnabled — efetivo = plataforma AND empresa. Default ligado.
+  aiClassificationAutoApplyEnabled: boolean('ai_classification_auto_apply_enabled').notNull().default(true),
+  aiTitleAutoApplyEnabled: boolean('ai_title_auto_apply_enabled').notNull().default(true),
+  aiIndexAutoApplyEnabled: boolean('ai_index_auto_apply_enabled').notNull().default(true),
 });
 
 // ---------------------------------------------------------------------------
@@ -119,6 +126,11 @@ export const platformSettings = pgTable('platform_settings', {
   aiTagGenerationEnabled: boolean('ai_tag_generation_enabled').notNull().default(true),
   // Kill switch global da 5ª feature de IA: aplicação automática de tags sugeridas.
   aiTagAutoApplyEnabled: boolean('ai_tag_auto_apply_enabled').notNull().default(true),
+  // Kill switch global da 6ª/7ª/8ª features de IA: aplicação automática de
+  // tipo, título e índices sugeridos.
+  aiClassificationAutoApplyEnabled: boolean('ai_classification_auto_apply_enabled').notNull().default(true),
+  aiTitleAutoApplyEnabled: boolean('ai_title_auto_apply_enabled').notNull().default(true),
+  aiIndexAutoApplyEnabled: boolean('ai_index_auto_apply_enabled').notNull().default(true),
   updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' })
     .notNull()
     .default(sql`now()`),

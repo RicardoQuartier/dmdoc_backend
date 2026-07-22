@@ -28,6 +28,34 @@ vi.mock('@dmdoc/db-pg', () => ({
 vi.mock('@dmdoc/llm-provider', () => ({
   suggestIndexValues: suggestIndexValuesMock,
   SUGGEST_INDEXES_PROMPT: { version: 'suggest-indexes-v1' },
+  // Implementação real (não mockada) — é lógica pura, vale testar de verdade
+  // o comportamento de merge/coerção através da orquestração.
+  coerceIndexValueForField: (fieldType: string, raw: string) => {
+    if (fieldType === 'NUMBER') {
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : raw;
+    }
+    return raw;
+  },
+  mergeSuggestedIndexValues: (
+    currentIndexValues: Record<string, string | number | null>,
+    suggestedValues: Record<string, string>,
+    indexFields: Array<{ name: string; field_type: string }>,
+  ) => {
+    const fieldTypeByName = new Map(indexFields.map((f) => [f.name, f.field_type]));
+    const merged: Record<string, string | number | null> = { ...currentIndexValues };
+    let appliedCount = 0;
+    for (const [fieldName, rawValue] of Object.entries(suggestedValues)) {
+      const existing = merged[fieldName];
+      const isEmpty = existing === undefined || existing === null || existing === '';
+      if (!isEmpty || rawValue === '') continue;
+      const fieldType = fieldTypeByName.get(fieldName);
+      merged[fieldName] =
+        fieldType === 'NUMBER' ? (Number.isFinite(Number(rawValue)) ? Number(rawValue) : rawValue) : rawValue;
+      appliedCount += 1;
+    }
+    return { merged, appliedCount };
+  },
 }));
 
 vi.mock('../classify.js', () => ({
@@ -49,6 +77,10 @@ const ALL_ON = {
   titleSuggestionEnabled: true,
   indexSuggestionEnabled: true,
   tagGenerationEnabled: true,
+  tagAutoApplyEnabled: true,
+  classificationAutoApplyEnabled: true,
+  titleAutoApplyEnabled: true,
+  indexAutoApplyEnabled: true,
 };
 
 function makeSilentLogger(): Logger {
@@ -65,18 +97,43 @@ function makeSilentLogger(): Logger {
 }
 
 interface SqlStubOptions {
-  doc?: { department_id: string; document_type_id: string | null; status: string } | null;
+  doc?:
+    | {
+        department_id: string;
+        document_type_id: string | null;
+        status: string;
+        title?: string | null;
+        index_values?: Record<string, string | number | null>;
+      }
+    | null;
   fullText?: string | null;
+  indexFields?: Array<{ id: string; name: string; field_type: 'TEXT' | 'DATE' | 'NUMBER' }>;
 }
 
 /**
  * Stub de `Sql`: responde às SELECTs de pré-condição/custo e contabiliza os
- * UPDATEs por tabela para verificar o que foi persistido.
+ * UPDATEs por tabela para verificar o que foi persistido. `documentsUpdates`
+ * guarda os valores interpolados de cada `UPDATE documents` (na ordem dos
+ * placeholders) para inspecionar auto-aplicação (`document_type_id`, `title`,
+ * `index_values`).
  */
-function makeSqlStub(opts: SqlStubOptions = {}): { sql: Sql; updates: string[] } {
-  const doc = opts.doc === undefined ? { department_id: 'dep', document_type_id: TYPE_ID, status: 'READY' } : opts.doc;
+function makeSqlStub(
+  opts: SqlStubOptions = {},
+): { sql: Sql; updates: string[]; documentsUpdates: Array<{ query: string; values: unknown[] }> } {
+  // `let` (não `const`): mutado quando um UPDATE de auto-aplicação toca
+  // `document_type_id`/`title`/`index_values`, para simular um banco real —
+  // necessário para testar o encadeamento title→indexes num mesmo lote
+  // (ver teste "reconsulta o tipo fresco").
+  let doc =
+    opts.doc === undefined
+      ? { department_id: 'dep', document_type_id: TYPE_ID, status: 'READY', title: null, index_values: {} }
+      : opts.doc === null
+        ? null
+        : { title: null, index_values: {}, ...opts.doc };
   const fullText = opts.fullText === undefined ? 'texto extraído do documento' : opts.fullText;
+  const indexFields = opts.indexFields ?? [];
   const updates: string[] = [];
+  const documentsUpdates: Array<{ query: string; values: unknown[] }> = [];
   const noop = Object.assign([], { count: 0 });
 
   function buildQuery(strings: TemplateStringsArray, values: unknown[]): string {
@@ -86,6 +143,12 @@ function makeSqlStub(opts: SqlStubOptions = {}): { sql: Sql; updates: string[] }
       if (i < values.length) q += String(values[i] ?? '');
     }
     return q.toLowerCase();
+  }
+
+  // Junta só os pedaços literais do template (sem interpolar valores) — usado
+  // para checar QUAIS colunas um UPDATE toca, independente do valor passado.
+  function buildStructuralQuery(strings: TemplateStringsArray): string {
+    return strings.join('?').toLowerCase();
   }
 
   const sqlFn = vi.fn().mockImplementation(
@@ -103,7 +166,7 @@ function makeSqlStub(opts: SqlStubOptions = {}): { sql: Sql; updates: string[] }
         return Promise.resolve([{ cost_breakdown: null }]);
       }
       if (query.includes('from document_type_index_fields')) {
-        return Promise.resolve([]);
+        return Promise.resolve(indexFields.map((f, i) => ({ ...f, required: false, ai_extraction_hint: null, sort_order: i, show_on_search: false, deleted: false })));
       }
       if (query.includes('update document_content')) {
         updates.push('document_content');
@@ -111,6 +174,20 @@ function makeSqlStub(opts: SqlStubOptions = {}): { sql: Sql; updates: string[] }
       }
       if (query.includes('update documents')) {
         updates.push('documents');
+        const structuralQuery = buildStructuralQuery(strings as TemplateStringsArray);
+        documentsUpdates.push({ query: structuralQuery, values });
+        // Simula persistência real: reflete a auto-aplicação no `doc` em
+        // memória, para que uma SELECT subsequente (ex.: o gate de `indexes`
+        // reconsultando o tipo após a etapa `title` auto-aplicar) veja o
+        // estado atualizado, não o snapshot inicial.
+        if (doc !== null) {
+          if (structuralQuery.includes('set document_type_id = ?')) {
+            doc = { ...doc, document_type_id: values[0] as string };
+          }
+          if (structuralQuery.includes('index_values = ?')) {
+            doc = { ...doc, index_values: values[0] as Record<string, string | number | null> };
+          }
+        }
         return Promise.resolve(noop);
       }
       return Promise.resolve(noop);
@@ -118,11 +195,17 @@ function makeSqlStub(opts: SqlStubOptions = {}): { sql: Sql; updates: string[] }
   );
   (sqlFn as unknown as Record<string, unknown>)['json'] = (val: unknown) => val;
 
-  return { sql: sqlFn as unknown as Sql, updates };
+  return { sql: sqlFn as unknown as Sql, updates, documentsUpdates };
 }
 
-function makeDeps(sql: Sql) {
-  return { sql, llmProvider: {} as never, chatModel: 'gpt-4o-mini', logger: makeSilentLogger() };
+function makeDeps(sql: Sql, overrides: { typeAutoApplyMinConfidence?: number } = {}) {
+  return {
+    sql,
+    llmProvider: {} as never,
+    chatModel: 'gpt-4o-mini',
+    logger: makeSilentLogger(),
+    typeAutoApplyMinConfidence: overrides.typeAutoApplyMinConfidence ?? 0.5,
+  };
 }
 
 function classifyOk() {
@@ -239,5 +322,116 @@ describe('runAiReprocessDocument — best-effort por etapa', () => {
     // Índices falhou best-effort (ainda conta como "run"), tags rodou normalmente.
     expect(generateTagsStepMock).toHaveBeenCalledTimes(1);
     expect(out.stepsRun).toEqual(['indexes', 'tags']);
+  });
+});
+
+describe('runAiReprocessDocument — auto-aplicação de tipo/título (gate por flag)', () => {
+  it('auto-aplica document_type_id quando classificationAutoApplyEnabled está ligada', async () => {
+    const { sql, documentsUpdates } = makeSqlStub();
+    await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['title'] }, makeDeps(sql));
+
+    const typeUpdate = documentsUpdates.find((u) => u.query.includes('document_type_id = ?'));
+    expect(typeUpdate).toBeDefined();
+    expect(typeUpdate!.values[0]).toBe(TYPE_ID);
+  });
+
+  it('NÃO auto-aplica document_type_id quando classificationAutoApplyEnabled está desligada', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValue({ ...ALL_ON, classificationAutoApplyEnabled: false });
+    const { sql, documentsUpdates } = makeSqlStub();
+    await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['title'] }, makeDeps(sql));
+
+    expect(documentsUpdates.find((u) => u.query.includes('document_type_id = ?'))).toBeUndefined();
+  });
+
+  it('NÃO auto-aplica document_type_id quando a confiança está abaixo do limiar', async () => {
+    classifyDocumentMock.mockResolvedValue({ ...classifyOk(), typeSuggestion: { ...classifyOk().typeSuggestion, confidence: 0.2 } });
+    const { sql, documentsUpdates } = makeSqlStub();
+    await runAiReprocessDocument(
+      { tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['title'] },
+      makeDeps(sql, { typeAutoApplyMinConfidence: 0.5 }),
+    );
+
+    expect(documentsUpdates.find((u) => u.query.includes('document_type_id = ?'))).toBeUndefined();
+  });
+
+  it('auto-aplica title (via COALESCE) quando titleAutoApplyEnabled está ligada', async () => {
+    const { sql, documentsUpdates } = makeSqlStub();
+    await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['title'] }, makeDeps(sql));
+
+    const titleUpdate = documentsUpdates.find((u) => u.query.includes('coalesce(title'));
+    expect(titleUpdate).toBeDefined();
+    // suggested_title, cost_usd_cents(+delta), title-a-aplicar, id, tenant_id
+    expect(titleUpdate!.values[2]).toBe('Contrato de Locação');
+  });
+
+  it('NÃO auto-aplica title quando titleAutoApplyEnabled está desligada (mas suggested_title continua sendo gravado)', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValue({ ...ALL_ON, titleAutoApplyEnabled: false });
+    const { sql, documentsUpdates } = makeSqlStub();
+    await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['title'] }, makeDeps(sql));
+
+    const titleUpdate = documentsUpdates.find((u) => u.query.includes('coalesce(title'));
+    expect(titleUpdate).toBeDefined();
+    expect(titleUpdate!.values[2]).toBeNull();
+    expect(titleUpdate!.values[0]).toBe('Contrato de Locação'); // suggested_title sempre gravado
+  });
+});
+
+describe('runAiReprocessDocument — auto-aplicação de índices (gate por flag)', () => {
+  const INDEX_FIELDS = [{ id: 'f1', name: 'vencimento', field_type: 'DATE' as const }];
+
+  it('mescla os valores sugeridos em index_values quando indexAutoApplyEnabled está ligada', async () => {
+    const { sql, documentsUpdates } = makeSqlStub({ indexFields: INDEX_FIELDS });
+    await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['indexes'] }, makeDeps(sql));
+
+    const indexUpdate = documentsUpdates.find((u) => u.query.includes('index_values = ?'));
+    expect(indexUpdate).toBeDefined();
+    expect(indexUpdate!.values[0]).toEqual({ vencimento: '2026-12-31' });
+  });
+
+  it('NÃO mescla índices quando indexAutoApplyEnabled está desligada', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValue({ ...ALL_ON, indexAutoApplyEnabled: false });
+    const { sql, documentsUpdates } = makeSqlStub({ indexFields: INDEX_FIELDS });
+    await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['indexes'] }, makeDeps(sql));
+
+    expect(documentsUpdates.find((u) => u.query.includes('index_values = ?'))).toBeUndefined();
+  });
+
+  it('não sobrescreve um campo de índice já confirmado — só preenche o que está vazio', async () => {
+    const { sql, documentsUpdates } = makeSqlStub({
+      doc: { department_id: 'dep', document_type_id: TYPE_ID, status: 'READY', index_values: { vencimento: '2020-01-01' } },
+      indexFields: INDEX_FIELDS,
+    });
+    await runAiReprocessDocument({ tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['indexes'] }, makeDeps(sql));
+
+    // Já preenchido ⇒ merge não altera nada ⇒ nenhum UPDATE de index_values disparado.
+    expect(documentsUpdates.find((u) => u.query.includes('index_values = ?'))).toBeUndefined();
+  });
+
+  it('reconsulta o tipo fresco: título e índices no MESMO lote aplicam índices mesmo quando o tipo era null antes e foi auto-aplicado pela etapa title', async () => {
+    // Documento SEM tipo confirmado antes do lote — cenário real: upload com
+    // aiClassificationAutoApplyEnabled desligada, depois ligada e reprocessado
+    // em lote pedindo title+indexes juntos.
+    const { sql, documentsUpdates } = makeSqlStub({
+      doc: { department_id: 'dep', document_type_id: null, status: 'READY', index_values: {} },
+      indexFields: INDEX_FIELDS,
+    });
+
+    const out = await runAiReprocessDocument(
+      { tenantId: TENANT_ID, documentId: DOCUMENT_ID, steps: ['title', 'indexes'] },
+      makeDeps(sql),
+    );
+
+    // A etapa title rodou e auto-aplicou o tipo (classifyOk() sugere TYPE_ID).
+    const typeUpdate = documentsUpdates.find((u) => u.query.includes('document_type_id = ?'));
+    expect(typeUpdate).toBeDefined();
+    expect(typeUpdate!.values[0]).toBe(TYPE_ID);
+
+    // A etapa indexes NÃO deveria pular por "sem tipo confirmado" — o tipo
+    // recém-aplicado pela etapa title já deve valer para o gate de indexes.
+    expect(out.stepsSkipped).not.toContain('indexes');
+    expect(out.stepsRun).toContain('indexes');
+    const indexUpdate = documentsUpdates.find((u) => u.query.includes('index_values = ?'));
+    expect(indexUpdate).toBeDefined();
+    expect(indexUpdate!.values[0]).toEqual({ vencimento: '2026-12-31' });
   });
 });

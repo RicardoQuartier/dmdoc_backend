@@ -4,6 +4,7 @@ import { resolveAiFeatureFlags } from '@dmdoc/db-pg';
 import {
   suggestIndexValues,
   SUGGEST_INDEXES_PROMPT,
+  mergeSuggestedIndexValues,
   type LLMProvider,
   type IndexFieldRow,
 } from '@dmdoc/llm-provider';
@@ -47,8 +48,15 @@ export interface SuggestIndexesStepDeps {
  * - `typeSuggestion.confidence >= minConfidence` (limiar configurável);
  * - `indexSuggestionEnabled` (plataforma AND empresa) está ligada.
  *
- * CONSULTIVA: grava apenas `document_content.index_suggestion` (sugestão) —
- * nunca escreve valores de índice confirmados nem toca `document_type_id`.
+ * Grava `document_content.index_suggestion` (sugestão) — nunca toca
+ * `document_type_id`. AUTO-APLICAÇÃO (gate: `aiIndexAutoApplyEnabled`): mescla
+ * os valores sugeridos em `documents.index_values`, campo a campo, só quando o
+ * tipo CONFIRMADO atual do documento é EXATAMENTE o tipo usado nesta sugestão
+ * (o sugerido) — evita aplicar índices de um tipo que não se tornou (ainda) o
+ * oficial (ex.: `aiClassificationAutoApplyEnabled` desligada, confiança abaixo
+ * do limiar de auto-aplicação de tipo mas acima do limiar de índices, ou o
+ * documento já tinha outro tipo confirmado manualmente antes). Nunca
+ * sobrescreve um valor já confirmado.
  *
  * BEST-EFFORT: qualquer erro (LLM fora do ar, resposta inválida, banco) é
  * logado como `warn` e NÃO derruba o pipeline — o documento já está READY.
@@ -188,6 +196,40 @@ export async function suggestIndexesStep(
       },
       'sugestão automática de índices concluída'
     );
+
+    // 7. Auto-aplicação (gate: aiIndexAutoApplyEnabled) — só quando o tipo
+    //    CONFIRMADO atual do documento é exatamente o tipo usado nesta
+    //    sugestão (auto-aplicado pela etapa de persist, ou já confirmado
+    //    manualmente antes — ex.: reprocessamento individual de um documento
+    //    já qualificado). Índices de um tipo que não é (ainda) o oficial do
+    //    documento nunca são aplicados.
+    if (flags.indexAutoApplyEnabled) {
+      const docRows = await sql<
+        Array<{ document_type_id: string | null; index_values: Record<string, string | number | null> }>
+      >`
+        SELECT document_type_id, index_values
+        FROM documents
+        WHERE id = ${documentId}
+          AND tenant_id = ${tenantId}
+        LIMIT 1
+      `;
+      const doc = docRows[0];
+      if (doc && doc.document_type_id === documentTypeId) {
+        const { merged, appliedCount } = mergeSuggestedIndexValues(doc.index_values, core.values, indexFieldRows);
+        if (appliedCount > 0) {
+          await sql`
+            UPDATE documents
+            SET index_values = ${sql.json(merged as unknown as JSONValue)}
+            WHERE id = ${documentId}
+              AND tenant_id = ${tenantId}
+          `;
+          log.info(
+            { fieldsAutoApplied: appliedCount },
+            'valores de índice aplicados automaticamente (aiIndexAutoApplyEnabled)'
+          );
+        }
+      }
+    }
   } catch (err: unknown) {
     // Best-effort: NUNCA derruba o pipeline. O documento já está READY.
     log.warn(

@@ -16,7 +16,7 @@ import {
   type AiReprocessBatchStep,
 } from '@dmdoc/db-pg';
 import type { TenantDocument } from '@dmdoc/db-pg';
-import type { Sql } from '@dmdoc/db-pg';
+import type { Sql, JSONValue } from '@dmdoc/db-pg';
 import type {
   DocumentProcessingJobData,
   ExtractionResult,
@@ -44,6 +44,7 @@ import {
   createLLMProvider,
   LLMError,
   validateIndexValues,
+  mergeSuggestedIndexValues,
   type LLMProvider,
   type IndexFieldRow,
 } from '@dmdoc/llm-provider';
@@ -1696,9 +1697,12 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     // GATILHO 2 (Fase 7): quando o PATCH DEFINE/TROCA o tipo do documento para
     // um valor não-nulo (mudança efetiva), dispara a sugestão de índices sobre
     // o NOVO tipo — aguardando (o usuário verá os valores pré-preenchidos na
-    // resposta). Best-effort e CONSULTIVA: respeita `indexSuggestionEnabled`,
-    // grava só `document_content.index_suggestion` (nunca valores confirmados) e
-    // NUNCA quebra o PATCH — falha de IA ⇒ 200 com o tipo salvo, sem sugestão.
+    // resposta). Best-effort: respeita `indexSuggestionEnabled`, grava
+    // `document_content.index_suggestion`; com `aiIndexAutoApplyEnabled`
+    // ligada, também mescla em `documents.index_values` (só campos vazios —
+    // aqui o tipo já é sempre o CONFIRMADO, sem o problema do "tipo órfão" do
+    // gatilho automático de upload). NUNCA quebra o PATCH — falha de IA ⇒ 200
+    // com o tipo salvo, sem sugestão.
     // -----------------------------------------------------------------------
     const typeChangedToNonNull =
       'documentTypeId' in body &&
@@ -1708,6 +1712,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     let suggestedIndexFields: Awaited<
       ReturnType<typeof suggestDocumentIndexes>
     >['fields'] | undefined;
+    let appliedIndexValues: Record<string, string | number | null> | undefined;
 
     if (typeChangedToNonNull) {
       const log = request.log.child({ tenantId, documentId: doc.id, userId, traceId: request.id });
@@ -1727,6 +1732,30 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
             },
             'sugestão de índices gerada após definição de tipo no PATCH'
           );
+
+          if (aiFlags.indexAutoApplyEnabled) {
+            const indexFieldRows = await sql<IndexFieldRow[]>`
+              SELECT id, name, field_type, required, ai_extraction_hint, sort_order, show_on_search, deleted
+              FROM document_type_index_fields
+              WHERE document_type_id = ${effectiveDocumentTypeId}
+                AND deleted = false
+            `;
+            const suggestedRaw = Object.fromEntries(
+              suggestion.fields.filter((f) => f.value !== null).map((f) => [f.name, f.value as string])
+            );
+            const currentIndexValues = (updated as DocumentRow).index_values ?? {};
+            const { merged, appliedCount } = mergeSuggestedIndexValues(currentIndexValues, suggestedRaw, indexFieldRows);
+            if (appliedCount > 0) {
+              await sql`
+                UPDATE documents
+                SET index_values = ${sql.json(merged as unknown as JSONValue)}
+                WHERE id = ${id}
+                  AND tenant_id = ${tenantId}
+              `;
+              appliedIndexValues = merged;
+              (updated as DocumentRow).index_values = merged;
+            }
+          }
         } else {
           log.info({}, 'sugestão de índices no PATCH pulada: feature desabilitada para a empresa');
         }
@@ -1742,6 +1771,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     return reply.status(200).send({
       ...rowToDocument(updated as DocumentRow),
       ...(suggestedIndexFields !== undefined ? { suggestedIndexFields } : {}),
+      ...(appliedIndexValues !== undefined ? { appliedIndexValues } : {}),
     });
   });
 
@@ -2326,7 +2356,9 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
   // POST /documents/:id/suggest-indexes — sugestão de valores de índice por IA
   // (Fase 7, entregável #55). Sob demanda — nunca roda automaticamente no
   // worker. Requer `documentTypeId` já definido (checado pelo próprio service
-  // `suggestDocumentIndexes`, que lança `ValidationError` caso contrário).
+  // `suggestDocumentIndexes`, que lança `ValidationError` caso contrário). Com
+  // `aiIndexAutoApplyEnabled` ligada, mescla os valores sugeridos em
+  // `documents.index_values` (só os campos ainda vazios).
   // =========================================================================
   app.post('/documents/:id/suggest-indexes', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
@@ -2415,21 +2447,61 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       'sugestão de índices retornada'
     );
 
+    // ------------------------------------------------------------------
+    // 3.1 Aplicação automática (gate: aiIndexAutoApplyEnabled) — o tipo aqui já
+    //     é sempre o CONFIRMADO (pré-condição do próprio service), então não há
+    //     o problema do "tipo órfão" do gatilho automático de upload. Mescla os
+    //     valores sugeridos em `documents.index_values`, campo a campo, só nos
+    //     que ainda estão vazios — nunca sobrescreve um valor já confirmado.
+    //     Busca `index_values` FRESCO (não o `doc` resolvido no passo 1, que
+    //     pode estar desatualizado após a chamada ao LLM) para minimizar a
+    //     janela de corrida com um PATCH concorrente.
+    // ------------------------------------------------------------------
+    let appliedIndexValues: Record<string, string | number | null> | undefined;
+    if (aiFlags.indexAutoApplyEnabled) {
+      const freshRows = await sql<Array<{ index_values: Record<string, string | number | null> }>>`
+        SELECT index_values FROM documents WHERE id = ${id} AND tenant_id = ${tenantId} LIMIT 1
+      `;
+      const currentIndexValues = freshRows[0]?.index_values ?? {};
+      const indexFieldRows = await sql<IndexFieldRow[]>`
+        SELECT id, name, field_type, required, ai_extraction_hint, sort_order, show_on_search, deleted
+        FROM document_type_index_fields
+        WHERE document_type_id = ${doc.document_type_id}
+          AND deleted = false
+      `;
+      const suggestedRaw = Object.fromEntries(
+        fields.filter((f) => f.value !== null).map((f) => [f.name, f.value as string])
+      );
+      const { merged, appliedCount } = mergeSuggestedIndexValues(currentIndexValues, suggestedRaw, indexFieldRows);
+      if (appliedCount > 0) {
+        await sql`
+          UPDATE documents
+          SET index_values = ${sql.json(merged as unknown as JSONValue)}
+          WHERE id = ${id}
+            AND tenant_id = ${tenantId}
+        `;
+        appliedIndexValues = merged;
+      }
+    }
+
     return reply.status(200).send({
       fields,
       model: result.indexSuggestion.model,
       promptVersion: result.indexSuggestion.promptVersion,
       suggestedAt: result.indexSuggestion.suggestedAt,
       costUsd: result.costUsd,
+      ...(appliedIndexValues !== undefined ? { appliedIndexValues } : {}),
     });
   });
 
   // =========================================================================
   // POST /documents/:id/classify — classificação automática de tipo por IA
   // (Fase 8, entregável #61). Sob demanda — re-sugere o tipo de um documento já
-  // processado. CONSULTIVO: persiste `document_content.type_suggestion` (e o
-  // `documents.suggested_title`, quando a feature de título está ligada), mas
-  // NUNCA sobrescreve `documents.document_type_id` (escolha manual do usuário).
+  // processado. Persiste `document_content.type_suggestion` (e o
+  // `documents.suggested_title`, quando a feature de título está ligada); com
+  // `aiClassificationAutoApplyEnabled`/`aiTitleAutoApplyEnabled` ligadas,
+  // também preenche `document_type_id`/`title` quando ainda vazios (nunca
+  // sobrescreve uma escolha manual já existente).
   // Espelha o guard/escopo de `POST /documents/:id/suggest-indexes`.
   // =========================================================================
   app.post('/documents/:id/classify', { preHandler: app.authenticate }, async (request, reply) => {
@@ -2520,8 +2592,52 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     );
 
     // ------------------------------------------------------------------
+    // 3.1 Aplicação automática de TIPO e TÍTULO (aiClassificationAutoApplyEnabled
+    //     / aiTitleAutoApplyEnabled) — mesmo padrão de auto-apply já usado em
+    //     POST /documents/:id/generate-tags: preenche document_type_id/title
+    //     quando ainda VAZIOS, sem exigir clique manual do usuário. Cada UPDATE
+    //     é guiado por WHERE ... IS NULL / COALESCE — race-safe contra um PATCH
+    //     concorrente. Nunca sobrescreve uma confirmação já existente.
+    // ------------------------------------------------------------------
+    let appliedType: { documentTypeId: string; documentTypeName: string | null } | undefined;
+    if (
+      aiFlags.classificationAutoApplyEnabled &&
+      result.typeSuggestion.documentTypeId !== null &&
+      result.typeSuggestion.confidence >= config.DMDOC_INDEX_SUGGESTION_MIN_CONFIDENCE
+    ) {
+      const applied = await sql`
+        UPDATE documents
+        SET document_type_id = ${result.typeSuggestion.documentTypeId}
+        WHERE id = ${id}
+          AND tenant_id = ${tenantId}
+          AND document_type_id IS NULL
+      `;
+      if (applied.count > 0) {
+        appliedType = {
+          documentTypeId: result.typeSuggestion.documentTypeId,
+          documentTypeName: result.typeSuggestion.documentTypeName,
+        };
+      }
+    }
+
+    let appliedTitle: string | undefined;
+    if (aiFlags.titleAutoApplyEnabled && result.suggestedTitle !== null) {
+      const applied = await sql`
+        UPDATE documents
+        SET title = COALESCE(title, ${result.suggestedTitle})
+        WHERE id = ${id}
+          AND tenant_id = ${tenantId}
+          AND title IS NULL
+      `;
+      if (applied.count > 0) {
+        appliedTitle = result.suggestedTitle;
+      }
+    }
+
+    // ------------------------------------------------------------------
     // 4. Resposta 200 — subconjunto do TypeSuggestion (sem rawResponse) +
-    //    título sugerido + custo desta chamada.
+    //    título sugerido + custo desta chamada. `appliedType`/`appliedTitle`
+    //    só aparecem quando a auto-aplicação efetivamente mudou algo.
     // ------------------------------------------------------------------
     return reply.status(200).send({
       typeSuggestion: {
@@ -2534,6 +2650,8 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       },
       suggestedTitle: result.suggestedTitle,
       costUsd: result.costUsd,
+      ...(appliedType !== undefined ? { appliedType } : {}),
+      ...(appliedTitle !== undefined ? { appliedTitle } : {}),
     });
   });
 

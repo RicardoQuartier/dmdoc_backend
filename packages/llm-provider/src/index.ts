@@ -29,11 +29,14 @@ export {
   normalizeNumberPtBr,
   SUGGEST_INDEXES_PROMPT,
   SuggestIndexesResponseSchema,
+  coerceIndexValueForField,
+  mergeSuggestedIndexValues,
   type IndexFieldRow,
   type SuggestedIndexField,
   type SuggestIndexValuesInput,
   type SuggestIndexValuesResult,
   type SuggestIndexesResponse,
+  type MergeSuggestedIndexValuesResult,
 } from './suggest-index-values.js';
 export {
   generateTags,

@@ -9,6 +9,9 @@ const PatchPlatformSettingsBodySchema = z.object({
   aiIndexSuggestionEnabled: z.boolean().optional(),
   aiTagGenerationEnabled: z.boolean().optional(),
   aiTagAutoApplyEnabled: z.boolean().optional(),
+  aiClassificationAutoApplyEnabled: z.boolean().optional(),
+  aiTitleAutoApplyEnabled: z.boolean().optional(),
+  aiIndexAutoApplyEnabled: z.boolean().optional(),
 });
 
 type PlatformSettingsRow = {
@@ -18,6 +21,9 @@ type PlatformSettingsRow = {
   ai_index_suggestion_enabled: boolean;
   ai_tag_generation_enabled: boolean;
   ai_tag_auto_apply_enabled: boolean;
+  ai_classification_auto_apply_enabled: boolean;
+  ai_title_auto_apply_enabled: boolean;
+  ai_index_auto_apply_enabled: boolean;
   updated_at: Date;
 };
 
@@ -29,6 +35,9 @@ function toResponse(r: PlatformSettingsRow) {
     aiIndexSuggestionEnabled: r.ai_index_suggestion_enabled,
     aiTagGenerationEnabled: r.ai_tag_generation_enabled,
     aiTagAutoApplyEnabled: r.ai_tag_auto_apply_enabled,
+    aiClassificationAutoApplyEnabled: r.ai_classification_auto_apply_enabled,
+    aiTitleAutoApplyEnabled: r.ai_title_auto_apply_enabled,
+    aiIndexAutoApplyEnabled: r.ai_index_auto_apply_enabled,
     updatedAt: r.updated_at,
   };
 }
@@ -56,7 +65,7 @@ export const adminPlatformSettingsRoutes: FastifyPluginAsync = async (app) => {
 
     const sql = app.db;
     const rows = await sql<PlatformSettingsRow[]>`
-      SELECT id, ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled, updated_at
+      SELECT id, ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled, ai_classification_auto_apply_enabled, ai_title_auto_apply_enabled, ai_index_auto_apply_enabled, updated_at
       FROM platform_settings
       LIMIT 1
     `;
@@ -83,7 +92,7 @@ export const adminPlatformSettingsRoutes: FastifyPluginAsync = async (app) => {
 
     if (Object.keys(updates).length === 0) {
       const rows = await sql<PlatformSettingsRow[]>`
-        SELECT id, ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, updated_at
+        SELECT id, ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled, ai_classification_auto_apply_enabled, ai_title_auto_apply_enabled, ai_index_auto_apply_enabled, updated_at
         FROM platform_settings
         LIMIT 1
       `;
@@ -97,7 +106,7 @@ export const adminPlatformSettingsRoutes: FastifyPluginAsync = async (app) => {
     // Captura o estado ANTES da atualização — necessário para o AuditLog
     // (registra valores antes/depois de cada flag alterada).
     const beforeRows = await sql<PlatformSettingsRow[]>`
-      SELECT id, ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled, updated_at
+      SELECT id, ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled, ai_classification_auto_apply_enabled, ai_title_auto_apply_enabled, ai_index_auto_apply_enabled, updated_at
       FROM platform_settings
       LIMIT 1
     `;
@@ -132,6 +141,18 @@ export const adminPlatformSettingsRoutes: FastifyPluginAsync = async (app) => {
       setParts.push(`ai_tag_auto_apply_enabled = $${paramIdx++}`);
       values.push(updates.aiTagAutoApplyEnabled);
     }
+    if (updates.aiClassificationAutoApplyEnabled !== undefined) {
+      setParts.push(`ai_classification_auto_apply_enabled = $${paramIdx++}`);
+      values.push(updates.aiClassificationAutoApplyEnabled);
+    }
+    if (updates.aiTitleAutoApplyEnabled !== undefined) {
+      setParts.push(`ai_title_auto_apply_enabled = $${paramIdx++}`);
+      values.push(updates.aiTitleAutoApplyEnabled);
+    }
+    if (updates.aiIndexAutoApplyEnabled !== undefined) {
+      setParts.push(`ai_index_auto_apply_enabled = $${paramIdx++}`);
+      values.push(updates.aiIndexAutoApplyEnabled);
+    }
     setParts.push('updated_at = now()');
 
     // Sem WHERE por id — a tabela tem uma única linha (invariante garantido
@@ -139,7 +160,7 @@ export const adminPlatformSettingsRoutes: FastifyPluginAsync = async (app) => {
     const query = `
       UPDATE platform_settings
       SET ${setParts.join(', ')}
-      RETURNING id, ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled, updated_at
+      RETURNING id, ai_classification_enabled, ai_title_suggestion_enabled, ai_index_suggestion_enabled, ai_tag_generation_enabled, ai_tag_auto_apply_enabled, ai_classification_auto_apply_enabled, ai_title_auto_apply_enabled, ai_index_auto_apply_enabled, updated_at
     `;
 
     const rows = await sql.unsafe<PlatformSettingsRow[]>(query, values as Parameters<typeof sql.unsafe>[1]);
@@ -181,6 +202,24 @@ export const adminPlatformSettingsRoutes: FastifyPluginAsync = async (app) => {
       changes['aiTagAutoApplyEnabled'] = {
         before: before.ai_tag_auto_apply_enabled,
         after: row.ai_tag_auto_apply_enabled,
+      };
+    }
+    if (updates.aiClassificationAutoApplyEnabled !== undefined) {
+      changes['aiClassificationAutoApplyEnabled'] = {
+        before: before.ai_classification_auto_apply_enabled,
+        after: row.ai_classification_auto_apply_enabled,
+      };
+    }
+    if (updates.aiTitleAutoApplyEnabled !== undefined) {
+      changes['aiTitleAutoApplyEnabled'] = {
+        before: before.ai_title_auto_apply_enabled,
+        after: row.ai_title_auto_apply_enabled,
+      };
+    }
+    if (updates.aiIndexAutoApplyEnabled !== undefined) {
+      changes['aiIndexAutoApplyEnabled'] = {
+        before: before.ai_index_auto_apply_enabled,
+        after: row.ai_index_auto_apply_enabled,
       };
     }
 

@@ -164,6 +164,7 @@ export async function runPipeline(
         suggestedTitle,
         classificationUsd,
         pipelineStartedAt,
+        typeAutoApplyMinConfidence: indexSuggestionMinConfidence,
       },
       { sql, logger: log }
     );

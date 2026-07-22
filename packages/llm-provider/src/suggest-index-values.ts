@@ -534,3 +534,55 @@ export async function suggestIndexValues(
     costUsd: totalCostUsd,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Auto-aplicação (aiIndexAutoApplyEnabled) — núcleo puro de merge
+// ---------------------------------------------------------------------------
+
+/**
+ * Converte o valor sugerido (sempre string, já normalizado pelo núcleo acima)
+ * para o mesmo formato usado quando o usuário salva manualmente no
+ * `IndexValuesForm` (`dmdoc_front`): campos NUMBER viram `number`, os demais
+ * permanecem `string`. Mantém `documents.index_values` consistente
+ * independente de quem preencheu (IA ou usuário).
+ */
+export function coerceIndexValueForField(fieldType: IndexFieldRow['field_type'], raw: string): string | number {
+  if (fieldType === 'NUMBER') {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : raw;
+  }
+  return raw;
+}
+
+export interface MergeSuggestedIndexValuesResult {
+  merged: Record<string, string | number | null>;
+  appliedCount: number;
+}
+
+/**
+ * Mescla valores de índice SUGERIDOS pela IA nos valores já CONFIRMADOS de um
+ * documento — núcleo puro (sem banco), reaproveitado por TODOS os pontos de
+ * auto-aplicação (upload/reprocessamento individual, reprocessamento em lote,
+ * `PATCH /documents/:id` ao definir o tipo, endpoint sob demanda). Só preenche
+ * campos ainda vazios (`undefined`/`null`/string vazia) — nunca sobrescreve um
+ * valor já confirmado manualmente. Mesma regra do merge manual de tags
+ * (`mergeConfirmedTags` em `@dmdoc/shared-types`).
+ */
+export function mergeSuggestedIndexValues(
+  currentIndexValues: Record<string, string | number | null>,
+  suggestedValues: Record<string, string>,
+  indexFields: IndexFieldRow[]
+): MergeSuggestedIndexValuesResult {
+  const fieldTypeByName = new Map(indexFields.map((f) => [f.name, f.field_type]));
+  const merged: Record<string, string | number | null> = { ...currentIndexValues };
+  let appliedCount = 0;
+  for (const [fieldName, rawValue] of Object.entries(suggestedValues)) {
+    const existing = merged[fieldName];
+    const isEmpty = existing === undefined || existing === null || existing === '';
+    if (!isEmpty || rawValue === '') continue;
+    const fieldType = fieldTypeByName.get(fieldName);
+    merged[fieldName] = fieldType ? coerceIndexValueForField(fieldType, rawValue) : rawValue;
+    appliedCount += 1;
+  }
+  return { merged, appliedCount };
+}
