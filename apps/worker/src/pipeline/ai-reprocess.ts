@@ -75,23 +75,25 @@ interface DocRow {
  *               persiste `index_suggestion`.
  * - `tags`    → geração automática de tags (E-3), persiste `suggested_tags`.
  *
- * AUTO-APLICAÇÃO (pedido do Owner, 2026-07-22): em QUALQUER gatilho de IA —
- * upload, reprocessamento individual, reprocessamento em lote, endpoints sob
- * demanda — cada sugestão gerada é aplicada automaticamente nos campos
- * CONFIRMADOS do documento, sem exigir confirmação manual, DESDE QUE a flag
- * dedicada esteja ligada (efetivo = plataforma AND empresa, default LIGADA):
+ * AUTO-APLICAÇÃO (pedido do Owner, 2026-07-22, revisado em 2026-07-22 para
+ * SOBRESCRITA): em QUALQUER gatilho de IA — upload, reprocessamento
+ * individual, reprocessamento em lote, endpoints sob demanda — cada sugestão
+ * gerada é aplicada automaticamente nos campos do documento, sem exigir
+ * confirmação manual, DESDE QUE a flag dedicada esteja ligada (efetivo =
+ * plataforma AND empresa, default LIGADA):
  * - `title`   → `document_type_id` (`aiClassificationAutoApplyEnabled`, com
- *               limiar de confiança) e `title` (`aiTitleAutoApplyEnabled`).
- * - `indexes` → cada campo sugerido é mesclado em `index_values`
- *               (`aiIndexAutoApplyEnabled`).
- * - `tags`    → mescla em `documents.tags` (via `generateTagsStep`, que já
- *               reaproveita a flag `aiTagAutoApplyEnabled` em TODOS os
- *               gatilhos, inclusive este).
- * Em todos os casos, a auto-aplicação SÓ preenche campos ainda VAZIOS — nunca
- * sobrescreve uma confirmação manual já existente (o gesto explícito do
- * usuário sempre vence). Cada UPDATE decide isso contra o estado ATUAL da
- * linha no banco (`WHERE ... IS NULL`), nunca contra um valor lido
- * antecipadamente em JS — race-safe mesmo com uma confirmação concorrente.
+ *               limiar de confiança) e `title` (`aiTitleAutoApplyEnabled`) são
+ *               SUBSTITUÍDOS pela sugestão desta rodada, mesmo já havendo um
+ *               valor confirmado — só preservam o valor atual quando a
+ *               sugestão desta rodada vier vazia/nula (ou, no caso do tipo,
+ *               com confiança insuficiente).
+ * - `indexes` → cada campo sugerido SUBSTITUI o valor confirmado quando vier
+ *               preenchido (`aiIndexAutoApplyEnabled`); um campo sem sugestão
+ *               nesta rodada preserva o valor já confirmado.
+ * - `tags`    → CONTINUA só somando (nunca sobrescreve/remove) via
+ *               `generateTagsStep`, que reaproveita a flag
+ *               `aiTagAutoApplyEnabled` em TODOS os gatilhos, inclusive este —
+ *               tags têm semântica aditiva, não de substituição.
  *
  * Gating: `resolveAiFeatureFlags` (plataforma AND empresa) — etapa desligada é
  * PULADA (não é erro). BEST-EFFORT por etapa: falha de LLM/validação numa etapa
@@ -100,7 +102,8 @@ interface DocRow {
  * (a acumulação vive dentro dos núcleos/persist, como no upload).
  *
  * IDEMPOTENTE: rerodar sobrescreve as sugestões consultivas e reaplica a
- * auto-aplicação sobre os campos ainda vazios — nunca duplica dados.
+ * auto-aplicação (tipo/título/índices substituem; tags só somam) — nunca
+ * duplica dados.
  *
  * @throws {AiReprocessPreconditionError} documento inexistente/sem texto —
  *   o processor conta o documento como `failed`.
@@ -340,9 +343,11 @@ async function reprocessTitleStep(
   `;
 
   // Auto-aplicação do TIPO (gate: aiClassificationAutoApplyEnabled + limiar de
-  // confiança): só preenche `document_type_id` quando o documento ainda não
-  // tem um tipo CONFIRMADO (checado pelo próprio WHERE, não por um SELECT
-  // antecipado) e a IA identificou um tipo compatível com confiança suficiente.
+  // confiança), COM SOBRESCRITA (decisão do Owner, 2026-07-22): substitui
+  // `document_type_id` mesmo já havendo um tipo confirmado, desde que a IA
+  // identifique um tipo compatível com confiança suficiente nesta rodada — uma
+  // reclassificação sem match (documentTypeId null ou confiança baixa) não
+  // entra aqui, preservando o tipo já confirmado.
   if (
     classificationAutoApplyEnabled &&
     typeSuggestion.documentTypeId !== null &&
@@ -353,28 +358,32 @@ async function reprocessTitleStep(
       SET document_type_id = ${typeSuggestion.documentTypeId}
       WHERE id = ${documentId}
         AND tenant_id = ${tenantId}
-        AND document_type_id IS NULL
     `;
   }
 
   // suggested_title só é gravado quando a feature de título está ligada — para
   // NÃO apagar (null) uma sugestão anterior quando só a classificação roda.
   // cost_usd_cents SEMPRE incrementado, nunca sobrescrito. Auto-aplicação do
-  // TÍTULO (gate: aiTitleAutoApplyEnabled): preenche `title` quando ainda vazio
-  // e há sugestão. `COALESCE(title, ...)` — não o inverso — é avaliado pelo
-  // próprio Postgres contra o valor ATUAL da coluna, nunca sobrescrevendo um
-  // título já confirmado (inclusive por uma escrita concorrente).
+  // TÍTULO (gate: aiTitleAutoApplyEnabled), COM SOBRESCRITA: substitui `title`
+  // pela sugestão desta rodada mesmo já havendo um título confirmado — só
+  // preserva o valor atual quando a sugestão desta rodada vier vazia/nula.
   const deltaCents = Math.ceil(classificationUsd * 100);
   if (titleSuggestionEnabled) {
-    const titleToApply = titleAutoApplyEnabled ? outcome.suggestedTitle : null;
     await sql`
       UPDATE documents
       SET suggested_title = ${outcome.suggestedTitle},
-          cost_usd_cents = cost_usd_cents + ${deltaCents},
-          title = COALESCE(title, ${titleToApply})
+          cost_usd_cents = cost_usd_cents + ${deltaCents}
       WHERE id = ${documentId}
         AND tenant_id = ${tenantId}
     `;
+    if (titleAutoApplyEnabled && outcome.suggestedTitle !== null) {
+      await sql`
+        UPDATE documents
+        SET title = ${outcome.suggestedTitle}
+        WHERE id = ${documentId}
+          AND tenant_id = ${tenantId}
+      `;
+    }
   } else if (deltaCents > 0) {
     await sql`
       UPDATE documents
@@ -395,7 +404,7 @@ interface ReprocessIndexesParams {
   /** Tipo CONFIRMADO do documento (nunca o sugerido — semântica on-demand). */
   documentTypeId: string;
   fullText: string;
-  /** Valores de índice já CONFIRMADOS — auto-aplicação só preenche campos vazios. */
+  /** Valores de índice já CONFIRMADOS — auto-aplicação com sobrescrita, campo a campo. */
   currentIndexValues: Record<string, string | number | null>;
   /** Auto-aplica os valores sugeridos em `index_values` (campo a campo). */
   indexAutoApplyEnabled: boolean;
@@ -406,10 +415,11 @@ interface ReprocessIndexesParams {
  * `index_suggestion` + custo acumulado. Espelha o caminho on-demand de
  * `apps/api/.../index-suggestion.ts` (núcleo `suggestIndexValues` compartilhado).
  *
- * AUTO-APLICAÇÃO (gate: aiIndexAutoApplyEnabled): mescla os valores sugeridos
- * em `documents.index_values` via `mergeSuggestedIndexValues` (núcleo
- * compartilhado de `@dmdoc/llm-provider`) — só preenche o que ainda está vazio
- * (`undefined`/`null`/string vazia), nunca sobrescreve um valor já confirmado.
+ * AUTO-APLICAÇÃO (gate: aiIndexAutoApplyEnabled), COM SOBRESCRITA: mescla os
+ * valores sugeridos em `documents.index_values` via `mergeSuggestedIndexValues`
+ * (núcleo compartilhado de `@dmdoc/llm-provider`) — cada campo sugerido
+ * SUBSTITUI o valor já confirmado; só preserva o valor atual de um campo
+ * quando a sugestão desta rodada vier vazia para aquele campo especificamente.
  *
  * BEST-EFFORT: qualquer erro (LLM/validação/banco) é logado como `warn` e NÃO
  * derruba o documento nem as outras etapas.

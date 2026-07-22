@@ -459,7 +459,7 @@ function makeTypeSuggestion(overrides: { documentTypeId?: string | null; confide
   };
 }
 
-describe('persistProcessingResult — auto-aplicação de tipo/título (gate por flag)', () => {
+describe('persistProcessingResult — auto-aplicação de tipo/título (gate por flag, COM SOBRESCRITA)', () => {
   it('auto-aplica document_type_id quando classificationAutoApplyEnabled está ligada e a confiança é suficiente', async () => {
     resolveAiFeatureFlagsMock.mockResolvedValueOnce({ classificationAutoApplyEnabled: true });
     const { sql, documentsUpdates } = makeAutoApplySqlStub();
@@ -482,6 +482,11 @@ describe('persistProcessingResult — auto-aplicação de tipo/título (gate por
     const typeUpdate = documentsUpdates.find((u) => u.query.includes('document_type_id = ?'));
     expect(typeUpdate).toBeDefined();
     expect(typeUpdate!.values[0]).toBe('type-1');
+    // SOBRESCRITA (decisão do Owner, 2026-07-22): sem WHERE ... IS NULL — o
+    // UPDATE substitui incondicionalmente (dado o gate de confiança já ter
+    // passado), mesmo que o documento já tivesse um tipo confirmado antes
+    // (ex.: reprocessamento individual reusa este mesmo pipeline).
+    expect(typeUpdate!.query).not.toContain('is null');
   });
 
   it('NÃO auto-aplica document_type_id quando classificationAutoApplyEnabled está desligada', async () => {
@@ -528,7 +533,29 @@ describe('persistProcessingResult — auto-aplicação de tipo/título (gate por
     expect(documentsUpdates.find((u) => u.query.includes('document_type_id = ?'))).toBeUndefined();
   });
 
-  it('auto-aplica title (via COALESCE) quando titleAutoApplyEnabled está ligada', async () => {
+  it('preserva document_type_id quando a classificação não sugere tipo (documentTypeId null), mesmo com a flag ligada', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValueOnce({ classificationAutoApplyEnabled: true });
+    const { sql, documentsUpdates } = makeAutoApplySqlStub();
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(1),
+        embeddedChunks: [],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: { ...makeTypeSuggestion(), documentTypeId: null },
+        suggestedTitle: null,
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    expect(documentsUpdates.find((u) => u.query.includes('document_type_id = ?'))).toBeUndefined();
+  });
+
+  it('SOBRESCREVE title (sem COALESCE) quando titleAutoApplyEnabled está ligada e a sugestão vem preenchida', async () => {
     resolveAiFeatureFlagsMock.mockResolvedValueOnce({ titleAutoApplyEnabled: true });
     const { sql, documentsUpdates } = makeAutoApplySqlStub();
 
@@ -547,9 +574,13 @@ describe('persistProcessingResult — auto-aplicação de tipo/título (gate por
       { sql, logger: makeSilentLogger() }
     );
 
-    const titleUpdate = documentsUpdates.find((u) => u.query.includes('coalesce(title'));
+    const titleUpdate = documentsUpdates.find((u) => u.query.includes('set title = ?'));
     expect(titleUpdate).toBeDefined();
     expect(titleUpdate!.values[0]).toBe('Título sugerido pela IA');
+    // SOBRESCRITA (decisão do Owner, 2026-07-22): nem COALESCE nem WHERE title
+    // IS NULL — substitui incondicionalmente um título já confirmado.
+    expect(titleUpdate!.query).not.toContain('coalesce');
+    expect(titleUpdate!.query).not.toContain('is null');
   });
 
   it('NÃO auto-aplica title quando titleAutoApplyEnabled está desligada', async () => {
@@ -571,6 +602,28 @@ describe('persistProcessingResult — auto-aplicação de tipo/título (gate por
       { sql, logger: makeSilentLogger() }
     );
 
-    expect(documentsUpdates.find((u) => u.query.includes('coalesce(title'))).toBeUndefined();
+    expect(documentsUpdates.find((u) => u.query.includes('set title = ?'))).toBeUndefined();
+  });
+
+  it('preserva title quando a sugestão desta rodada vier nula, mesmo com titleAutoApplyEnabled ligada', async () => {
+    resolveAiFeatureFlagsMock.mockResolvedValueOnce({ titleAutoApplyEnabled: true });
+    const { sql, documentsUpdates } = makeAutoApplySqlStub();
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(1),
+        embeddedChunks: [],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: null,
+        suggestedTitle: null,
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    expect(documentsUpdates.find((u) => u.query.includes('set title = ?'))).toBeUndefined();
   });
 });
