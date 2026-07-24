@@ -52,7 +52,7 @@ const MAX_ATTEMPTS = 2;
 /**
  * Prompt de geração de tags por IA (Fase 9 / E-3).
  *
- * Versão: generate-tags-v1
+ * Versão: generate-tags-v2
  *
  * O modelo recebe o texto do documento e deve investigar e extrair até 30 tags
  * curtas com as informações mais relevantes — nomes, datas, valores, números de
@@ -60,18 +60,26 @@ const MAX_ATTEMPTS = 2;
  * documento depois. A normalização final (trim, dedupe, teto) é feita DEPOIS da
  * resposta, em `generateTags` — o prompt só pede a lista.
  *
+ * v2 (bugfix): a v1 deixava o modelo quebrar pares rótulo+valor em duas tags
+ * soltas (ex.: "NFS-e" e "22" em vez de "NFS-e: 22"), o que reduz a utilidade
+ * da tag para busca/leitura. A regra 2 agora exige explicitamente o formato
+ * "Rótulo: valor" para informação composta, com exemplos.
+ *
  * A versão é gravada junto com o resultado para rastrear o que reprocessar
  * quando o prompt evoluir (invariante de prompt versionado — spec §11). Um bump
  * futuro é apenas de rastreabilidade — NÃO força reprocessamento.
  */
 export const GENERATE_TAGS_PROMPT = {
-  version: 'generate-tags-v1',
+  version: 'generate-tags-v2',
 
   systemPrompt: `Você investiga documentos empresariais brasileiros e gera TAGS de busca com as informações mais relevantes do documento.
 
 Regras obrigatórias:
 1. Extraia até ${MAX_GENERATED_TAGS} tags (pode ser menos — só o que for realmente relevante; NÃO precisa chegar a ${MAX_GENERATED_TAGS}).
 2. Uma tag é um termo CURTO (no máximo ${MAX_TAG_LENGTH} caracteres) que identifica uma informação útil para encontrar o documento depois: nomes de pessoas/empresas, datas, valores monetários, números de documento (CNPJ, CPF, nota fiscal, contrato, boleto), tipos de documento, produtos, locais, ou qualquer dado relevante a seu critério.
+   - Quando a informação for COMPOSTA (um rótulo que identifica o tipo do dado + o valor correspondente), gere UMA ÚNICA tag no formato "Rótulo: valor". NUNCA separe o rótulo e o valor em duas tags distintas.
+   - Exemplos corretos: "NFS-e: 22" (nunca "NFS-e" e "22" soltos), "CNPJ: 26.575.462/0001-20", "Valor: R$ 16.800,00", "Data de emissão: 12/03/2026", "Contrato nº: 4521", "Nota Fiscal: 000.123.456".
+   - Tags de nome próprio sem rótulo associado (ex.: "ACME Ltda", "João da Silva") continuam sendo geradas normalmente, sem forçar um rótulo artificial.
 3. Use APENAS informações presentes no texto. Nunca invente dados que não estejam escritos.
 4. Este documento pode conter VÁRIOS documentos distintos concatenados (ex.: um contrato junto com um boleto). Gere tags que cubram todos eles.
 5. Não repita tags. Não gere tags vazias, genéricas demais ("documento", "página") nem frases longas.
@@ -236,7 +244,7 @@ async function callLlmWithRetry(
  * Núcleo puro da geração de tags (Fase 9 / E-3) — SEM banco.
  *
  * 1. Texto vazio ⇒ retorna resultado vazio SEM chamar o LLM (custo 0).
- * 2. Monta o prompt `generate-tags-v1` e chama o LLM (com retry).
+ * 2. Monta o prompt `generate-tags-v2` e chama o LLM (com retry).
  * 3. Normaliza (trim, dedupe, teto de 30) e valida a lista final com Zod.
  *
  * Não lê nem escreve no banco e não calcula custo acumulado — só o `costUsd`
