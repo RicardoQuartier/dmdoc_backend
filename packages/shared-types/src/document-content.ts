@@ -115,8 +115,13 @@ export type PublicIndexSuggestion = z.infer<typeof PublicIndexSuggestionSchema>;
  */
 export const MAX_GENERATED_TAGS = 30;
 
-/** Tamanho máximo (em caracteres) de uma tag — defensivo contra tag-lixo. */
-export const MAX_TAG_LENGTH = 60;
+/**
+ * Tamanho máximo (em caracteres) de uma tag — defensivo contra tag-lixo.
+ * generate-tags-v3: 60 → 90 para acomodar tags com papel + razão social longa
+ * (ex.: "Emitente: METAVERSO DESENVOLVIMENTO DE SOFTWARE LTDA"). Espelhado em
+ * `llm-provider/src/generate-tags.ts` e no TAG_MAX_LENGTH do frontend.
+ */
+export const MAX_TAG_LENGTH = 90;
 
 /**
  * Sugestão de TAGS gerada por LLM (Fase 9 / E-3) — CONSULTIVA.

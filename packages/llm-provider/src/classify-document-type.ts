@@ -30,7 +30,7 @@ export const MAX_RECOGNITION_RULES_CHARS = 500;
 /**
  * Prompt de classificação automática de tipo de documento.
  *
- * Versão: classify-document-type-v3
+ * Versão: classify-document-type-v4
  *
  * O modelo recebe um CATÁLOGO FECHADO e NUMERADO de tipos (escopado ao
  * departamento do documento pelo chamador) e o início do texto extraído, e deve:
@@ -57,12 +57,21 @@ export const MAX_RECOGNITION_RULES_CHARS = 500;
  * negativas) — usados para separar tipos parecidos (ex.: Boleto × Fatura ×
  * Recibo). Esses campos são renderizados apenas quando presentes.
  *
+ * TÍTULO COMPOSTO (v4): a v3 pedia só "um título curto e legível", o que gerava
+ * títulos genéricos mesmo para documentos únicos e perfeitamente identificáveis
+ * (uma NFS-e virava algo como "Nota Fiscal de Serviço"). A v4 instrui a compor
+ * o título com tipo + número/identificador + partes (emissora → destinatária)
+ * quando o arquivo contém UM documento identificável, mantendo o título
+ * resumido/genérico para arquivos com vários documentos concatenados. Regra
+ * agnóstica ao tipo (vale para nota, boleto, conta de consumo, contrato...);
+ * catálogo numerado e resolução por índice seguem intactos da v3.
+ *
  * A versão é gravada junto com o resultado para rastrear o que reprocessar
  * quando o prompt evoluir (invariante de prompt versionado — spec §11). O bump
- * para v3 é apenas de rastreabilidade — NÃO força reprocessamento.
+ * para v4 é apenas de rastreabilidade — NÃO força reprocessamento.
  */
 export const CLASSIFY_DOCUMENT_TYPE_PROMPT = {
-  version: 'classify-document-type-v3',
+  version: 'classify-document-type-v4',
 
   systemPrompt: `Você classifica documentos empresariais dentro de um catálogo FECHADO e NUMERADO de tipos e sugere um título de exibição.
 
@@ -72,7 +81,10 @@ Regras obrigatórias:
 3. Use a descrição de cada tipo como dica para decidir o encaixe.
 4. Quando um tipo trouxer "Sinais" (palavras-chave) ou "Regras", use-os para desambiguar entre tipos parecidos. As regras podem ser NEGATIVAS (ex.: "NÃO classifique como X se..."): respeite-as — se uma regra negativa se aplicar ao documento, NÃO escolha aquele tipo.
 5. "confidence" reflete sua certeza sobre o tipo escolhido, de 0 a 1. Se "documentTypeNumber" for null, "confidence" deve ser baixa (próxima de 0).
-6. "suggestedTitle" é um título curto e legível gerado a partir do conteúdo do documento (não é o nome do arquivo). Se não for possível inferir, retorne null.
+6. "suggestedTitle" é um título curto e legível gerado a partir do CONTEÚDO do documento (não é o nome do arquivo), com no máximo 100 caracteres. O título é INDEPENDENTE da classificação: gere-o SEMPRE que o texto permitir identificar o documento, mesmo quando "documentTypeNumber" for null.
+   - Se o arquivo contém UM documento identificável, componha: tipo do documento + número/identificador + partes envolvidas no formato "<emissor> → <destinatário>", com nomes encurtados e legíveis (dispense sufixos como LTDA/ME/S.A.). Exemplos: "NFS-e 22 — Metaverso Desenvolvimento de Software → S2M Consultoria", "Boleto — Banco Atlas → Comercial Alfa — venc. 10/08/2026", "Conta de Luz — Enel → João da Silva — 07/2026". Omita a parte que o documento não tiver (sem número → sem número; sem destinatário → só o emissor). Vale para QUALQUER tipo de documento — identifique emissor/destinatário pelo papel que o documento expressa.
+   - Se o arquivo contém VÁRIOS documentos concatenados, gere um título resumido do conjunto (ex.: "Comprovantes de entrega e notas fiscais — Espumas Cuiabá / Centro Oeste Móveis").
+   - Se não for possível inferir, retorne null.
 7. Responda em português brasileiro, em JSON estrito, contendo APENAS os campos "documentTypeNumber", "confidence" e "suggestedTitle". Sem texto fora do JSON.`,
 
   /**

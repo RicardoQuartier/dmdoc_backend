@@ -75,7 +75,7 @@ describe('classifyDocumentType', () => {
     expect(result.confidence).toBe(0.92);
     expect(result.suggestedTitle).toBe('Contrato de locação');
     expect(result.model).toBe('gpt-4o-mini');
-    expect(result.promptVersion).toBe('classify-document-type-v3');
+    expect(result.promptVersion).toBe('classify-document-type-v4');
     expect(result.usage.totalTokens).toBe(120);
   });
 
@@ -299,8 +299,17 @@ describe('classifyDocumentType', () => {
     expect(result.suggestedTitle).toBe('T');
   });
 
-  it('promptVersion é classify-document-type-v3 (rastreabilidade do prompt)', () => {
-    expect(CLASSIFY_DOCUMENT_TYPE_PROMPT.version).toBe('classify-document-type-v3');
+  it('promptVersion é classify-document-type-v4 (rastreabilidade do prompt)', () => {
+    expect(CLASSIFY_DOCUMENT_TYPE_PROMPT.version).toBe('classify-document-type-v4');
+  });
+
+  it('v4: instrui a compor o título de documento único com tipo + nº + emissor → destinatário', () => {
+    const prompt = CLASSIFY_DOCUMENT_TYPE_PROMPT.systemPrompt;
+    expect(prompt).toContain('UM documento identificável');
+    expect(prompt).toContain('<emissor> → <destinatário>');
+    expect(prompt).toContain('NFS-e 22 — Metaverso Desenvolvimento de Software → S2M Consultoria');
+    // Documentos concatenados continuam com título resumido do conjunto.
+    expect(prompt).toContain('VÁRIOS documentos concatenados');
   });
 
   it('fatia o texto ao orçamento (~12k chars) antes de enviar ao LLM', async () => {

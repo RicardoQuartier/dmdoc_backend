@@ -51,7 +51,7 @@ export type TenantDeletionJobData = z.infer<typeof TenantDeletionJobDataSchema>;
  *
  * Cada etapa reaproveita uma feature de IA já existente e é INDEPENDENTE:
  * - `title`   → classificação de tipo + título sugerido (mesma chamada de LLM,
- *               `classify-document-type-v3`); consultiva, nunca toca o tipo/título
+ *               `classify-document-type-v4`); consultiva, nunca toca o tipo/título
  *               confirmado pelo usuário.
  * - `indexes` → sugestão de valores de índice (Fase 7) sobre o tipo CONFIRMADO
  *               do documento; consultiva, grava só `document_content.index_suggestion`.

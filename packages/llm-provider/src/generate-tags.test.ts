@@ -43,8 +43,8 @@ function mockProvider(
 }
 
 describe('GENERATE_TAGS_PROMPT (regressão: par rótulo:valor numa tag só — bug T-51)', () => {
-  it('está na versão v2 (bump de rastreabilidade)', () => {
-    expect(GENERATE_TAGS_PROMPT.version).toBe('generate-tags-v2');
+  it('está na versão v3 (bump de rastreabilidade)', () => {
+    expect(GENERATE_TAGS_PROMPT.version).toBe('generate-tags-v3');
   });
 
   it('instrui explicitamente o formato "Rótulo: valor" para informação composta', () => {
@@ -61,12 +61,41 @@ describe('GENERATE_TAGS_PROMPT (regressão: par rótulo:valor numa tag só — b
   it('os exemplos de formato rótulo:valor do prompt respeitam MAX_TAG_LENGTH', () => {
     const prompt = GENERATE_TAGS_PROMPT.systemPrompt;
     const examples = [...prompt.matchAll(/"([^"]+)"/g)].map((m) => m[1] ?? '');
-    // Exemplos de tag (contém ": ") não podem estourar o teto de 60 caracteres.
+    // Exemplos de tag (contém ": ") não podem estourar o teto por tag.
     const tagLikeExamples = examples.filter((e) => e.includes(': '));
     expect(tagLikeExamples.length).toBeGreaterThan(0);
     for (const example of tagLikeExamples) {
       expect(example.length).toBeLessThanOrEqual(MAX_TAG_LENGTH);
     }
+  });
+});
+
+describe('GENERATE_TAGS_PROMPT (regressão v3: papel das partes como rótulo)', () => {
+  it('proíbe repetir o rótulo genérico impresso no documento para partes diferentes', () => {
+    const prompt = GENERATE_TAGS_PROMPT.systemPrompt;
+    expect(prompt).toContain('DUAS OU MAIS partes');
+    expect(prompt).toMatch(/NUNCA repita.*rótulo genérico/i);
+  });
+
+  it('instrui a usar o PAPEL da parte como rótulo, com exemplos multi-domínio', () => {
+    const prompt = GENERATE_TAGS_PROMPT.systemPrompt;
+    // NFS-e: emitente × tomador distinguidos (o bug original do usuário).
+    expect(prompt).toContain('"CNPJ do Emitente: 26.575.462/0001-20"');
+    expect(prompt).toContain('"CNPJ do Tomador: 02.389.406/0001-33"');
+    // Método agnóstico ao tipo: exemplos de boleto e conta de consumo também.
+    expect(prompt).toContain('"Pagador: COMERCIAL ALFA LTDA"');
+    expect(prompt).toContain('"Titular: JOÃO DA SILVA"');
+  });
+
+  it('mostra o antipadrão do rótulo repetido como ERRADO', () => {
+    expect(GENERATE_TAGS_PROMPT.systemPrompt).toContain('ERRADO');
+  });
+
+  it('teto por tag comporta papel + razão social longa (v3: 60 → 90)', () => {
+    expect(MAX_TAG_LENGTH).toBe(90);
+    expect('Emitente: METAVERSO DESENVOLVIMENTO DE SOFTWARE LTDA'.length).toBeLessThanOrEqual(
+      MAX_TAG_LENGTH
+    );
   });
 });
 

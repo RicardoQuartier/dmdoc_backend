@@ -3038,7 +3038,7 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     expect(body.typeSuggestion.documentTypeName).toBe('Contrato A');
     expect(body.typeSuggestion.confidence).toBe(0.9);
     expect(body.typeSuggestion.model).toBe('gpt-4o-mini');
-    expect(body.typeSuggestion.promptVersion).toBe('classify-document-type-v3');
+    expect(body.typeSuggestion.promptVersion).toBe('classify-document-type-v4');
     expect(body.typeSuggestion).not.toHaveProperty('rawResponse');
     expect(body.suggestedTitle).toBe('Contrato de Serviço');
     expect(body.costUsd).toBeCloseTo(0.002, 6);
@@ -3143,7 +3143,7 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     expect(body.typeSuggestion.documentTypeId).toBe(DOC_TYPE_ID);
     expect(body.typeSuggestion.documentTypeName).toBe('Contrato A');
     expect(body.typeSuggestion.confidence).toBe(0.9);
-    expect(body.typeSuggestion.promptVersion).toBe('classify-document-type-v3');
+    expect(body.typeSuggestion.promptVersion).toBe('classify-document-type-v4');
   });
 
   it('v3: número fora da faixa → nenhum tipo (sugestão null persistida)', async () => {
