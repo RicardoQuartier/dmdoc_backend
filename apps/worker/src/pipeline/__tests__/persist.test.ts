@@ -453,7 +453,7 @@ function makeTypeSuggestion(overrides: { documentTypeId?: string | null; confide
     documentTypeName: 'Contrato',
     confidence: overrides.confidence ?? 0.9,
     model: 'gpt-4o-mini',
-    promptVersion: 'classify-document-type-v3',
+    promptVersion: 'classify-document-type-v4',
     suggestedAt: new Date(),
     rawResponse: {},
   };

@@ -249,7 +249,7 @@ interface ReprocessTitleParams {
 
 /**
  * Roda a classificação (reusa o worker `classifyDocument` — mesma chamada de
- * LLM `classify-document-type-v3`) e PERSISTE `type_suggestion`/`suggested_title`
+ * LLM `classify-document-type-v4`) e PERSISTE `type_suggestion`/`suggested_title`
  * + custo acumulado. Espelha o service on-demand `apps/api/.../classify-document.ts`
  * (o worker não importa de `apps/api`; a lógica de IA é compartilhada via
  * `@dmdoc/llm-provider`, só o persist é replicado).

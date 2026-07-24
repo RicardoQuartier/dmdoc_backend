@@ -155,7 +155,7 @@ function makeTypeSuggestion(overrides: Partial<TypeSuggestion> = {}): TypeSugges
     documentTypeName: 'Contrato',
     confidence: 0.9,
     model: 'gpt-4o-mini',
-    promptVersion: 'classify-document-type-v3',
+    promptVersion: 'classify-document-type-v4',
     suggestedAt: new Date(),
     rawResponse: {},
     ...overrides,

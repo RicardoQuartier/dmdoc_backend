@@ -35,8 +35,13 @@ interface MinimalLogger {
  */
 export const MAX_GENERATED_TAGS = 30;
 
-/** Tamanho máximo (em caracteres) de uma tag — defensivo contra tag-lixo. */
-export const MAX_TAG_LENGTH = 60;
+/**
+ * Tamanho máximo (em caracteres) de uma tag — defensivo contra tag-lixo.
+ * v3: 60 → 90 para acomodar tags com papel + razão social longa
+ * (ex.: "Emitente: METAVERSO DESENVOLVIMENTO DE SOFTWARE LTDA"). Espelhado em
+ * `shared-types/src/document-content.ts` e no TAG_MAX_LENGTH do frontend.
+ */
+export const MAX_TAG_LENGTH = 90;
 
 /**
  * Orçamento defensivo de caracteres do texto enviado ao LLM. O caso de uso
@@ -52,7 +57,7 @@ const MAX_ATTEMPTS = 2;
 /**
  * Prompt de geração de tags por IA (Fase 9 / E-3).
  *
- * Versão: generate-tags-v2
+ * Versão: generate-tags-v3
  *
  * O modelo recebe o texto do documento e deve investigar e extrair até 30 tags
  * curtas com as informações mais relevantes — nomes, datas, valores, números de
@@ -65,12 +70,22 @@ const MAX_ATTEMPTS = 2;
  * da tag para busca/leitura. A regra 2 agora exige explicitamente o formato
  * "Rótulo: valor" para informação composta, com exemplos.
  *
+ * v3 (papel das partes): a v2 deixava o modelo copiar o rótulo literal impresso
+ * no documento — numa NFS-e com duas empresas saíam "Nome Empresarial: X" e
+ * "Nome Empresarial: Y", sem dizer quem emite e quem recebe. A regra 3 agora
+ * exige que, havendo duas ou mais partes, o PAPEL de cada uma (conforme o
+ * próprio documento expressa — Emitente, Tomador, Beneficiário, Pagador,
+ * Titular...) vire o rótulo da tag. Regra agnóstica ao tipo de documento: os
+ * papéis citados são exemplos de método, não um catálogo fechado. Junto, o teto
+ * por tag subiu de 60 para 90 chars (papel + razão social longa não cabia em 60
+ * e a tag era descartada inteira).
+ *
  * A versão é gravada junto com o resultado para rastrear o que reprocessar
  * quando o prompt evoluir (invariante de prompt versionado — spec §11). Um bump
  * futuro é apenas de rastreabilidade — NÃO força reprocessamento.
  */
 export const GENERATE_TAGS_PROMPT = {
-  version: 'generate-tags-v2',
+  version: 'generate-tags-v3',
 
   systemPrompt: `Você investiga documentos empresariais brasileiros e gera TAGS de busca com as informações mais relevantes do documento.
 
@@ -78,13 +93,20 @@ Regras obrigatórias:
 1. Extraia até ${MAX_GENERATED_TAGS} tags (pode ser menos — só o que for realmente relevante; NÃO precisa chegar a ${MAX_GENERATED_TAGS}).
 2. Uma tag é um termo CURTO (no máximo ${MAX_TAG_LENGTH} caracteres) que identifica uma informação útil para encontrar o documento depois: nomes de pessoas/empresas, datas, valores monetários, números de documento (CNPJ, CPF, nota fiscal, contrato, boleto), tipos de documento, produtos, locais, ou qualquer dado relevante a seu critério.
    - Quando a informação for COMPOSTA (um rótulo que identifica o tipo do dado + o valor correspondente), gere UMA ÚNICA tag no formato "Rótulo: valor". NUNCA separe o rótulo e o valor em duas tags distintas.
-   - Exemplos corretos: "NFS-e: 22" (nunca "NFS-e" e "22" soltos), "CNPJ: 26.575.462/0001-20", "Valor: R$ 16.800,00", "Data de emissão: 12/03/2026", "Contrato nº: 4521", "Nota Fiscal: 000.123.456".
-   - Tags de nome próprio sem rótulo associado (ex.: "ACME Ltda", "João da Silva") continuam sendo geradas normalmente, sem forçar um rótulo artificial.
-3. Use APENAS informações presentes no texto. Nunca invente dados que não estejam escritos.
-4. Este documento pode conter VÁRIOS documentos distintos concatenados (ex.: um contrato junto com um boleto). Gere tags que cubram todos eles.
-5. Não repita tags. Não gere tags vazias, genéricas demais ("documento", "página") nem frases longas.
-6. Responda em português brasileiro.
-7. Responda APENAS com um JSON válido no formato exato: {"tags":[string, ...]}. Não inclua texto fora do JSON, comentários ou markdown.`,
+   - Exemplos corretos: "NFS-e: 22" (nunca "NFS-e" e "22" soltos), "Valor Total: R$ 16.800,00", "Data de emissão: 12/03/2026", "Contrato nº: 4521".
+3. Quando o documento envolver DUAS OU MAIS partes (pessoas ou empresas), identifique o PAPEL de cada parte conforme o próprio documento expressa e use esse papel como rótulo das tags dela. NUNCA repita para partes diferentes o mesmo rótulo genérico impresso no documento ("Nome Empresarial", "Razão Social", "CNPJ", "Endereço") — isso torna as tags ambíguas.
+   - O papel é o que o documento diz sobre a parte, qualquer que seja o tipo de documento: Emitente, Prestador, Tomador, Cliente, Beneficiário, Pagador, Cedente, Sacado, Fornecedor, Transportadora, Remetente, Destinatário, Contratante, Contratada, Distribuidora, Titular, etc. Esses são exemplos do método — use o papel que o documento de fato apresenta.
+   - Exemplos corretos (NFS-e): "Emitente: METAVERSO DESENVOLVIMENTO DE SOFTWARE LTDA", "CNPJ do Emitente: 26.575.462/0001-20", "Tomador: S2M CONSULTORIA E SISTEMAS LTDA", "CNPJ do Tomador: 02.389.406/0001-33".
+   - Exemplos corretos (boleto): "Beneficiário: BANCO ATLAS S.A.", "Pagador: COMERCIAL ALFA LTDA", "Vencimento: 10/08/2026".
+   - Exemplos corretos (conta de consumo): "Distribuidora: ENEL SP", "Titular: JOÃO DA SILVA".
+   - ERRADO: "Nome Empresarial: METAVERSO..." e "Nome Empresarial: S2M..." (rótulo repetido — não se sabe quem é quem).
+   - Dados que não pertencem a uma parte específica (número do documento, valor total, datas, município) não levam papel — mantêm o rótulo natural: "NFS-e: 22", "Valor Total: R$ 16.800,00".
+   - Tags de nome próprio sem rótulo (ex.: "ACME Ltda") continuam permitidas quando não houver papel identificável no documento.
+4. Use APENAS informações presentes no texto. Nunca invente dados que não estejam escritos.
+5. Este documento pode conter VÁRIOS documentos distintos concatenados (ex.: um contrato junto com um boleto). Gere tags que cubram todos eles; se o mesmo papel aparecer em documentos diferentes do arquivo, diferencie pelo contexto (ex.: "Emitente (NF 22): ..." e "Emitente (NF 31): ...").
+6. Não repita tags nem rótulos. Não gere tags vazias, genéricas demais ("documento", "página") nem frases longas.
+7. Responda em português brasileiro.
+8. Responda APENAS com um JSON válido no formato exato: {"tags":[string, ...]}. Não inclua texto fora do JSON, comentários ou markdown.`,
 
   /**
    * Monta a mensagem do usuário com o texto do documento (fatiado ao orçamento).
@@ -244,7 +266,7 @@ async function callLlmWithRetry(
  * Núcleo puro da geração de tags (Fase 9 / E-3) — SEM banco.
  *
  * 1. Texto vazio ⇒ retorna resultado vazio SEM chamar o LLM (custo 0).
- * 2. Monta o prompt `generate-tags-v2` e chama o LLM (com retry).
+ * 2. Monta o prompt `generate-tags-v3` e chama o LLM (com retry).
  * 3. Normaliza (trim, dedupe, teto de 30) e valida a lista final com Zod.
  *
  * Não lê nem escreve no banco e não calcula custo acumulado — só o `costUsd`
