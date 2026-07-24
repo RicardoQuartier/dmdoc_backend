@@ -103,7 +103,7 @@ function coreResult(overrides: Record<string, unknown> = {}) {
   return {
     tags: ['Contrato', 'Boleto', 'ACME Ltda'],
     model: 'gpt-4o-mini',
-    promptVersion: 'generate-tags-v1',
+    promptVersion: 'generate-tags-v2',
     rawResponse: { tags: ['Contrato', 'Boleto', 'ACME Ltda'] },
     costUsd: 0.0002,
     ...overrides,

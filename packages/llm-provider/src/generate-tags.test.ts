@@ -42,6 +42,34 @@ function mockProvider(
   return { provider, chat };
 }
 
+describe('GENERATE_TAGS_PROMPT (regressão: par rótulo:valor numa tag só — bug T-51)', () => {
+  it('está na versão v2 (bump de rastreabilidade)', () => {
+    expect(GENERATE_TAGS_PROMPT.version).toBe('generate-tags-v2');
+  });
+
+  it('instrui explicitamente o formato "Rótulo: valor" para informação composta', () => {
+    const prompt = GENERATE_TAGS_PROMPT.systemPrompt;
+    expect(prompt).toMatch(/rótulo.*valor/i);
+    expect(prompt).toContain('NUNCA separe o rótulo e o valor em duas tags distintas');
+  });
+
+  it('traz o exemplo real do bug reportado (NFS-e: 22) e não o formato quebrado', () => {
+    const prompt = GENERATE_TAGS_PROMPT.systemPrompt;
+    expect(prompt).toContain('"NFS-e: 22"');
+  });
+
+  it('os exemplos de formato rótulo:valor do prompt respeitam MAX_TAG_LENGTH', () => {
+    const prompt = GENERATE_TAGS_PROMPT.systemPrompt;
+    const examples = [...prompt.matchAll(/"([^"]+)"/g)].map((m) => m[1] ?? '');
+    // Exemplos de tag (contém ": ") não podem estourar o teto de 60 caracteres.
+    const tagLikeExamples = examples.filter((e) => e.includes(': '));
+    expect(tagLikeExamples.length).toBeGreaterThan(0);
+    for (const example of tagLikeExamples) {
+      expect(example.length).toBeLessThanOrEqual(MAX_TAG_LENGTH);
+    }
+  });
+});
+
 describe('normalizeTags', () => {
   it('faz trim e remove vazias', () => {
     expect(normalizeTags(['  Contrato  ', '', '   ', 'Boleto'])).toEqual(['Contrato', 'Boleto']);
