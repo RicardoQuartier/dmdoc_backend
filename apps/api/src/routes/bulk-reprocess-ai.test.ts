@@ -10,10 +10,12 @@ import { newId } from '@dmdoc/db-pg';
  * E2E do reprocessamento de IA em massa (épico E-4 / T-24):
  * `POST /documents/bulk-reprocess-ai` + `GET /documents/bulk-reprocess-ai/:batchId`.
  *
- * Foco: isolamento multi-tenant (não reprocessar/ver lote de outra empresa →
- * 404), teto de lote, gating por feature flags do tenant, e o registro/leitura
- * de progresso do lote. A fila é `null` (sem Redis) — o lote é criado, só não há
- * jobs enfileirados; isso é suficiente para exercitar toda a rota HTTP.
+ * Foco: gate de papel administrativo (o lote é exclusivo de SUPER_ADMIN /
+ * MULTI_TENANT_ADMIN / TENANT_ADMIN — UPLOADER e USER recebem 403), isolamento
+ * multi-tenant (não reprocessar/ver lote de outra empresa → 404), teto de lote,
+ * gating por feature flags do tenant, e o registro/leitura de progresso do lote.
+ * A fila é `null` (sem Redis) — o lote é criado, só não há jobs enfileirados;
+ * isso é suficiente para exercitar toda a rota HTTP.
  */
 
 function createMockS3(): S3Service {
@@ -27,6 +29,7 @@ function createMockS3(): S3Service {
 const TENANT_A = crypto.randomUUID();
 const TENANT_B = crypto.randomUUID();
 const ADMIN_A_ID = crypto.randomUUID();
+const UPLOADER_A_ID = crypto.randomUUID();
 const USER_A_ID = crypto.randomUUID();
 const ADMIN_B_ID = crypto.randomUUID();
 const DEPT_A_ID = newId();
@@ -38,6 +41,7 @@ let app: FastifyInstance;
 let testDb: TestDb;
 let tokenAdminA: string;
 let tokenAdminB: string;
+let tokenUploaderA: string;
 let tokenUserA: string;
 
 let DOC_A1 = '';
@@ -112,8 +116,17 @@ beforeEach(async () => {
   `;
 
   await seedUser(testDb.db, { id: ADMIN_A_ID, tenantId: TENANT_A, email: 'admin-a@e.com', password: PASSWORD, role: 'TENANT_ADMIN' });
+  await seedUser(testDb.db, { id: UPLOADER_A_ID, tenantId: TENANT_A, email: 'uploader-a@e.com', password: PASSWORD, role: 'UPLOADER' });
   await seedUser(testDb.db, { id: USER_A_ID, tenantId: TENANT_A, email: 'user-a@e.com', password: PASSWORD, role: 'USER' });
   await seedUser(testDb.db, { id: ADMIN_B_ID, tenantId: TENANT_B, email: 'admin-b@e.com', password: PASSWORD, role: 'TENANT_ADMIN' });
+
+  // ACL legítima de ESCRITA do UPLOADER no departamento A: garante que o 403 do
+  // lote vem do gate de papel, não de falta de permissão no departamento.
+  await testDb.db`
+    INSERT INTO department_permissions (user_id, department_id, tenant_id, can_read, can_write)
+    VALUES (${UPLOADER_A_ID}, ${DEPT_A_ID}, ${TENANT_A}, true, true)
+    ON CONFLICT (user_id, department_id) WHERE deleted = false DO NOTHING
+  `;
 
   DOC_A1 = await seedDocument(TENANT_A, DEPT_A_ID, ADMIN_A_ID);
   DOC_A2 = await seedDocument(TENANT_A, DEPT_A_ID, ADMIN_A_ID);
@@ -121,6 +134,7 @@ beforeEach(async () => {
 
   tokenAdminA = await login('admin-a@e.com');
   tokenAdminB = await login('admin-b@e.com');
+  tokenUploaderA = await login('uploader-a@e.com');
   tokenUserA = await login('user-a@e.com');
 });
 
@@ -161,14 +175,27 @@ describe('POST /documents/bulk-reprocess-ai', () => {
     expect(res.statusCode).toBe(404);
   });
 
-  it('USER (somente-leitura) não pode disparar (404 — sem permissão de escrita)', async () => {
+  it('USER (somente-leitura) não pode disparar (403 — papel não administrativo)', async () => {
     const res = await app.inject({
       method: 'POST',
       url: '/documents/bulk-reprocess-ai',
       headers: { authorization: `Bearer ${tokenUserA}` },
       payload: { documentIds: [DOC_A1] },
     });
-    expect(res.statusCode).toBe(404);
+    expect(res.statusCode).toBe(403);
+  });
+
+  it('UPLOADER com ACL de escrita no departamento AINDA ASSIM não dispara lote (403)', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents/bulk-reprocess-ai',
+      headers: { authorization: `Bearer ${tokenUploaderA}` },
+      payload: { documentIds: [DOC_A1, DOC_A2] },
+    });
+    expect(res.statusCode).toBe(403);
+    // Nenhum lote pode ter sido criado.
+    const rows = await testDb.db<{ count: string }[]>`SELECT COUNT(*)::text AS count FROM ai_reprocess_batch`;
+    expect(rows[0]?.count).toBe('0');
   });
 
   it('nenhuma feature de IA habilitada para a empresa → 422', async () => {
@@ -236,5 +263,18 @@ describe('GET /documents/bulk-reprocess-ai/:batchId', () => {
       headers: { authorization: `Bearer ${tokenAdminB}` },
     });
     expect(res.statusCode).toBe(404);
+  });
+
+  it('UPLOADER e USER do próprio tenant não leem o progresso do lote (403)', async () => {
+    const batchId = await createBatch(tokenAdminA, [DOC_A1]);
+
+    for (const token of [tokenUploaderA, tokenUserA]) {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/documents/bulk-reprocess-ai/${batchId}`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(res.statusCode).toBe(403);
+    }
   });
 });

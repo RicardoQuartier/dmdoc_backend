@@ -32,6 +32,7 @@ import {
   MAX_GENERATED_TAGS,
   MAX_TAG_LENGTH,
   mergeConfirmedTags,
+  ADMIN_ROLES,
   ROLE_LEVEL,
   RoleSchema,
   AiReprocessJobDataSchema,
@@ -216,6 +217,15 @@ const ListDocumentsQuerySchema = z.object({
   // case-insensitive). Termo sanitizado via `escapeLikePattern` antes de virar
   // padrão `%termo%` — nunca concatenado cru na query (sempre bind param).
   search: z.string().optional(),
+  // Período de upload — filtra `uploaded_at`, inclusivo nos DOIS extremos.
+  // Os dois lados são independentes: passar só `dateFrom` (ou só `dateTo`)
+  // vale como range aberto do outro lado. Nomes convergem com `GET /reports/*`
+  // e `GET /audit-logs`, que já filtram por data com o mesmo contrato.
+  // O front envia dias inteiros já convertidos para instante (início do dia em
+  // `dateFrom`, fim do dia em `dateTo`) no fuso do navegador — o backend não
+  // arredonda nada, só compara os instantes recebidos.
+  dateFrom: z.string().datetime({ offset: true }).optional(),
+  dateTo: z.string().datetime({ offset: true }).optional(),
   sortBy: z.enum(SORT_BY_KEYS).default('uploadedAt'),
   sortDir: z.enum(['asc', 'desc']).default('desc'),
   // Paginação por número de página (OFFSET) — substitui o cursor/keyset
@@ -1018,6 +1028,14 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
 
     const query = ListDocumentsQuerySchema.parse(request.query);
 
+    // Período de upload: comparar como instante, não como string — dois ISO
+    // com offsets diferentes ordenam errado lexicograficamente.
+    const uploadedFrom = query.dateFrom !== undefined ? new Date(query.dateFrom) : undefined;
+    const uploadedTo = query.dateTo !== undefined ? new Date(query.dateTo) : undefined;
+    if (uploadedFrom !== undefined && uploadedTo !== undefined && uploadedFrom > uploadedTo) {
+      throw new ValidationError('dateFrom não pode ser posterior a dateTo');
+    }
+
     const tenantContext = resolveTenantContext(request, { explicitTenantId: query.tenantId, write: false });
 
     const effectiveTenantId: string | null =
@@ -1111,6 +1129,16 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       conditions.push(
         `(d.original_filename ILIKE ${searchParam} ESCAPE '\\' OR d.title ILIKE ${searchParam} ESCAPE '\\')`
       );
+    }
+
+    // Período de upload — entra no mesmo array de condições (AND), então o
+    // COUNT abaixo já sai filtrado por ele. Sempre bind param (`addParam`),
+    // nunca a data interpolada na string.
+    if (uploadedFrom !== undefined) {
+      conditions.push(`d.uploaded_at >= ${addParam(uploadedFrom)}::timestamptz`);
+    }
+    if (uploadedTo !== undefined) {
+      conditions.push(`d.uploaded_at <= ${addParam(uploadedTo)}::timestamptz`);
     }
 
     const whereClause = conditions.join(' AND ');
@@ -1929,11 +1957,18 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
    * bloqueia num lote grande). Retorna o `batchId` para o front acompanhar o
    * progresso via `GET /documents/bulk-reprocess-ai/:batchId`.
    *
-   * ESCOPO/PERMISSÃO (inegociável): só documentos que o ator pode ESCREVER —
-   * `assertCanWriteDepartment` por documento (mesmo choke point do reprocess
-   * individual: UPLOADER+ com ACL do departamento). Documento fora de escopo
-   * (outro tenant, sem ACL, USER) resolve para 404, nunca 403 — não vaza
-   * existência. O lote é escopado por UM tenant.
+   * PERMISSÃO — DUAS CAMADAS:
+   *   1. GATE DE PAPEL (403): exclusivo de SUPER_ADMIN, MULTI_TENANT_ADMIN e
+   *      TENANT_ADMIN. UPLOADER e USER NÃO disparam lote — diferente do
+   *      reprocess individual (`POST /documents/:id/reprocess`), que continua
+   *      UPLOADER+ com ACL. O motivo é o impacto administrativo: um lote de até
+   *      500 documentos ACUMULA custo de LLM na empresa e a auto-aplicação
+   *      SOBRESCREVE tipo/título/índices já qualificados. O gate roda ANTES de
+   *      resolver qualquer id, então o 403 não revela existência de documento.
+   *   2. ESCOPO + ACL (404): dentro do gate, só entram documentos que o ator
+   *      pode ESCREVER — `assertCanWriteDepartment` por documento. Documento
+   *      fora de escopo (outro tenant, sem ACL) resolve para 404, nunca 403 —
+   *      não vaza existência. O lote é escopado por UM tenant.
    *
    * FEATURE FLAGS: só enfileira as etapas efetivamente habilitadas para a
    * empresa (`resolveAiFeatureFlags`, plataforma AND empresa). Nenhuma ligada
@@ -1943,6 +1978,10 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     '/documents/bulk-reprocess-ai',
     { preHandler: app.authenticate },
     async (request, reply) => {
+      // Gate de papel: operação administrativa (custo de IA + sobrescrita em
+      // massa). UPLOADER/USER → 403 antes de qualquer leitura de documento.
+      requireRole(request, ...ADMIN_ROLES);
+
       const userId = request.user!.sub;
       const role = request.user!.role;
       const sql = app.db;
@@ -2097,13 +2136,19 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
   // =========================================================================
   /**
    * Retorna o progresso de um lote de reprocessamento de IA (`total/done/failed/
-   * status/steps`) para o polling do front. ESCOPADO ao tenant do ator: lote de
-   * outra empresa → 404 (nunca revela existência).
+   * status/steps`) para o polling do front.
+   *
+   * PERMISSÃO: mesmo gate de papel do disparo — só SUPER_ADMIN,
+   * MULTI_TENANT_ADMIN e TENANT_ADMIN (UPLOADER/USER → 403), já que só eles
+   * podem criar um lote. ESCOPADO ao tenant do ator: lote de outra empresa →
+   * 404 (nunca revela existência).
    */
   app.get(
     '/documents/bulk-reprocess-ai/:batchId',
     { preHandler: app.authenticate },
     async (request, reply) => {
+      requireRole(request, ...ADMIN_ROLES);
+
       const role = request.user!.role;
       const sql = app.db;
 

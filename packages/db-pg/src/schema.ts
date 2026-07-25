@@ -386,6 +386,9 @@ export const documents = pgTable(
     index('docs_by_tenant_status').on(t.tenantId, t.status),
     index('docs_by_tenant_department').on(t.tenantId, t.departmentId),
     index('docs_by_tenant_deleted').on(t.tenantId, t.deleted),
+    // Ordenação default da listagem (`uploaded_at DESC`) e filtro por período
+    // de upload (T-74) — ver migration 0015.
+    index('docs_by_tenant_uploaded_at').on(t.tenantId, t.uploadedAt.desc()),
   ],
 );
 

@@ -1,0 +1,53 @@
+-- Índice btree composto (tenant_id, uploaded_at DESC) em `documents`.
+--
+-- PROBLEMA
+-- --------
+-- A listagem de documentos (`GET /documents`) sempre ordena por `uploaded_at`
+-- (default `uploadedAt DESC`, apps/api/src/routes/documents.ts) e agora também
+-- FILTRA por um período de upload (T-74). Nenhum dos índices existentes cobre
+-- essa coluna: `docs_by_tenant_deleted`, `docs_by_tenant_status` e
+-- `docs_by_tenant_department` param no `tenant_id`.
+--
+-- O resultado é que tanto o COUNT quanto a página varriam a fatia INTEIRA da
+-- empresa no heap: o planner entrava por `docs_by_tenant_deleted`, trazia todos
+-- os documentos do tenant e só então aplicava o range de data como filtro e
+-- ordenava com top-N heapsort. O custo de cada clique de página (e de cada
+-- ajuste de período) crescia com o acervo total da empresa, não com o tamanho
+-- do recorte pedido.
+--
+-- MEDIÇÃO (base descartável, 40 empresas x 7.500 documentos = 300.000 linhas,
+-- pgvector/pgvector:pg16, cache quente, `EXPLAIN (ANALYZE, BUFFERS)`; queries
+-- do handler de `GET /documents`: 1 empresa, `deleted = false`, período de 30
+-- dias, página 1 de 20):
+--
+--                                     antes                depois
+--   página com filtro de período   10,43 ms  7.516 buf   0,08 ms   34 buf
+--   COUNT(*) do mesmo WHERE         9,61 ms  7.510 buf   0,40 ms  313 buf
+--   página sem filtro de período   11,31 ms  7.510 buf   0,05 ms   24 buf
+--
+-- A terceira linha é a ordenação default da listagem, que já existia antes
+-- deste filtro e já pagava a varredura completa — o índice a conserta de
+-- carona. Depois da migration o plano vira `Index Scan` + `Incremental Sort`
+-- (o índice já entrega `uploaded_at` ordenado; só o desempate por `d.id` sobra
+-- para o sort).
+--
+-- POR QUE NÃO UM ÍNDICE PARCIAL `WHERE deleted = false`
+-- ------------------------------------------------------
+-- Foi medido: 11 MB contra 12 MB e 0,455 ms contra 0,397 ms no COUNT — ou seja,
+-- nenhum ganho fora do ruído, porque documentos deletados são uma fração
+-- desprezível das linhas. Em compensação, o parcial só é usado quando o planner
+-- prova que a query implica `deleted = false`, o que deixaria de fora qualquer
+-- consulta futura por data que não filtre soft-delete. Índice completo.
+--
+-- CONTRAPARTIDAS MEDIDAS
+-- ----------------------
+-- * Disco: 12 MB para 300.000 documentos (~42 bytes/linha).
+-- * Escrita: dois blocos alternados de 1.001 INSERTs, com e sem o índice —
+--   46,2 vs 40,2 ms e 29,2 vs 23,4 ms. Sempre +6 ms por 1.001 documentos, isto
+--   é ~6 µs por documento ingerido; ruído perto do resto do pipeline do worker.
+-- * `CREATE INDEX` (não CONCURRENTLY — a migration roda em transação) levou
+--   0,56 s para 300.000 linhas, bloqueando escrita em `documents` no intervalo.
+--
+-- Registro completo: task T-74.
+
+CREATE INDEX docs_by_tenant_uploaded_at ON documents (tenant_id, uploaded_at DESC);
