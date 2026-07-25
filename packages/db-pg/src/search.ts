@@ -110,6 +110,263 @@ function embeddingToLiteral(embedding: number[]): string {
 type UnsafeParams = Parameters<Sql['unsafe']>[1];
 
 // ---------------------------------------------------------------------------
+// Allocator de parâmetros posicionais
+// ---------------------------------------------------------------------------
+
+/** Valores que podem ser passados como binding posicional para o postgres.js. */
+export type SqlBindingValue = string | number | boolean | null | string[] | number[];
+
+/**
+ * Aloca parâmetros posicionais (`$1`, `$2`, ...) e acumula os bindings na mesma
+ * ordem em que foram emitidos.
+ *
+ * Existe para permitir que predicados sejam montados por funções independentes
+ * e depois inlinados em qualquer posição de uma query maior: quem monta o
+ * fragmento não precisa saber quantos parâmetros já foram usados antes dele.
+ */
+export interface ParamAllocator {
+  /**
+   * Registra um valor e devolve o placeholder já formatado (ex.: `'$3'`).
+   *
+   * Chame UMA vez por valor e reutilize a string devolvida quando o mesmo valor
+   * aparecer em mais de um fragmento — alocar duas vezes desloca todos os `$N`
+   * seguintes e corrompe a query inteira.
+   */
+  add(value: SqlBindingValue): string;
+  /** Bindings acumulados, na ordem de alocação. Passar direto ao `sql.unsafe`. */
+  readonly bindings: SqlBindingValue[];
+  /** Índice que a próxima chamada de `add` vai receber (1-based). */
+  readonly next: number;
+}
+
+/**
+ * Cria um allocator de parâmetros posicionais.
+ *
+ * O índice é derivado de `bindings.length`, e não de um contador paralelo: é
+ * estruturalmente impossível alocar um placeholder sem empurrar o binding
+ * correspondente (parâmetro sobrando/faltando é erro duro do Postgres —
+ * `bind message supplies N parameters, but prepared statement requires M`).
+ *
+ * O padrão nasceu em `apps/api/src/routes/search.ts` (`addParam`) e foi trazido
+ * para cá para ser usado por todas as funções de busca.
+ */
+export function createParamAllocator(): ParamAllocator {
+  const bindings: SqlBindingValue[] = [];
+
+  return {
+    add(value: SqlBindingValue): string {
+      bindings.push(value);
+      return `$${bindings.length}`;
+    },
+    get bindings(): SqlBindingValue[] {
+      return bindings;
+    },
+    get next(): number {
+      return bindings.length + 1;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Builders de predicado reutilizáveis
+// ---------------------------------------------------------------------------
+
+/**
+ * Tamanho mínimo de uma palavra para participar da busca por metadados.
+ *
+ * Fica em 2 de propósito: subir para 3 quebraria buscas legítimas e comuns no
+ * domínio ("NF", "CT", "OS").
+ */
+export const METADATA_MIN_WORD_LENGTH = 2;
+
+/**
+ * Quebra o texto da busca nas palavras usadas pelo predicado de metadados,
+ * descartando as menores que `METADATA_MIN_WORD_LENGTH`.
+ */
+export function tokenizeMetadataQuery(queryText: string): string[] {
+  return queryText
+    .trim()
+    .split(/\s+/)
+    .filter((w) => w.length >= METADATA_MIN_WORD_LENGTH);
+}
+
+/**
+ * Monta o predicado de casamento por metadados na tabela `documents`.
+ *
+ * Para cada palavra, casa (case-insensitive, por substring) contra:
+ *   - `original_filename`
+ *   - qualquer tag (`unnest(tags)`)
+ *   - qualquer valor de índice (`jsonb_each_text(index_values)`), também na
+ *     variante com `.` trocado por `,` — assim "1.234,56" e "1234.56"
+ *     encontram um ao outro em campos numéricos digitados por humanos.
+ *
+ * As palavras são combinadas com OR (replica o regex alternado do MongoDB).
+ * Cada palavra consome UM slot de parâmetro reutilizado nas quatro posições.
+ *
+ * Com a lista de palavras vazia o predicado degenera para `false` (nunca uma
+ * string vazia, que produziria `AND ()` — erro de sintaxe).
+ */
+export function buildMetadataPredicate(words: string[], alloc: ParamAllocator): string {
+  if (words.length === 0) return 'false';
+
+  const wordParts = words.map((word) => {
+    const p = alloc.add(word);
+    return `(original_filename ILIKE '%' || ${p}::text || '%' OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE t ILIKE '%' || ${p}::text || '%') OR EXISTS (SELECT 1 FROM jsonb_each_text(index_values) kv WHERE kv.value ILIKE '%' || ${p}::text || '%' OR REPLACE(kv.value, '.', ',') ILIKE '%' || ${p}::text || '%'))`;
+  });
+
+  return `(${wordParts.join(' OR ')})`;
+}
+
+/** Condições aceitas por campo de índice nos filtros estruturados. */
+export interface StructuredIndexFilter {
+  gte?: string | number | undefined;
+  lte?: string | number | undefined;
+  eq?: string | number | undefined;
+}
+
+/** Filtros estruturados aplicáveis sobre a tabela `documents`. */
+export interface StructuredDocumentFilters {
+  departmentIds?: string[] | undefined;
+  documentTypeIds?: string[] | undefined;
+  tags?: string[] | undefined;
+  indexFilters?: Record<string, StructuredIndexFilter> | undefined;
+}
+
+/** Entradas do predicado de filtros estruturados sobre `documents`. */
+export interface DocumentFilterPredicateParams {
+  tenantId?: string | undefined;
+  tenantIds?: string[] | undefined;
+  allowedDepartmentIds: string[] | null;
+  filters?: StructuredDocumentFilters | undefined;
+}
+
+/** Resultado da montagem do predicado de filtros estruturados. */
+export interface DocumentFilterPredicate {
+  /** Predicado pronto para o WHERE, sempre não vazio. Usa o alias `d`. */
+  sql: string;
+  /**
+   * `true` quando os filtros são insatisfazíveis por construção (ex.: nenhum
+   * dos departamentos pedidos está entre os permitidos). Quem chama deve
+   * devolver lista vazia sem ir ao banco — o `sql` devolvido é `false`.
+   */
+  unsatisfiable: boolean;
+}
+
+/**
+ * Indica se há algum filtro estruturado a aplicar. Sem nenhum, não faz sentido
+ * resolver uma lista de documentIds (a busca fica sem restrição).
+ */
+export function hasStructuredDocumentFilters(
+  filters: StructuredDocumentFilters | undefined
+): boolean {
+  return (
+    filters !== undefined &&
+    (filters.departmentIds !== undefined ||
+      filters.documentTypeIds !== undefined ||
+      (filters.tags !== undefined && filters.tags.length > 0) ||
+      (filters.indexFilters !== undefined && Object.keys(filters.indexFilters).length > 0))
+  );
+}
+
+/**
+ * Monta o WHERE dos filtros estruturados sobre `documents` (alias `d`).
+ *
+ * Filtros JSONB para indexValues (spec §9 etapa 4 + §7 search):
+ *   - TEXT/eq:    index_values->>'campo' = $val
+ *   - NUMBER/gte: (index_values->>'campo')::numeric >= $val
+ *   - NUMBER/lte: (index_values->>'campo')::numeric <= $val
+ *   - DATE/gte:   (index_values->>'campo')::timestamptz >= $val::timestamptz
+ *   - DATE/lte:   (index_values->>'campo')::timestamptz <= $val::timestamptz
+ *   - tags:       tags @> $tags::text[]   (contém TODAS)
+ *   - documentTypeIds: document_type_id = ANY($ids::uuid[])
+ *
+ * A distinção DATE × NUMBER é feita pelo formato do valor (`YYYY-MM-DD...`),
+ * não pelo tipo declarado do campo — é o que a rota já fazia.
+ */
+export function buildDocumentFilterPredicate(
+  params: DocumentFilterPredicateParams,
+  alloc: ParamAllocator
+): DocumentFilterPredicate {
+  const { tenantId, tenantIds, allowedDepartmentIds, filters } = params;
+
+  const conditions: string[] = [`d.deleted = false`, `d.status = 'READY'`];
+
+  // Filtro de tenant
+  if (tenantIds !== undefined && tenantIds.length > 0) {
+    conditions.push(`d.tenant_id = ANY(${alloc.add(tenantIds)}::uuid[])`);
+  } else if (tenantId !== undefined) {
+    conditions.push(`d.tenant_id = ${alloc.add(tenantId)}`);
+  }
+
+  // Filtro de departamentos (interseção entre o pedido e o permitido)
+  if (filters?.departmentIds !== undefined) {
+    const requested = filters.departmentIds;
+    let effective: string[];
+    if (allowedDepartmentIds !== null) {
+      effective = requested.filter((id) => allowedDepartmentIds.includes(id));
+      if (effective.length === 0) return { sql: 'false', unsatisfiable: true };
+    } else {
+      effective = requested;
+    }
+    conditions.push(`d.department_id = ANY(${alloc.add(effective)}::uuid[])`);
+  } else if (allowedDepartmentIds !== null) {
+    conditions.push(`d.department_id = ANY(${alloc.add(allowedDepartmentIds)}::uuid[])`);
+  }
+
+  // Filtro de documentTypeIds
+  if (filters?.documentTypeIds !== undefined && filters.documentTypeIds.length > 0) {
+    conditions.push(`d.document_type_id = ANY(${alloc.add(filters.documentTypeIds)}::uuid[])`);
+  }
+
+  // Filtro de tags: contém TODAS as tags pedidas
+  if (filters?.tags !== undefined && filters.tags.length > 0) {
+    conditions.push(`d.tags @> ${alloc.add(filters.tags)}::text[]`);
+  }
+
+  // Filtros de indexValues (JSONB)
+  if (filters?.indexFilters !== undefined) {
+    for (const [fieldName, condition] of Object.entries(filters.indexFilters)) {
+      if (condition.eq !== undefined) {
+        conditions.push(
+          `d.index_values->>${alloc.add(fieldName)} = ${alloc.add(String(condition.eq))}`
+        );
+      }
+      if (condition.gte !== undefined) {
+        const val = condition.gte;
+        if (isDateFilterValue(val)) {
+          conditions.push(
+            `(d.index_values->>${alloc.add(fieldName)})::timestamptz >= ${alloc.add(val)}::timestamptz`
+          );
+        } else {
+          conditions.push(
+            `(d.index_values->>${alloc.add(fieldName)})::numeric >= ${alloc.add(val)}`
+          );
+        }
+      }
+      if (condition.lte !== undefined) {
+        const val = condition.lte;
+        if (isDateFilterValue(val)) {
+          conditions.push(
+            `(d.index_values->>${alloc.add(fieldName)})::timestamptz <= ${alloc.add(val)}::timestamptz`
+          );
+        } else {
+          conditions.push(
+            `(d.index_values->>${alloc.add(fieldName)})::numeric <= ${alloc.add(val)}`
+          );
+        }
+      }
+    }
+  }
+
+  return { sql: conditions.join(' AND '), unsatisfiable: false };
+}
+
+/** Um valor de filtro é tratado como data quando começa em `YYYY-MM-DD`. */
+function isDateFilterValue(value: string | number): value is string {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value);
+}
+
+// ---------------------------------------------------------------------------
 // documentMetadataSearch
 // ---------------------------------------------------------------------------
 
@@ -136,54 +393,36 @@ export async function documentMetadataSearch(
 ): Promise<string[]> {
   const { tenantId, tenantIds, allowedDepartmentIds, filterDocumentIds, queryText } = params;
 
-  const words = queryText
-    .trim()
-    .split(/\s+/)
-    .filter((w) => w.length >= 2);
+  const words = tokenizeMetadataQuery(queryText);
 
   if (words.length === 0) return [];
 
-  let paramIndex = 1;
-  const bindings: (string | string[])[] = [];
+  const alloc = createParamAllocator();
 
-  // Predicados de palavras: cada palavra gera um par de condições ILIKE + ANY(tags).
-  // O índice do parâmetro é reutilizado duas vezes ($N aparece duas vezes na cláusula).
-  const wordParts: string[] = [];
-  for (const word of words) {
-    bindings.push(word);
-    const idx = paramIndex++;
-    wordParts.push(
-      `(original_filename ILIKE '%' || $${idx}::text || '%' OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE t ILIKE '%' || $${idx}::text || '%') OR EXISTS (SELECT 1 FROM jsonb_each_text(index_values) kv WHERE kv.value ILIKE '%' || $${idx}::text || '%' OR REPLACE(kv.value, '.', ',') ILIKE '%' || $${idx}::text || '%'))`
-    );
-  }
-
-  let whereClause = `deleted = false AND status = 'READY' AND (${wordParts.join(' OR ')})`;
+  // Predicado de metadados compartilhado com o restante do pipeline de busca.
+  let whereClause = `deleted = false AND status = 'READY' AND ${buildMetadataPredicate(words, alloc)}`;
 
   // Filtro de tenant
   if (tenantIds !== undefined && tenantIds.length > 0) {
-    bindings.push(tenantIds);
-    whereClause += ` AND tenant_id = ANY($${paramIndex++}::uuid[])`;
+    whereClause += ` AND tenant_id = ANY(${alloc.add(tenantIds)}::uuid[])`;
   } else if (tenantId !== undefined) {
-    bindings.push(tenantId);
-    whereClause += ` AND tenant_id = $${paramIndex++}::uuid`;
+    whereClause += ` AND tenant_id = ${alloc.add(tenantId)}::uuid`;
   }
 
   // Filtro de departamento
   if (allowedDepartmentIds !== null) {
-    bindings.push(allowedDepartmentIds);
-    whereClause += ` AND department_id = ANY($${paramIndex++}::uuid[])`;
+    whereClause += ` AND department_id = ANY(${alloc.add(allowedDepartmentIds)}::uuid[])`;
   }
 
   // Filtro de documentos pré-filtrados
   if (filterDocumentIds !== undefined && filterDocumentIds.length > 0) {
-    bindings.push(filterDocumentIds);
-    whereClause += ` AND id = ANY($${paramIndex++}::uuid[])`;
+    whereClause += ` AND id = ANY(${alloc.add(filterDocumentIds)}::uuid[])`;
   }
 
   const query = `SELECT id FROM documents WHERE ${whereClause} LIMIT 10`;
 
   type Row = { id: string };
-  const rows = await sql.unsafe<Row[]>(query, bindings as UnsafeParams);
+  const rows = await sql.unsafe<Row[]>(query, alloc.bindings as UnsafeParams);
   return rows.map((r) => r.id);
 }
 
@@ -209,37 +448,30 @@ export async function lexicalSearch(
 ): Promise<ChunkSearchResult[]> {
   const { tenantId, tenantIds, allowedDepartmentIds, queryText, topK, filterDocumentIds } = params;
 
-  let paramIndex = 1;
-  const bindings: (string | string[] | number)[] = [];
+  const alloc = createParamAllocator();
 
-  bindings.push(queryText);
-  const queryParam = paramIndex++;   // $1 — tsquery
+  const queryParam = alloc.add(queryText); // $1 — tsquery
 
-  let whereClause = `text_search_pt @@ plainto_tsquery('portuguese', $${queryParam}::text)`;
+  let whereClause = `text_search_pt @@ plainto_tsquery('portuguese', ${queryParam}::text)`;
 
   // Filtro de tenant
   if (tenantIds !== undefined && tenantIds.length > 0) {
-    bindings.push(tenantIds);
-    whereClause += ` AND tenant_id = ANY($${paramIndex++}::uuid[])`;
+    whereClause += ` AND tenant_id = ANY(${alloc.add(tenantIds)}::uuid[])`;
   } else if (tenantId !== undefined) {
-    bindings.push(tenantId);
-    whereClause += ` AND tenant_id = $${paramIndex++}::uuid`;
+    whereClause += ` AND tenant_id = ${alloc.add(tenantId)}::uuid`;
   }
 
   // Filtro de departamento
   if (allowedDepartmentIds !== null) {
-    bindings.push(allowedDepartmentIds);
-    whereClause += ` AND department_id = ANY($${paramIndex++}::uuid[])`;
+    whereClause += ` AND department_id = ANY(${alloc.add(allowedDepartmentIds)}::uuid[])`;
   }
 
   // Filtro de documentos pré-filtrados
   if (filterDocumentIds !== undefined && filterDocumentIds.length > 0) {
-    bindings.push(filterDocumentIds);
-    whereClause += ` AND document_id = ANY($${paramIndex++}::uuid[])`;
+    whereClause += ` AND document_id = ANY(${alloc.add(filterDocumentIds)}::uuid[])`;
   }
 
-  bindings.push(topK);
-  const limitParam = paramIndex++;
+  const limitParam = alloc.add(topK);
 
   const query = `
     SELECT
@@ -251,11 +483,11 @@ export async function lexicalSearch(
       chunk_index        AS "chunkIndex",
       text,
       token_count        AS "tokenCount",
-      ts_rank(text_search_pt, plainto_tsquery('portuguese', $${queryParam}::text)) AS score
+      ts_rank(text_search_pt, plainto_tsquery('portuguese', ${queryParam}::text)) AS score
     FROM chunks
     WHERE ${whereClause}
     ORDER BY score DESC
-    LIMIT $${limitParam}
+    LIMIT ${limitParam}
   `;
 
   type Row = {
@@ -270,7 +502,7 @@ export async function lexicalSearch(
     score: number;
   };
 
-  const rows = await sql.unsafe<Row[]>(query, bindings as UnsafeParams);
+  const rows = await sql.unsafe<Row[]>(query, alloc.bindings as UnsafeParams);
   return rows.map((r) => ({
     documentId: r.documentId,
     tenantId: r.tenantId,
@@ -282,6 +514,326 @@ export async function lexicalSearch(
     tokenCount: r.tokenCount,
     score: Number(r.score),
   }));
+}
+
+// ---------------------------------------------------------------------------
+// searchDocumentsPaged
+// ---------------------------------------------------------------------------
+
+/**
+ * Teto de documentos trazidos pelo ramo de metadados numa mesma busca.
+ *
+ * O ramo de metadados é um OR de `ILIKE '%palavra%'` — não tem índice e não tem
+ * ranking: todo documento que casa vale exatamente o mesmo (score 0). Sem teto,
+ * uma palavra genérica ("nota") varreria a tabela inteira de `documents` a cada
+ * página. 200 é generoso o bastante para que o ramo continue útil como rede de
+ * segurança (o valor anterior era 10, em `documentMetadataSearch`).
+ */
+export const METADATA_BRANCH_LIMIT = 200;
+
+/**
+ * Um resultado de DOCUMENTO da busca lexical paginada.
+ *
+ * Mesmo formato de campos de `ChunkSearchResult` — o consumidor continua
+ * montando um `SearchChunk` —, porém com semântica diferente: há no máximo UMA
+ * linha por documento, e os campos de chunk (`text`, `chunkIndex`, `pageNumber`,
+ * `tokenCount`, `documentTypeName`) descrevem o MELHOR chunk daquele documento
+ * para a query.
+ *
+ * `score` é o `max(ts_rank(...))` entre os chunks do documento. Documento que
+ * entrou só pelo ramo de metadados tem `score = 0`.
+ *
+ * Documento READY sem nenhum chunk (PDF escaneado sem texto extraível —
+ * `apps/worker/src/pipeline/persist.ts` só insere quando há chunks) que case por
+ * metadado APARECE no resultado, com `text: ''`, `chunkIndex: 0`,
+ * `tokenCount: 0`, `pageNumber: null` e `documentTypeName: null`. É mudança de
+ * comportamento intencional: antes ele sumia silenciosamente.
+ */
+export interface DocumentSearchResult {
+  documentId: string;
+  tenantId: string;
+  departmentId: string;
+  documentTypeName: string | null;
+  pageNumber: number | null;
+  chunkIndex: number;
+  text: string;
+  tokenCount: number;
+  score: number;
+}
+
+/**
+ * Parâmetros da busca lexical paginada por documento.
+ *
+ * `structuredFilter` substitui o antigo `filterDocumentIds`: os filtros viram a
+ * CTE `filtered` dentro da própria query, em vez de uma lista de UUIDs
+ * materializada no Node e devolvida ao Postgres a cada página.
+ *
+ * `page` é 1-based.
+ */
+export interface PagedDocumentSearchParams {
+  tenantId?: string | undefined;
+  tenantIds?: string[] | undefined;
+  allowedDepartmentIds: string[] | null;
+  structuredFilter?: StructuredDocumentFilters | undefined;
+  queryText: string;
+  page: number;
+  pageSize: number;
+}
+
+/** Página de documentos + total exato de documentos que casam com a busca. */
+export interface PagedDocumentSearchResult {
+  items: DocumentSearchResult[];
+  /** Documentos distintos (conteúdo ∪ metadados) que casam — NÃO é nº de chunks. */
+  total: number;
+}
+
+/** Linha crua devolvida pela query paginada. */
+type PagedRow = {
+  documentId: string;
+  tenantId: string;
+  departmentId: string;
+  documentTypeName: string | null;
+  pageNumber: number | null;
+  chunkIndex: number;
+  text: string;
+  tokenCount: number;
+  score: number;
+  /** `count(*) OVER ()` é int8 — chega como string no postgres.js. */
+  total: string;
+};
+
+/**
+ * Busca lexical PAGINADA POR DOCUMENTO, com total exato.
+ *
+ * Unifica numa única query os dois ramos que antes eram consultas separadas e
+ * truncadas (`lexicalSearch` + `documentMetadataSearch`) e devolve uma página de
+ * documentos — não de chunks — junto do total de documentos que casam.
+ *
+ * Forma da query (a ORDEM dos estágios é o que garante corretude e desempenho):
+ *
+ *   filtered → filtros estruturados + tenant + dept + deleted + READY
+ *   content  → HashAggregate `GROUP BY document_id`: 1 linha por documento
+ *   meta     → ramo de metadados (ILIKE em filename/tags/indexValues), com teto
+ *   merged   → UNION ALL + `max(score)` + semi-join de `filtered`: dedup por
+ *              construção, conteúdo vence metadado
+ *   paged    → MATERIALIZED: corta a página ANTES de tocar em `chunks.text`
+ *   final    → LEFT JOIN LATERAL do melhor chunk, só para as linhas da página
+ *
+ * Invariantes que NÃO podem ser "otimizados" (cada um é um defeito real):
+ *
+ * - **`AS MATERIALIZED` na CTE `paged`**: CTE referenciada uma única vez é
+ *   inlined por padrão desde o PG12. Sem o `MATERIALIZED`, nada garante que o
+ *   `LIMIT` seja aplicado antes do join e o `text` de TODOS os documentos
+ *   casados seja lido e destoastado a cada página (dezenas de MB por request).
+ *   Medido no PG16 os dois planos coincidem — o `LIMIT` já impede o pullup da
+ *   subquery —, mas a barreira é explícita e custa um tuplestore de `pageSize`
+ *   linhas: fica.
+ * - **Semi-join de `filtered` ANTES do `count(*) OVER ()`**: o filtro
+ *   estruturado precisa estar aplicado antes da contagem e do `LIMIT`. Ele vive
+ *   em `merged` (sempre) e, quando há filtros de fato, também é empurrado para
+ *   dentro de `content` — ver o comentário no corpo da função.
+ * - **`GROUP BY max(ts_rank)` em vez de `ROW_NUMBER() OVER (PARTITION BY ...)`**:
+ *   o window function forçaria sort completo dos N chunks casados (spill em
+ *   disco acima do `work_mem`); o `GROUP BY` vira HashAggregate O(N) com hash
+ *   table do tamanho de N_docs.
+ * - **Tenant e departamento DENTRO de todas as CTEs**: no join final (depois do
+ *   `LIMIT`) eles filtrariam o item mas contariam documentos proibidos no
+ *   `total` — vazamento por contagem, mesmo sem vazar o item.
+ * - **Tiebreaker `document_id ASC` em todo `ORDER BY` de ranking**: sem ele,
+ *   scores empatados (e o ramo de metadados empata TUDO em 0) produzem itens
+ *   duplicados ou ausentes entre páginas.
+ * - **`tenant_id`/`department_id` vêm de `documents`**, nunca do chunk:
+ *   `chunks.tenant_id` é cópia congelada do momento da ingestão.
+ * - **`count(*) OVER ()` é int8** e chega como string no postgres.js —
+ *   convertido com `parseInt` (mesmo padrão de `routes/documents.ts`).
+ *
+ * `plainto_tsquery` é STABLE, não IMMUTABLE: cada ocorrência textual é
+ * reavaliada por linha. Aparece o mínimo possível (3x: filtro do `content`,
+ * ranking do `content`, ranking do LATERAL).
+ */
+export async function searchDocumentsPaged(
+  sql: Sql,
+  params: PagedDocumentSearchParams
+): Promise<PagedDocumentSearchResult> {
+  const { tenantId, tenantIds, allowedDepartmentIds, structuredFilter, queryText } = params;
+
+  const page = Math.max(1, Math.trunc(params.page));
+  const pageSize = Math.max(1, Math.trunc(params.pageSize));
+  const offset = (page - 1) * pageSize;
+
+  const alloc = createParamAllocator();
+
+  // --- CTE `filtered`: filtros estruturados + tenant + dept + deleted + READY.
+  // Usa o alias `d`, como o builder espera.
+  const predicate = buildDocumentFilterPredicate(
+    { tenantId, tenantIds, allowedDepartmentIds, filters: structuredFilter },
+    alloc
+  );
+
+  // Filtros insatisfazíveis por construção (ex.: nenhum departamento pedido é
+  // permitido): nenhum documento pode passar, não vale ir ao banco.
+  if (predicate.unsatisfiable) {
+    return { items: [], total: 0 };
+  }
+
+  const queryParam = alloc.add(queryText);
+  const tsQuery = `plainto_tsquery('portuguese', ${queryParam}::text)`;
+
+  // Fragmentos de tenant/dept montados UMA vez e reusados em `content` e `meta`.
+  // Alocar por CTE duplicaria o parâmetro. As colunas se chamam igual em
+  // `chunks` e em `documents`, então o mesmo fragmento serve às duas.
+  let tenantFilter = '';
+  if (tenantIds !== undefined && tenantIds.length > 0) {
+    tenantFilter = ` AND tenant_id = ANY(${alloc.add(tenantIds)}::uuid[])`;
+  } else if (tenantId !== undefined) {
+    tenantFilter = ` AND tenant_id = ${alloc.add(tenantId)}::uuid`;
+  }
+
+  let deptFilter = '';
+  if (allowedDepartmentIds !== null) {
+    deptFilter = ` AND department_id = ANY(${alloc.add(allowedDepartmentIds)}::uuid[])`;
+  }
+
+  // --- CTE `meta`: predicado de metadados inlinado (mesmo de documentMetadataSearch).
+  const metadataPredicate = buildMetadataPredicate(tokenizeMetadataQuery(queryText), alloc);
+
+  // Semi-join de `filtered` DENTRO do ramo de conteúdo: só quando há filtros
+  // estruturados de fato. Medido com EXPLAIN (ANALYZE, BUFFERS), 75k chunks:
+  //
+  //   com semi-join sempre → o planner multiplica a seletividade de tenant/dept
+  //   duas vezes (uma no predicado sobre `chunks`, outra na de `filtered` sobre
+  //   `documents`), estima 1440 linhas onde há 8330, conclui que cada grupo tem
+  //   1 linha e troca o HashAggregate por Sort + GroupAggregate — um sort de
+  //   N_CHUNKS carregando o `text_search_pt` (width 799):
+  //     Sort Method: external merge  Disk: 6584kB   → 46 ms
+  //
+  //   sem o semi-join redundante → estimativa de grupos correta (2997) e
+  //   HashAggregate: 15 ms, zero temp.
+  //
+  // Sem filtros estruturados o semi-join não restringe nada além do que
+  // tenant/dept já restringem (mais `deleted`/`READY`, que `merged` reaplica),
+  // então sai. Com filtros estruturados ele é genuinamente seletivo e o
+  // pushdown vale mais que a estimativa.
+  //
+  // O semi-join OBRIGATÓRIO — o que garante que nenhum documento fora dos
+  // filtros seja contado — vive em `merged`, ainda ANTES do `count(*) OVER ()`
+  // e do LIMIT. Nunca no join final.
+  const contentSemiJoin = hasStructuredDocumentFilters(structuredFilter)
+    ? `
+        AND document_id IN (SELECT id FROM filtered)`
+    : '';
+
+  // Prefixo comum às duas queries (página e contagem de fallback). Precisa ser
+  // fechado ANTES de alocar LIMIT/OFFSET: a query de fallback não os referencia
+  // e o Postgres rejeita bind com parâmetros sobrando.
+  const cteBlock = `
+    WITH filtered AS (
+      SELECT d.id
+      FROM documents d
+      WHERE ${predicate.sql}
+    ),
+    content AS MATERIALIZED (
+      SELECT
+        document_id,
+        max(ts_rank(text_search_pt, ${tsQuery}))::float8 AS score
+      FROM chunks
+      WHERE text_search_pt @@ ${tsQuery}${tenantFilter}${deptFilter}${contentSemiJoin}
+      GROUP BY document_id
+    ),
+    meta AS MATERIALIZED (
+      SELECT
+        id AS document_id,
+        0::float8 AS score
+      FROM documents
+      WHERE deleted = false
+        AND status = 'READY'
+        AND ${metadataPredicate}${tenantFilter}${deptFilter}
+        AND id IN (SELECT id FROM filtered)
+      LIMIT ${METADATA_BRANCH_LIMIT}
+    ),
+    merged AS (
+      SELECT document_id, max(score) AS score
+      FROM (
+        SELECT document_id, score FROM content
+        UNION ALL
+        SELECT document_id, score FROM meta
+      ) u
+      WHERE document_id IN (SELECT id FROM filtered)
+      GROUP BY document_id
+    )`;
+
+  const bindingsWithoutPaging = [...alloc.bindings];
+
+  const limitParam = alloc.add(pageSize);
+  const offsetParam = alloc.add(offset);
+
+  const query = `${cteBlock},
+    paged AS MATERIALIZED (
+      SELECT
+        document_id,
+        score,
+        count(*) OVER () AS total
+      FROM merged
+      ORDER BY score DESC, document_id ASC
+      LIMIT ${limitParam}
+      OFFSET ${offsetParam}
+    )
+    SELECT
+      p.document_id                     AS "documentId",
+      d.tenant_id                       AS "tenantId",
+      d.department_id                   AS "departmentId",
+      best.document_type_name           AS "documentTypeName",
+      best.page_number                  AS "pageNumber",
+      COALESCE(best.chunk_index, 0)     AS "chunkIndex",
+      COALESCE(best.text, '')           AS text,
+      COALESCE(best.token_count, 0)     AS "tokenCount",
+      p.score                           AS score,
+      p.total                           AS total
+    FROM paged p
+    JOIN documents d ON d.id = p.document_id
+    LEFT JOIN LATERAL (
+      SELECT c.chunk_index, c.page_number, c.text, c.token_count, c.document_type_name
+      FROM chunks c
+      WHERE c.document_id = p.document_id
+      ORDER BY ts_rank(c.text_search_pt, ${tsQuery}) DESC, c.chunk_index ASC
+      LIMIT 1
+    ) best ON true
+    ORDER BY p.score DESC, p.document_id ASC
+  `;
+
+  const rows = await sql.unsafe<PagedRow[]>(query, alloc.bindings as UnsafeParams);
+
+  const items: DocumentSearchResult[] = rows.map((r) => ({
+    documentId: r.documentId,
+    tenantId: r.tenantId,
+    departmentId: r.departmentId,
+    documentTypeName: r.documentTypeName,
+    pageNumber: r.pageNumber,
+    chunkIndex: r.chunkIndex,
+    text: r.text,
+    tokenCount: r.tokenCount,
+    score: Number(r.score),
+  }));
+
+  // `count(*) OVER ()` só existe se a página trouxe alguma linha. Numa página
+  // além do fim (OFFSET > total) o resultado é vazio e o total se perderia —
+  // devolver 0 ali faria o front dizer "nenhum resultado" para uma busca que
+  // tem resultados. Só nesse caso pagamos uma segunda ida ao banco.
+  let total: number;
+  if (rows.length > 0) {
+    total = parseInt(rows[0]!.total, 10);
+  } else if (offset > 0) {
+    const countRows = await sql.unsafe<Array<{ total: string }>>(
+      `${cteBlock}
+      SELECT count(*) AS total FROM merged`,
+      bindingsWithoutPaging as UnsafeParams
+    );
+    total = parseInt(countRows[0]?.total ?? '0', 10);
+  } else {
+    total = 0;
+  }
+
+  return { items, total };
 }
 
 // ---------------------------------------------------------------------------
@@ -312,37 +864,30 @@ export async function vectorSearch(
 
   const embeddingLiteral = embeddingToLiteral(queryEmbedding);
 
-  let paramIndex = 1;
-  const bindings: (string | string[] | number)[] = [];
+  const alloc = createParamAllocator();
 
-  bindings.push(embeddingLiteral);
-  const embParam = paramIndex++;   // $1 — embedding literal
+  const embParam = alloc.add(embeddingLiteral); // $1 — embedding literal
 
   let whereClause = '1=1';
 
   // Filtro de tenant
   if (tenantIds !== undefined && tenantIds.length > 0) {
-    bindings.push(tenantIds);
-    whereClause += ` AND tenant_id = ANY($${paramIndex++}::uuid[])`;
+    whereClause += ` AND tenant_id = ANY(${alloc.add(tenantIds)}::uuid[])`;
   } else if (tenantId !== undefined) {
-    bindings.push(tenantId);
-    whereClause += ` AND tenant_id = $${paramIndex++}::uuid`;
+    whereClause += ` AND tenant_id = ${alloc.add(tenantId)}::uuid`;
   }
 
   // Filtro de departamento
   if (allowedDepartmentIds !== null) {
-    bindings.push(allowedDepartmentIds);
-    whereClause += ` AND department_id = ANY($${paramIndex++}::uuid[])`;
+    whereClause += ` AND department_id = ANY(${alloc.add(allowedDepartmentIds)}::uuid[])`;
   }
 
   // Filtro de documentos pré-filtrados
   if (filterDocumentIds !== undefined && filterDocumentIds.length > 0) {
-    bindings.push(filterDocumentIds);
-    whereClause += ` AND document_id = ANY($${paramIndex++}::uuid[])`;
+    whereClause += ` AND document_id = ANY(${alloc.add(filterDocumentIds)}::uuid[])`;
   }
 
-  bindings.push(topK);
-  const limitParam = paramIndex++;
+  const limitParam = alloc.add(topK);
 
   const query = `
     SELECT
@@ -354,11 +899,11 @@ export async function vectorSearch(
       chunk_index        AS "chunkIndex",
       text,
       token_count        AS "tokenCount",
-      1 - (embedding <=> $${embParam}::vector) AS score
+      1 - (embedding <=> ${embParam}::vector) AS score
     FROM chunks
     WHERE ${whereClause}
-    ORDER BY embedding <=> $${embParam}::vector
-    LIMIT $${limitParam}
+    ORDER BY embedding <=> ${embParam}::vector
+    LIMIT ${limitParam}
   `;
 
   type Row = {
@@ -373,7 +918,7 @@ export async function vectorSearch(
     score: number;
   };
 
-  const rows = await sql.unsafe<Row[]>(query, bindings as UnsafeParams);
+  const rows = await sql.unsafe<Row[]>(query, alloc.bindings as UnsafeParams);
   return rows.map((r) => ({
     documentId: r.documentId,
     tenantId: r.tenantId,
@@ -397,8 +942,10 @@ export async function vectorSearch(
  * Substitui o $rankFusion nativo do MongoDB Atlas 8.0+.
  *
  * Algoritmo (constante k=60, padrão da literatura RRF de Cormack et al. 2009):
- *   1. lexical_ranked: ROW_NUMBER sobre ts_rank DESC, LIMIT topK*3 candidatos
- *   2. vector_ranked:  ROW_NUMBER sobre embedding <=> ASC, LIMIT topK*3 candidatos
+ *   1. lexical_ranked: corta topK*3 candidatos por ts_rank DESC, id ASC e
+ *                      numera os sobreviventes com ROW_NUMBER
+ *   2. vector_ranked:  corta topK*3 candidatos por embedding <=> ASC e numera
+ *                      os sobreviventes com ROW_NUMBER
  *   3. rrf:            FULL OUTER JOIN em chunk_id
  *                      rrf_score = 1/(60+rank_l) + 1/(60+rank_v)
  *                      chunk ausente em um lado recebe rank fictício 10000
@@ -408,10 +955,43 @@ export async function vectorSearch(
  * dos rankings recebem rank fictício 10000 (praticamente zero de contribuição)
  * para garantir que chunks presentes nos dois rankings sejam promovidos.
  *
- * Os filtros de tenant/dept são aplicados DENTRO de cada CTE para garantir
- * isolamento multi-tenant desde o início da execução.
- * O filtro de filterDocumentIds é aplicado no JOIN final para evitar
- * duplicação de parâmetros entre os dois CTEs internos.
+ * DETERMINISMO (T-60). Cada CTE tem duas etapas separadas de propósito: uma
+ * subquery que CORTA (ORDER BY ... LIMIT topK*3) e um ROW_NUMBER que NUMERA os
+ * sobreviventes. Antes da T-60 as duas eram a mesma etapa, e faltava
+ * tiebreaker: o CTE lexical nem ORDER BY de statement tinha antes do `LIMIT`
+ * (o Postgres podia devolver quaisquer topK*3 linhas) e as duas janelas
+ * empatavam sem critério de desempate. Resultado: com empate de `ts_rank`
+ * (comum — chunks com o mesmo texto) ou de distância cosine, o rank saía da
+ * ordem física das linhas, o `rrf_score` saía junto, e a MESMA busca devolvia
+ * ordens diferentes entre execuções.
+ *
+ * Hoje: a numeração é sempre determinística (`, chunk_id ASC` nas duas janelas)
+ * e o ORDER BY final termina em `, c.id ASC`.
+ *
+ * Por que o corte vetorial NÃO leva `, id` no ORDER BY: `ORDER BY embedding <=>
+ * $emb` sozinho é a única forma que o índice HNSW consegue servir. Medido em
+ * 20k chunks com o índice forçado: `ORDER BY dist` usa o HNSW em 2,2 ms;
+ * `ORDER BY dist, id` torna o plano HNSW impossível e cai para varredura
+ * completa + sort, ~125 ms. Por isso o desempate por id fica na JANELA (que
+ * roda sobre os ≤ topK*3 candidatos já cortados, onde custa zero) e não no
+ * corte. Consequência assumida: sob empate EXATO de distância bem na fronteira
+ * do corte, quais linhas entram no pool ainda depende do plano — resíduo
+ * aceitável num índice que já é aproximado por construção. O lado lexical não
+ * tem esse dilema (nenhum índice fornece ordem de `ts_rank`), então lá o
+ * desempate por id entra também no corte.
+ *
+ * FILTROS. tenant/dept e `filterDocumentIds` são aplicados DENTRO de cada CTE,
+ * antes do corte de `topK*3` candidatos. Aplicar o filtro de documentos só no
+ * JOIN final (como era até T-60) descartava resultados válidos: os candidatos
+ * eram escolhidos ignorando o filtro e podiam não conter nenhum documento que
+ * passasse nele, devolvendo menos que `topK` — às vezes zero — mesmo havendo
+ * muitos chunks elegíveis. O mesmo placeholder `$N` é reusado nas três
+ * posições (allocator da T-58), então empurrar o filtro para dentro não
+ * duplica binding nem desloca a numeração.
+ *
+ * Esta função NÃO pagina (sem offset/cursor): paginação de vector/hybrid exige
+ * pool de candidatos fixo e `hnsw.ef_search` por página — dívida técnica
+ * registrada à parte (T-68).
  *
  * Spec §9 (etapa 3 — busca híbrida $rankFusion → RRF manual).
  */
@@ -432,69 +1012,74 @@ export async function hybridSearch(
   const embeddingLiteral = embeddingToLiteral(queryEmbedding);
   const candidateLimit = topK * 3;
 
-  let paramIndex = 1;
-  const bindings: (string | string[] | number)[] = [];
+  const alloc = createParamAllocator();
 
-  bindings.push(queryText);
-  const queryParam = paramIndex++;           // $1 — tsquery text
+  const queryParam = alloc.add(queryText);              // $1 — tsquery text
+  const embParam = alloc.add(embeddingLiteral);         // $2 — embedding literal
+  const candidateLimitParam = alloc.add(candidateLimit); // $3 — LIMIT para cada CTE
 
-  bindings.push(embeddingLiteral);
-  const embParam = paramIndex++;             // $2 — embedding literal
-
-  bindings.push(candidateLimit);
-  const candidateLimitParam = paramIndex++;  // $3 — LIMIT para cada CTE
-
-  // Filtros comuns (aplicados identicamente em lexical_ranked e vector_ranked)
+  // Filtros comuns (aplicados identicamente em lexical_ranked e vector_ranked).
+  // O fragmento é montado UMA vez e a mesma string de placeholder é reusada nas
+  // duas CTEs — alocar por CTE duplicaria o parâmetro.
   let tenantFilter = '';
   if (tenantIds !== undefined && tenantIds.length > 0) {
-    bindings.push(tenantIds);
-    tenantFilter = ` AND tenant_id = ANY($${paramIndex++}::uuid[])`;
+    tenantFilter = ` AND tenant_id = ANY(${alloc.add(tenantIds)}::uuid[])`;
   } else if (tenantId !== undefined) {
-    bindings.push(tenantId);
-    tenantFilter = ` AND tenant_id = $${paramIndex++}::uuid`;
+    tenantFilter = ` AND tenant_id = ${alloc.add(tenantId)}::uuid`;
   }
 
   let deptFilter = '';
   if (allowedDepartmentIds !== null) {
-    bindings.push(allowedDepartmentIds);
-    deptFilter = ` AND department_id = ANY($${paramIndex++}::uuid[])`;
+    deptFilter = ` AND department_id = ANY(${alloc.add(allowedDepartmentIds)}::uuid[])`;
   }
 
-  // filterDocumentIds aplicado no JOIN final (após o RRF)
+  // filterDocumentIds entra DENTRO das duas CTEs (antes do corte de candidatos)
+  // e é repetido no JOIN final. As três posições reusam o MESMO placeholder —
+  // uma segunda chamada de `alloc.add` deslocaria todos os `$N` seguintes.
   let docFilter = '';
+  let docFilterAliased = '';
   if (filterDocumentIds !== undefined && filterDocumentIds.length > 0) {
-    bindings.push(filterDocumentIds);
-    docFilter = ` AND c.document_id = ANY($${paramIndex++}::uuid[])`;
+    const docParam = alloc.add(filterDocumentIds);
+    docFilter = ` AND document_id = ANY(${docParam}::uuid[])`;
+    docFilterAliased = ` AND c.document_id = ANY(${docParam}::uuid[])`;
   }
 
-  bindings.push(topK);
-  const topKParam = paramIndex++;            // último parâmetro — LIMIT final
+  const topKParam = alloc.add(topK); // último parâmetro — LIMIT final
 
   const query = `
     WITH lexical_ranked AS (
       SELECT
-        id AS chunk_id,
-        ROW_NUMBER() OVER (
-          ORDER BY ts_rank(text_search_pt, plainto_tsquery('portuguese', $${queryParam}::text)) DESC
-        ) AS rnk
-      FROM chunks
-      WHERE text_search_pt @@ plainto_tsquery('portuguese', $${queryParam}::text)
-        ${tenantFilter}
-        ${deptFilter}
-      LIMIT $${candidateLimitParam}
+        chunk_id,
+        ROW_NUMBER() OVER (ORDER BY lex_rank DESC, chunk_id ASC) AS rnk
+      FROM (
+        SELECT
+          id AS chunk_id,
+          ts_rank(text_search_pt, plainto_tsquery('portuguese', ${queryParam}::text)) AS lex_rank
+        FROM chunks
+        WHERE text_search_pt @@ plainto_tsquery('portuguese', ${queryParam}::text)
+          ${tenantFilter}
+          ${deptFilter}
+          ${docFilter}
+        ORDER BY lex_rank DESC, id ASC
+        LIMIT ${candidateLimitParam}
+      ) l
     ),
     vector_ranked AS (
       SELECT
-        id AS chunk_id,
-        ROW_NUMBER() OVER (
-          ORDER BY embedding <=> $${embParam}::vector
-        ) AS rnk
-      FROM chunks
-      WHERE 1=1
-        ${tenantFilter}
-        ${deptFilter}
-      ORDER BY embedding <=> $${embParam}::vector
-      LIMIT $${candidateLimitParam}
+        chunk_id,
+        ROW_NUMBER() OVER (ORDER BY dist ASC, chunk_id ASC) AS rnk
+      FROM (
+        SELECT
+          id AS chunk_id,
+          embedding <=> ${embParam}::vector AS dist
+        FROM chunks
+        WHERE 1=1
+          ${tenantFilter}
+          ${deptFilter}
+          ${docFilter}
+        ORDER BY embedding <=> ${embParam}::vector
+        LIMIT ${candidateLimitParam}
+      ) v
     ),
     rrf AS (
       SELECT
@@ -519,9 +1104,9 @@ export async function hybridSearch(
     FROM rrf r
     JOIN chunks c ON c.id = r.chunk_id
     WHERE 1=1
-      ${docFilter}
-    ORDER BY r.rrf_score DESC
-    LIMIT $${topKParam}
+      ${docFilterAliased}
+    ORDER BY r.rrf_score DESC, c.id ASC
+    LIMIT ${topKParam}
   `;
 
   type Row = {
@@ -536,7 +1121,7 @@ export async function hybridSearch(
     score: number;
   };
 
-  const rows = await sql.unsafe<Row[]>(query, bindings as UnsafeParams);
+  const rows = await sql.unsafe<Row[]>(query, alloc.bindings as UnsafeParams);
   return rows.map((r) => ({
     documentId: r.documentId,
     tenantId: r.tenantId,

@@ -4,8 +4,21 @@ import type { FastifyPluginAsync, FastifyReply, FastifyBaseLogger } from 'fastif
 import type { Sql } from '@dmdoc/db-pg';
 import { SearchRequestSchema } from '@dmdoc/shared-types';
 import type { SearchChunk, SearchChunkIndexValue, Citation } from '@dmdoc/shared-types';
-import { hybridSearch, lexicalSearch, vectorSearch, documentMetadataSearch } from '@dmdoc/db-pg';
-import type { ChunkSearchResult } from '@dmdoc/db-pg';
+import {
+  hybridSearch,
+  lexicalSearch,
+  vectorSearch,
+  documentMetadataSearch,
+  searchDocumentsPaged,
+  createParamAllocator,
+  buildDocumentFilterPredicate,
+  hasStructuredDocumentFilters,
+} from '@dmdoc/db-pg';
+import type {
+  ChunkSearchResult,
+  DocumentSearchResult,
+  StructuredDocumentFilters,
+} from '@dmdoc/db-pg';
 import { createLLMProvider } from '@dmdoc/llm-provider';
 import type { LLMProvider } from '@dmdoc/llm-provider';
 import type { Config } from '../config.js';
@@ -47,133 +60,202 @@ type DocMeta = {
   tags: string[];
 };
 
+/**
+ * Campos que o enriquecimento em lote consome de um resultado de busca.
+ *
+ * Serve tanto a `ChunkSearchResult` (caminho por chunk — vector/hybrid/RAG)
+ * quanto a `DocumentSearchResult` (caminho paginado por documento), que
+ * compartilham esse subconjunto de campos.
+ */
+type EnrichableResult = Pick<
+  ChunkSearchResult & DocumentSearchResult,
+  'documentId' | 'tenantId' | 'documentTypeName' | 'pageNumber' | 'chunkIndex' | 'text' | 'score'
+>;
+
+/** Escopo de tenant já resolvido pela rota, reaproveitado no enriquecimento. */
+type TenantScope = {
+  singleTenantId: string | undefined;
+  multiTenantIds: string[] | undefined;
+};
+
+/**
+ * Teto de profundidade da paginação: `(page - 1) * pageSize`.
+ *
+ * O custo não é o OFFSET em si, e sim repagar o pipeline inteiro (ranking +
+ * agregação) a cada página para descartar tudo antes do offset. Todo motor de
+ * busca impõe um teto desse tipo; acima dele o caminho correto é refinar a
+ * busca com filtros, não avançar páginas.
+ */
+const MAX_PAGINATION_DEPTH = 5000;
+
 // ---------------------------------------------------------------------------
 // Helpers de filtros estruturados
 // ---------------------------------------------------------------------------
-
-interface StructuredFilters {
-  departmentIds?: string[] | undefined;
-  documentTypeIds?: string[] | undefined;
-  tags?: string[] | undefined;
-  indexFilters?:
-    | Record<
-        string,
-        {
-          gte?: string | number | undefined;
-          lte?: string | number | undefined;
-          eq?: string | number | undefined;
-        }
-      >
-    | undefined;
-}
 
 /**
  * Aplica filtros estruturados na tabela `documents` e retorna os documentIds
  * que passam. Retorna `null` quando não há filtros (sem restrição por documentId).
  *
- * Filtros JSONB para indexValues (spec §9 etapa 4 + §7 search):
- *   - TEXT/eq:   index_values->>'campo' = $val
- *   - NUMBER/gte: (index_values->>'campo')::numeric >= $val
- *   - NUMBER/lte: (index_values->>'campo')::numeric <= $val
- *   - DATE/gte:  (index_values->>'campo')::timestamptz >= $val
- *   - DATE/lte:  (index_values->>'campo')::timestamptz <= $val
- *   - tags:      tags @> $tags::text[]
- *   - documentTypeIds: document_type_id = ANY($ids::uuid[])
+ * A montagem do WHERE vive em `@dmdoc/db-pg` (`buildDocumentFilterPredicate`)
+ * para poder ser inlinada em queries maiores sem duplicar o predicado — aqui
+ * fica só a execução e o mapeamento do resultado.
  */
 async function resolveFilteredDocumentIds(
   sql: Sql,
   tenantId: string | undefined,
   tenantIds: string[] | undefined,
   allowedDepartmentIds: string[] | null,
-  filters: StructuredFilters | undefined,
+  filters: StructuredDocumentFilters | undefined,
 ): Promise<string[] | null> {
-  const hasStructuredFilters =
-    filters !== undefined &&
-    (filters.departmentIds !== undefined ||
-      filters.documentTypeIds !== undefined ||
-      (filters.tags !== undefined && filters.tags.length > 0) ||
-      (filters.indexFilters !== undefined && Object.keys(filters.indexFilters).length > 0));
-
-  if (!hasStructuredFilters) {
+  if (!hasStructuredDocumentFilters(filters)) {
     return null;
   }
 
-  // Construção dinâmica de WHERE com sql.unsafe + parâmetros
-  const conditions: string[] = [`d.deleted = false`, `d.status = 'READY'`];
-  const params: unknown[] = [];
-  let paramIdx = 1;
+  const alloc = createParamAllocator();
+  const predicate = buildDocumentFilterPredicate(
+    { tenantId, tenantIds, allowedDepartmentIds, filters },
+    alloc,
+  );
 
-  const addParam = (val: unknown): string => {
-    params.push(val);
-    return `$${paramIdx++}`;
-  };
+  // Filtros insatisfazíveis (ex.: nenhum departamento pedido é permitido):
+  // nenhum documento pode passar, não vale ir ao banco.
+  if (predicate.unsatisfiable) return [];
 
-  // Filtro de tenant
-  if (tenantIds !== undefined && tenantIds.length > 0) {
-    conditions.push(`d.tenant_id = ANY(${addParam(tenantIds)}::uuid[])`);
-  } else if (tenantId !== undefined) {
-    conditions.push(`d.tenant_id = ${addParam(tenantId)}`);
-  }
+  const query = `SELECT d.id FROM documents d WHERE ${predicate.sql}`;
 
-  // Filtro de departamentos
-  if (filters?.departmentIds !== undefined) {
-    const requested = filters.departmentIds;
-    let effective: string[];
-    if (allowedDepartmentIds !== null) {
-      effective = requested.filter((id) => allowedDepartmentIds.includes(id));
-      if (effective.length === 0) return [];
-    } else {
-      effective = requested;
-    }
-    conditions.push(`d.department_id = ANY(${addParam(effective)}::uuid[])`);
-  } else if (allowedDepartmentIds !== null) {
-    conditions.push(`d.department_id = ANY(${addParam(allowedDepartmentIds)}::uuid[])`);
-  }
-
-  // Filtro de documentTypeIds: = ANY($ids::uuid[])
-  if (filters?.documentTypeIds !== undefined && filters.documentTypeIds.length > 0) {
-    conditions.push(`d.document_type_id = ANY(${addParam(filters.documentTypeIds)}::uuid[])`);
-  }
-
-  // Filtro de tags: tags @> $tags::text[] (contém TODOS)
-  if (filters?.tags !== undefined && filters.tags.length > 0) {
-    conditions.push(`d.tags @> ${addParam(filters.tags)}::text[]`);
-  }
-
-  // Filtros de indexValues (JSONB)
-  if (filters?.indexFilters !== undefined) {
-    for (const [fieldName, conditions_] of Object.entries(filters.indexFilters)) {
-      if (conditions_.eq !== undefined) {
-        conditions.push(`d.index_values->>${addParam(fieldName)} = ${addParam(String(conditions_.eq))}`);
-      }
-      if (conditions_.gte !== undefined) {
-        const val = conditions_.gte;
-        if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val)) {
-          // DATE
-          conditions.push(`(d.index_values->>${addParam(fieldName)})::timestamptz >= ${addParam(val)}::timestamptz`);
-        } else {
-          // NUMBER
-          conditions.push(`(d.index_values->>${addParam(fieldName)})::numeric >= ${addParam(val)}`);
-        }
-      }
-      if (conditions_.lte !== undefined) {
-        const val = conditions_.lte;
-        if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val)) {
-          // DATE
-          conditions.push(`(d.index_values->>${addParam(fieldName)})::timestamptz <= ${addParam(val)}::timestamptz`);
-        } else {
-          // NUMBER
-          conditions.push(`(d.index_values->>${addParam(fieldName)})::numeric <= ${addParam(val)}`);
-        }
-      }
-    }
-  }
-
-  const whereClause = conditions.join(' AND ');
-  const query = `SELECT d.id FROM documents d WHERE ${whereClause}`;
-
-  const rows = await sql.unsafe<Array<{ id: string }>>(query, params as Parameters<typeof sql.unsafe>[1]);
+  const rows = await sql.unsafe<Array<{ id: string }>>(
+    query,
+    alloc.bindings as Parameters<typeof sql.unsafe>[1],
+  );
   return rows.map((r) => r.id);
+}
+
+// ---------------------------------------------------------------------------
+// Enriquecimento em lote dos resultados
+// ---------------------------------------------------------------------------
+
+/**
+ * Enriquece os resultados da busca com nome original, título CONFIRMADO, tags
+ * confirmadas e os valores de índice "que aparecem na busca" (showOnSearch).
+ * Tudo em LOTE — duas queries no total, sem N+1.
+ *
+ * Multi-tenancy inegociável: além do `documentId` (que a busca já autorizou),
+ * aplica o MESMO filtro de tenant/allowedTenantIds. Nenhum título/índice de
+ * outra empresa entra por aqui.
+ *
+ * Esta query NÃO reaplica o filtro de departamento: ela confia que a busca já
+ * autorizou os documentos. O que sustenta essa confiança é o filtro de
+ * departamento estar dentro de TODAS as CTEs da query de busca — tanto no ramo
+ * de conteúdo quanto no de metadados. Se algum dia esse filtro sair de lá, esta
+ * função vira o vazamento.
+ */
+async function enrichResultsToChunks(
+  sql: Sql,
+  results: EnrichableResult[],
+  scope: TenantScope,
+): Promise<SearchChunk[]> {
+  const { singleTenantId, multiTenantIds } = scope;
+  const uniqueDocIds = [...new Set(results.map((r) => r.documentId))];
+
+  const docMetaMap = new Map<string, DocMeta>();
+  if (uniqueDocIds.length > 0) {
+    const tenantFilter =
+      multiTenantIds !== undefined
+        ? sql`AND d.tenant_id = ANY(${multiTenantIds}::uuid[])`
+        : singleTenantId !== undefined
+          ? sql`AND d.tenant_id = ${singleTenantId}`
+          : sql``;
+
+    const docRows = await sql<DocMetaRow[]>`
+      SELECT d.id, d.original_filename, d.title, d.document_type_id, d.index_values, d.tags
+      FROM documents d
+      WHERE d.id = ANY(${uniqueDocIds}::uuid[])
+        AND d.deleted = false
+        ${tenantFilter}
+    `;
+
+    // Campos de índice showOnSearch dos tipos envolvidos — uma query em lote.
+    const typeIds = [
+      ...new Set(
+        docRows.map((d) => d.document_type_id).filter((id): id is string => id !== null),
+      ),
+    ];
+
+    const fieldsByType = new Map<string, IndexFieldRow[]>();
+    if (typeIds.length > 0) {
+      const fieldRows = await sql<IndexFieldRow[]>`
+        SELECT document_type_id, name, label, field_type, sort_order
+        FROM document_type_index_fields
+        WHERE document_type_id = ANY(${typeIds}::uuid[])
+          AND show_on_search = true
+          AND deleted = false
+        ORDER BY sort_order ASC
+      `;
+      for (const f of fieldRows) {
+        const list = fieldsByType.get(f.document_type_id) ?? [];
+        list.push(f);
+        fieldsByType.set(f.document_type_id, list);
+      }
+    }
+
+    for (const d of docRows) {
+      const fields = d.document_type_id !== null ? fieldsByType.get(d.document_type_id) ?? [] : [];
+      const values = d.index_values ?? {};
+      const indexValues: SearchChunkIndexValue[] = [];
+      for (const field of fields) {
+        const raw = values[field.name];
+        if (raw === undefined || raw === null) continue;
+        indexValues.push({
+          fieldName: field.name,
+          label: resolveIndexFieldDisplayLabel(field),
+          fieldType: field.field_type,
+          value: raw,
+        });
+      }
+      docMetaMap.set(d.id, {
+        originalFilename: d.original_filename,
+        title: d.title,
+        indexValues,
+        tags: d.tags ?? [],
+      });
+    }
+  }
+
+  return results.map((r) => {
+    const meta = docMetaMap.get(r.documentId);
+    return {
+      documentId: r.documentId,
+      documentName: meta?.originalFilename ?? null,
+      title: meta?.title ?? null,
+      indexValues: meta?.indexValues ?? [],
+      tags: meta?.tags ?? [],
+      tenantId: r.tenantId,
+      documentTypeName: r.documentTypeName,
+      pageNumber: r.pageNumber,
+      chunkIndex: r.chunkIndex,
+      text: r.text,
+      score: r.score,
+    };
+  });
+}
+
+/**
+ * Corpo de uma resposta de busca vazia, já com os campos de paginação.
+ *
+ * `page`/`pageSize` ecoam o que foi pedido (contrato do `SearchResponseSchema`);
+ * `total` e `pageCount` são 0 — sem resultados não há página nenhuma.
+ */
+function emptySearchResponse(page: number, pageSize: number) {
+  return {
+    answer: null,
+    citations: [],
+    chunks: [],
+    page,
+    pageSize,
+    total: 0,
+    pageCount: 0,
+    costUsd: 0,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -210,13 +292,22 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     const role = request.user!.role;
     const sql = app.db;
 
+    // Lido ANTES do parse (que aplica os defaults do Zod): só assim dá para
+    // distinguir `page: 1` enviado pelo cliente do default. A guarda de
+    // "paginação em modo não-lexical" depende dessa distinção.
+    const rawBody =
+      typeof request.body === 'object' && request.body !== null
+        ? (request.body as Record<string, unknown>)
+        : {};
+    const pagingRequested = rawBody.page !== undefined || rawBody.pageSize !== undefined;
+
     const body = SearchRequestSchema.parse(request.body);
 
     const { tenantId: tenantIdParam } = z
       .object({ tenantId: z.string().uuid().optional() })
       .parse(request.query);
     const context = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: false });
-    const { query, searchMode, filters, topK, generateAnswer } = body;
+    const { query, searchMode, filters, topK, generateAnswer, page, pageSize } = body;
 
     const singleTenantId = context.mode === 'single' ? context.tenantId : undefined;
     const multiTenantIds = context.mode === 'allowed' ? context.tenantIds : undefined;
@@ -224,6 +315,47 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
     const logTenantId =
       singleTenantId ?? (multiTenantIds ? `[${multiTenantIds.join(',')}]` : 'all');
     const log = request.log.child({ tenantId: logTenantId, userId, traceId: request.id });
+
+    // -----------------------------------------------------------------------
+    // Guardas de paginação (400) — antes de qualquer ida ao banco.
+    // -----------------------------------------------------------------------
+
+    // (a) O caminho SSE não pagina: ele monta o contexto do LLM com os `topK`
+    // chunks mais relevantes. Aceitar `page > 1` ali seria inventar semântica.
+    if (generateAnswer && page > 1) {
+      log.info({ page, generateAnswer }, 'busca recusada: geração de resposta com page > 1');
+      return reply.status(400).send({
+        error: {
+          code: 'BAD_REQUEST',
+          message:
+            'generateAnswer não é compatível com page > 1: a resposta gerada por IA usa sempre a primeira página de resultados',
+        },
+      });
+    }
+
+    // (b) `total`/`pageCount` só são exatos no modo lexical (ver comentário do
+    // SearchRequestSchema). Em vector/hybrid o conjunto candidato é truncado
+    // pelo ranqueador — paginar sobre ele devolveria números mentirosos.
+    if (searchMode !== 'lexical' && pagingRequested) {
+      log.info({ searchMode, page, pageSize }, 'busca recusada: paginação em modo não-lexical');
+      return reply.status(400).send({
+        error: {
+          code: 'BAD_REQUEST',
+          message: `paginação (page/pageSize) só é suportada em searchMode 'lexical'; recebido '${searchMode}'`,
+        },
+      });
+    }
+
+    // (c) Profundidade máxima.
+    if ((page - 1) * pageSize > MAX_PAGINATION_DEPTH) {
+      log.info({ page, pageSize }, 'busca recusada: profundidade de paginação excedida');
+      return reply.status(400).send({
+        error: {
+          code: 'BAD_REQUEST',
+          message: `profundidade de paginação excedida: (page - 1) * pageSize deve ser no máximo ${MAX_PAGINATION_DEPTH}; refine a busca com filtros em vez de avançar páginas`,
+        },
+      });
+    }
 
     let allowedDepartmentIds = await resolveAccessibleDepartmentIds(
       sql,
@@ -238,8 +370,11 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
           (allowedDepartmentIds as string[]).includes(id),
         );
         if (intersection.length === 0) {
+          // Corte de PERMISSÃO: nenhum dos departamentos pedidos é acessível.
+          // Não vale ir ao banco — o resultado é vazio por construção.
           if (generateAnswer) return sendEmptySSE(reply, log);
-          return reply.status(200).send({ answer: null, citations: [], chunks: [], costUsd: 0 });
+          log.info({ page, pageSize, total: 0 }, 'busca sem departamentos acessíveis');
+          return reply.status(200).send(emptySearchResponse(page, pageSize));
         }
         allowedDepartmentIds = intersection;
       } else {
@@ -247,17 +382,65 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
       }
     }
 
+    const structuredFilter = filters as StructuredDocumentFilters | undefined;
+
+    // -----------------------------------------------------------------------
+    // Caminho PAGINADO — `searchMode: 'lexical'` sem geração de resposta.
+    //
+    // Uma única query (`searchDocumentsPaged`) resolve filtros estruturados,
+    // ramo de conteúdo, ramo de metadados, dedup por documento, total exato e
+    // recorte da página. Os filtros estruturados viram a CTE `filtered`: nenhum
+    // array de UUIDs trafega mais entre Node e Postgres neste caminho.
+    // -----------------------------------------------------------------------
+    if (searchMode === 'lexical' && !generateAnswer) {
+      const { items, total } = await searchDocumentsPaged(sql, {
+        ...(singleTenantId !== undefined ? { tenantId: singleTenantId } : {}),
+        ...(multiTenantIds !== undefined ? { tenantIds: multiTenantIds } : {}),
+        allowedDepartmentIds,
+        ...(structuredFilter !== undefined ? { structuredFilter } : {}),
+        queryText: query,
+        page,
+        pageSize,
+      });
+
+      const chunks = await enrichResultsToChunks(sql, items, { singleTenantId, multiTenantIds });
+      const pageCount = Math.ceil(total / pageSize);
+
+      log.info(
+        { searchMode, page, pageSize, total, pageCount, returned: chunks.length },
+        'busca lexical paginada concluída',
+      );
+
+      return reply.status(200).send({
+        answer: null,
+        citations: [],
+        chunks,
+        page,
+        pageSize,
+        total,
+        pageCount,
+        costUsd: 0,
+      });
+    }
+
+    // -----------------------------------------------------------------------
+    // Caminho por CHUNK — vector/hybrid e o RAG (generateAnswer). Preserva a
+    // semântica atual: `topK` chunks (vários por documento) alimentando o LLM,
+    // com o ramo de metadados mesclado em memória.
+    // -----------------------------------------------------------------------
+
     const filterDocumentIds = await resolveFilteredDocumentIds(
       sql,
       singleTenantId,
       multiTenantIds,
       allowedDepartmentIds,
-      filters as StructuredFilters | undefined,
+      structuredFilter,
     );
 
     if (filterDocumentIds !== null && filterDocumentIds.length === 0) {
       if (generateAnswer) return sendEmptySSE(reply, log);
-      return reply.status(200).send({ answer: null, citations: [], chunks: [], costUsd: 0 });
+      log.info({ page, pageSize, total: 0 }, 'busca sem documentos após filtros estruturados');
+      return reply.status(200).send(emptySearchResponse(page, pageSize));
     }
 
     // Busca por metadados em paralelo
@@ -400,103 +583,30 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
 
     const allSearchResults = [...searchResults, ...metadataChunks];
 
-    // Enriquece chunks com nome original, título confirmado e valores de índice
-    // "que aparecem na busca" (showOnSearch). Tudo em LOTE (sem N+1).
-    const uniqueDocIds = [...new Set(allSearchResults.map((r) => r.documentId))];
-
-    const docMetaMap = new Map<string, DocMeta>();
-    if (uniqueDocIds.length > 0) {
-      // Multi-tenancy inegociável: além do documentId (que a busca já autorizou),
-      // aplicamos o MESMO filtro de tenant/allowedTenantIds. Nenhum título/índice
-      // de outra empresa pode entrar por esta query em lote.
-      const tenantFilter =
-        multiTenantIds !== undefined
-          ? sql`AND d.tenant_id = ANY(${multiTenantIds}::uuid[])`
-          : singleTenantId !== undefined
-            ? sql`AND d.tenant_id = ${singleTenantId}`
-            : sql``;
-
-      const docRows = await sql<DocMetaRow[]>`
-        SELECT d.id, d.original_filename, d.title, d.document_type_id, d.index_values, d.tags
-        FROM documents d
-        WHERE d.id = ANY(${uniqueDocIds}::uuid[])
-          AND d.deleted = false
-          ${tenantFilter}
-      `;
-
-      // Campos de índice showOnSearch dos tipos envolvidos — uma query em lote.
-      const typeIds = [
-        ...new Set(
-          docRows
-            .map((d) => d.document_type_id)
-            .filter((id): id is string => id !== null),
-        ),
-      ];
-
-      const fieldsByType = new Map<string, IndexFieldRow[]>();
-      if (typeIds.length > 0) {
-        const fieldRows = await sql<IndexFieldRow[]>`
-          SELECT document_type_id, name, label, field_type, sort_order
-          FROM document_type_index_fields
-          WHERE document_type_id = ANY(${typeIds}::uuid[])
-            AND show_on_search = true
-            AND deleted = false
-          ORDER BY sort_order ASC
-        `;
-        for (const f of fieldRows) {
-          const list = fieldsByType.get(f.document_type_id) ?? [];
-          list.push(f);
-          fieldsByType.set(f.document_type_id, list);
-        }
-      }
-
-      for (const d of docRows) {
-        const fields =
-          d.document_type_id !== null ? fieldsByType.get(d.document_type_id) ?? [] : [];
-        const values = d.index_values ?? {};
-        const indexValues: SearchChunkIndexValue[] = [];
-        for (const field of fields) {
-          const raw = values[field.name];
-          if (raw === undefined || raw === null) continue;
-          indexValues.push({
-            fieldName: field.name,
-            label: resolveIndexFieldDisplayLabel(field),
-            fieldType: field.field_type,
-            value: raw,
-          });
-        }
-        docMetaMap.set(d.id, {
-          originalFilename: d.original_filename,
-          title: d.title,
-          indexValues,
-          tags: d.tags ?? [],
-        });
-      }
-    }
-
-    const chunks: SearchChunk[] = allSearchResults.map((r) => {
-      const meta = docMetaMap.get(r.documentId);
-      return {
-        documentId: r.documentId,
-        documentName: meta?.originalFilename ?? null,
-        title: meta?.title ?? null,
-        indexValues: meta?.indexValues ?? [],
-        tags: meta?.tags ?? [],
-        tenantId: r.tenantId,
-        documentTypeName: r.documentTypeName,
-        pageNumber: r.pageNumber,
-        chunkIndex: r.chunkIndex,
-        text: r.text,
-        score: r.score,
-      };
+    const chunks: SearchChunk[] = await enrichResultsToChunks(sql, allSearchResults, {
+      singleTenantId,
+      multiTenantIds,
     });
 
     if (!generateAnswer || chunks.length === 0) {
-      log.info({ generateAnswer, chunksFound: chunks.length }, 'busca sem geração de resposta');
+      // Este caminho não pagina: devolve o conjunto ranqueado inteiro (truncado
+      // pelo `topK`, não por `pageSize`). Para o contrato de resposta continuar
+      // uniforme, ele se apresenta como PÁGINA ÚNICA — `pageSize` ecoa o que foi
+      // efetivamente devolvido, de modo que `pageCount` nunca prometa uma página
+      // 2 que a guarda (b) recusaria.
+      const total = chunks.length;
+      log.info(
+        { generateAnswer, searchMode, page: 1, pageSize: total, total },
+        'busca sem geração de resposta',
+      );
       return reply.status(200).send({
         answer: null,
         citations: [],
         chunks,
+        page: 1,
+        pageSize: total > 0 ? total : pageSize,
+        total,
+        pageCount: total > 0 ? 1 : 0,
         costUsd: embeddingCostUsd,
       });
     }
@@ -521,6 +631,11 @@ function formatSSEEvent(eventType: string, data: unknown): string {
 
 async function sendEmptySSE(reply: FastifyReply, log: FastifyBaseLogger): Promise<void> {
   log.info('busca SSE sem resultados — nenhum chunk acessível');
+
+  // Assume o controle do socket ANTES de escrever em `reply.raw`, igual a
+  // `generateSSEResponse`. Sem o hijack o Fastify tenta responder de novo ao
+  // fim do handler, sobre um socket já encerrado.
+  reply.hijack();
 
   reply.raw.writeHead(200, {
     'Content-Type': 'text/event-stream',

@@ -19,15 +19,29 @@ export type IndexFilterValue = z.infer<typeof IndexFilterValueSchema>;
 /**
  * Body do POST /search (spec §7 — Busca RAG).
  *
- * `searchMode`:
- *   - `lexical`  → Atlas Search ($search) — sem embedding, sem API externa
- *   - `vector`   → Atlas Vector Search ($vectorSearch) — requer embedding
- *   - `hybrid`   → $rankFusion (lexical + vetorial) — requer embedding
+ * `searchMode` (PostgreSQL 16 + pgvector):
+ *   - `lexical`  → full-text search (tsvector/tsquery) — sem embedding, sem API externa
+ *   - `vector`   → similaridade de embeddings via pgvector — requer embedding
+ *   - `hybrid`   → Reciprocal Rank Fusion em SQL (lexical + vetorial) — requer embedding
  *
  * `generateAnswer`: se true, passa os chunks para o LLM e retorna
  *   resposta gerada + citações. Requer LLM_API_KEY configurado.
  *
- * `topK`: número de chunks mais relevantes a retornar (padrão 10, máx 50).
+ * `page` / `pageSize`: paginação server-side da lista de resultados (E-5).
+ *   O teto de `pageSize` é 100 — deliberadamente menor que os 500 de
+ *   `ListDocumentsQuerySchema` (apps/api/src/routes/documents.ts), porque cada
+ *   item da busca carrega o `text` completo de um chunk.
+ *
+ * ESCOPO DA PAGINAÇÃO (decisão E-5): a paginação exata — `total`/`pageCount`
+ *   confiáveis e navegação estável entre páginas — vale apenas para
+ *   `searchMode: 'lexical'`, onde o motor consegue contar o universo completo de
+ *   resultados. Nos modos `vector` e `hybrid` o conjunto candidato é truncado
+ *   pelo ranqueador (ver wiki "Busca híbrida PostgreSQL: parâmetros RRF"), então
+ *   `total` reflete apenas o que foi ranqueado, não o universo do tenant.
+ *
+ * `topK`: NÃO rege o tamanho da lista de resultados (isso é `pageSize`). Rege
+ *   quantos chunks — os mais relevantes — alimentam o LLM quando
+ *   `generateAnswer: true`. Padrão 10, máx 50. O caminho RAG depende dele.
  *
  * `filters.departmentIds`: restringe a busca a departamentos específicos.
  *   Se ausente, usa todos os departamentos que o usuário pode ler.
@@ -43,6 +57,8 @@ export const SearchRequestSchema = z.object({
       indexFilters: z.record(IndexFilterValueSchema).optional(),
     })
     .optional(),
+  page: z.number().int().min(1).default(1),
+  pageSize: z.number().int().min(1).max(100).default(20),
   topK: z.number().int().min(1).max(50).default(10),
   generateAnswer: z.boolean().default(false),
 });
@@ -125,11 +141,28 @@ export type Citation = z.infer<typeof CitationSchema>;
  * `answer` é null quando `generateAnswer: false` (busca sem LLM).
  * `citations` é vazio quando `generateAnswer: false`.
  * `costUsd` acumula embedding da query + geração de resposta (se ativada).
+ *
+ * `chunks` mantém o nome histórico por compatibilidade com os consumidores
+ * atuais, mas passa a conter a PÁGINA de resultados (1 item por documento),
+ * recortada por `page`/`pageSize` — não mais os `topK` chunks brutos.
+ *
+ * `page`/`pageSize` ecoam o que foi efetivamente aplicado; `total` é a
+ * quantidade de resultados que casam com a busca e `pageCount` o número de
+ * páginas (`ceil(total / pageSize)`; 0 quando `total` é 0).
+ *
+ * Atenção ao escopo (E-5): `total` e `pageCount` só são exatos em
+ * `searchMode: 'lexical'`. Em `vector`/`hybrid` refletem o conjunto ranqueado,
+ * não o universo de documentos elegíveis — ver o comentário do
+ * `SearchRequestSchema`.
  */
 export const SearchResponseSchema = z.object({
   answer: z.string().nullable(),
   citations: z.array(CitationSchema),
   chunks: z.array(SearchChunkSchema),
+  page: z.number().int().min(1),
+  pageSize: z.number().int().min(1),
+  total: z.number().int().nonnegative(),
+  pageCount: z.number().int().nonnegative(),
   costUsd: z.number().nonnegative(),
 });
 
