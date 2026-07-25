@@ -92,6 +92,13 @@
       "when": 1785354400000,
       "tag": "0013_ai_suggestion_auto_apply",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1785440800000,
+      "tag": "0014_chunks_fts_tenant_index",
+      "breakpoints": true
     }
   ]
 }

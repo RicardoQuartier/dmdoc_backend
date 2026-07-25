@@ -133,6 +133,37 @@ describe('classifyDocumentType', () => {
     expect(result.suggestedTitle).toBe('Boleto de cobrança');
   });
 
+  it('(b3) sem match, loga o que o modelo escolheu × o que o catálogo oferecia (T-53)', async () => {
+    const { provider } = mockProvider([
+      JSON.stringify({ documentTypeNumber: 9, confidence: 0.88, suggestedTitle: 'Boleto de cobrança' }),
+    ]);
+    const logger = makeLogger();
+
+    await classifyDocumentType(provider, inputWith(), logger);
+
+    // A confiança é zerada no fallback, então o log é a ÚNICA pista de que o
+    // modelo tinha uma escolha — e de que ela caiu fora do catálogo.
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        catalogSize: 2,
+        catalogTypeNames: ['Contrato', 'Nota Fiscal'],
+        modelDocumentTypeNumber: 9,
+      }),
+      expect.stringContaining('nenhum tipo do catálogo')
+    );
+  });
+
+  it('(b4) com match não há log de alerta', async () => {
+    const { provider } = mockProvider([
+      JSON.stringify({ documentTypeNumber: 1, confidence: 0.9, suggestedTitle: null }),
+    ]);
+    const logger = makeLogger();
+
+    await classifyDocumentType(provider, inputWith(), logger);
+
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
   it('(b2) número válido tem precedência sobre nome divergente no fallback', async () => {
     // Número 1 (Contrato) vence, mesmo o nome apontando para outro tipo.
     const { provider } = mockProvider([

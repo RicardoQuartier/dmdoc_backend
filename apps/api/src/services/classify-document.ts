@@ -56,6 +56,13 @@ export interface ClassifyDocumentResult {
    * `documents.suggested_title` — CONSULTIVO, nunca sobrescreve `title`.
    */
   suggestedTitle: string | null;
+  /**
+   * Quantos tipos o departamento do documento oferecia à IA nesta rodada (T-53).
+   * `0` significa que nenhum tipo está associado ao departamento — a IA não teve
+   * o que escolher, e "nenhum tipo compatível" na tela é consequência disso, não
+   * de uma falha de classificação.
+   */
+  catalogSize: number;
   /** Custo em USD APENAS desta chamada (não o acumulado). */
   costUsd: number;
 }
@@ -233,6 +240,7 @@ export async function classifyDocument(
   return {
     typeSuggestion,
     suggestedTitle: result.suggestedTitle,
+    catalogSize: catalog.length,
     costUsd,
   };
 }

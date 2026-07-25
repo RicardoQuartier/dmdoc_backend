@@ -3079,6 +3079,244 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     expect(content[0]!.cost_breakdown!['embeddingsUsd']).toBeCloseTo(0.01, 6);
     expect(content[0]!.cost_breakdown!['classificationUsd']).toBeCloseTo(0.002, 6);
     expect(content[0]!.cost_breakdown!['totalUsd']).toBeCloseTo(0.012, 6);
+    // T-53: body ausente ⇒ escopo COMPLETO (tipo + título), como sempre foi.
+    // Este teste é, portanto, também o de retrocompatibilidade do novo `scope`.
+    // Catálogo = "Contrato A" (empresa, no departamento) + "Tipo Global".
+    expect(body.catalogSize).toBe(2);
+  });
+
+  // ===========================================================================
+  // T-53 — `scope` delimita A QUE CAMPO a rodada se aplica.
+  //
+  // Tipo e título saem da MESMA chamada de LLM, e cada um tem seu botão na tela.
+  // Sem escopo, "Reclassificar com IA" (card Tipo e Tags) sobrescrevia o título
+  // do documento — inclusive um título digitado à mão. Os testes abaixo travam
+  // o isolamento nos dois sentidos.
+  // ===========================================================================
+  describe('escopo da chamada (T-53)', () => {
+    it("scope ['type'] aplica o tipo e não encosta no título — nem no confirmado, nem no sugerido", async () => {
+      await makeTypeVisibleInDeptA();
+      const docId = await seedProcessedDoc({ documentTypeId: null });
+      await testDb.db`
+        UPDATE documents
+        SET title = 'Título confirmado manualmente', suggested_title = 'Sugestão anterior'
+        WHERE id = ${docId}
+      `;
+      fakeLlmChat.mockResolvedValueOnce(
+        chatResult({ documentTypeNumber: 1, confidence: 0.9, suggestedTitle: 'Título novo da IA' })
+      );
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/documents/${docId}/classify`,
+        headers: { authorization: `Bearer ${tokenAdminA}` },
+        payload: { scope: ['type'] },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.appliedType).toEqual({ documentTypeId: DOC_TYPE_ID, documentTypeName: 'Contrato A' });
+      expect(body).not.toHaveProperty('appliedTitle');
+      // Fora do escopo, o título sugerido nem é devolvido.
+      expect(body.suggestedTitle).toBeNull();
+
+      const rows = await testDb.db<
+        Array<{ document_type_id: string | null; title: string | null; suggested_title: string | null }>
+      >`
+        SELECT document_type_id, title, suggested_title FROM documents WHERE id = ${docId}
+      `;
+      expect(rows[0]!.document_type_id).toBe(DOC_TYPE_ID);
+      // O defeito original da issue #46: estas duas linhas são a regressão.
+      expect(rows[0]!.title).toBe('Título confirmado manualmente');
+      expect(rows[0]!.suggested_title).toBe('Sugestão anterior');
+    });
+
+    it("scope ['title'] aplica o título, preserva o tipo confirmado e ainda atualiza a sugestão de tipo", async () => {
+      await makeTypeVisibleInDeptA();
+      const docId = await seedProcessedDoc({ documentTypeId: null });
+      fakeLlmChat.mockResolvedValueOnce(
+        chatResult({ documentTypeNumber: 1, confidence: 0.9, suggestedTitle: 'Título novo da IA' })
+      );
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/documents/${docId}/classify`,
+        headers: { authorization: `Bearer ${tokenAdminA}` },
+        payload: { scope: ['title'] },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.appliedTitle).toBe('Título novo da IA');
+      expect(body).not.toHaveProperty('appliedType');
+
+      const rows = await testDb.db<Array<{ document_type_id: string | null; title: string | null }>>`
+        SELECT document_type_id, title FROM documents WHERE id = ${docId}
+      `;
+      expect(rows[0]!.title).toBe('Título novo da IA');
+      expect(rows[0]!.document_type_id).toBeNull();
+
+      // A `type_suggestion` NÃO é mascarada por este escopo: ela é gravada
+      // incondicionalmente pelo service, então zerá-la aqui apagaria a sugestão
+      // da rodada anterior. Fora do escopo fica só a AUTO-APLICAÇÃO do tipo.
+      const content = await testDb.db<Array<{ type_suggestion: Record<string, unknown> | null }>>`
+        SELECT type_suggestion FROM document_content WHERE document_id = ${docId}
+      `;
+      expect(content[0]!.type_suggestion!['documentTypeId']).toBe(DOC_TYPE_ID);
+      expect(body.typeSuggestion.documentTypeId).toBe(DOC_TYPE_ID);
+    });
+
+    it('escopo não LIGA o que a empresa desligou: título fora da auto-aplicação continua fora', async () => {
+      await makeTypeVisibleInDeptA();
+      await testDb.db`
+        UPDATE tenants SET ai_title_auto_apply_enabled = false WHERE id = ${TENANT_A}
+      `;
+      const docId = await seedProcessedDoc({ documentTypeId: null });
+      fakeLlmChat.mockResolvedValueOnce(
+        chatResult({ documentTypeNumber: 1, confidence: 0.9, suggestedTitle: 'Título novo da IA' })
+      );
+
+      try {
+        const res = await app.inject({
+          method: 'POST',
+          url: `/documents/${docId}/classify`,
+          headers: { authorization: `Bearer ${tokenAdminA}` },
+          payload: { scope: ['title'] },
+        });
+
+        expect(res.statusCode).toBe(200);
+        const body = res.json();
+        expect(body).not.toHaveProperty('appliedTitle');
+        // A sugestão consultiva continua sendo gravada — só não vira `title`.
+        expect(body.suggestedTitle).toBe('Título novo da IA');
+        const rows = await testDb.db<Array<{ title: string | null; suggested_title: string | null }>>`
+          SELECT title, suggested_title FROM documents WHERE id = ${docId}
+        `;
+        expect(rows[0]!.title).toBeNull();
+        expect(rows[0]!.suggested_title).toBe('Título novo da IA');
+      } finally {
+        await testDb.db`
+          UPDATE tenants SET ai_title_auto_apply_enabled = true WHERE id = ${TENANT_A}
+        `;
+      }
+    });
+
+    it('403 quando o escopo pedido é justamente a feature desligada na empresa', async () => {
+      await makeTypeVisibleInDeptA();
+      await testDb.db`
+        UPDATE tenants SET ai_classification_enabled = false WHERE id = ${TENANT_A}
+      `;
+      const docId = await seedProcessedDoc({ documentTypeId: null });
+
+      try {
+        const res = await app.inject({
+          method: 'POST',
+          url: `/documents/${docId}/classify`,
+          headers: { authorization: `Bearer ${tokenAdminA}` },
+          payload: { scope: ['type'] },
+        });
+
+        expect(res.statusCode).toBe(403);
+        expect(fakeLlmChat).not.toHaveBeenCalled();
+      } finally {
+        await testDb.db`
+          UPDATE tenants SET ai_classification_enabled = true WHERE id = ${TENANT_A}
+        `;
+      }
+    });
+
+    it('escopo inválido é 422 e não gasta uma chamada de LLM', async () => {
+      await makeTypeVisibleInDeptA();
+      const docId = await seedProcessedDoc({ documentTypeId: null });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/documents/${docId}/classify`,
+        headers: { authorization: `Bearer ${tokenAdminA}` },
+        payload: { scope: ['tipo'] },
+      });
+
+      expect(res.statusCode).toBe(422);
+      expect(fakeLlmChat).not.toHaveBeenCalled();
+    });
+
+    it('catalogSize reporta quantos tipos a IA teve para escolher', async () => {
+      // Sem `makeTypeVisibleInDeptA()`: nenhum tipo DE EMPRESA no departamento.
+      // O tipo GLOBAL entra assim mesmo (ver bloco de tipos globais abaixo).
+      const docId = await seedProcessedDoc({ documentTypeId: null });
+      fakeLlmChat.mockResolvedValueOnce(
+        chatResult({ documentTypeNumber: null, confidence: 0.1, suggestedTitle: 'Título qualquer' })
+      );
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/documents/${docId}/classify`,
+        headers: { authorization: `Bearer ${tokenAdminA}` },
+        payload: { scope: ['type'] },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.catalogSize).toBe(1); // só o tipo global
+      expect(body.typeSuggestion.documentTypeId).toBeNull();
+    });
+  });
+
+  // ===========================================================================
+  // Tipos GLOBAIS no catálogo da IA (Owner, 2026-07-25).
+  //
+  // A associação por departamento (`global_type_tenant_depts`) deixou de
+  // restringir a classificação: um tipo global aplicável que a empresa vê no
+  // seletor não pode mais ficar de fora do prompt e produzir um falso "nenhum
+  // tipo compatível".
+  // ===========================================================================
+  describe('tipos globais entram sem associação por departamento', () => {
+    it('global SEM associação alguma é candidato e pode ser sugerido', async () => {
+      // Nenhuma linha em global_type_tenant_depts para este tenant, e nenhum
+      // tipo de empresa no departamento: o catálogo é só o global.
+      const docId = await seedProcessedDoc({ documentTypeId: null });
+      fakeLlmChat.mockResolvedValueOnce(
+        chatResult({ documentTypeNumber: 1, confidence: 0.9, suggestedTitle: null })
+      );
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/documents/${docId}/classify`,
+        headers: { authorization: `Bearer ${tokenAdminA}` },
+        payload: { scope: ['type'] },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.catalogSize).toBe(1);
+      expect(body.typeSuggestion.documentTypeId).toBe(GLOBAL_DOC_TYPE_ID);
+      expect(body.typeSuggestion.documentTypeName).toBe('Tipo Global');
+      expect(body.appliedType).toEqual({
+        documentTypeId: GLOBAL_DOC_TYPE_ID,
+        documentTypeName: 'Tipo Global',
+      });
+    });
+
+    it('global convive com o tipo da empresa do departamento no mesmo catálogo', async () => {
+      await makeTypeVisibleInDeptA();
+      const docId = await seedProcessedDoc({ documentTypeId: null });
+      // Catálogo ordenado por nome: 1 = "Contrato A" (empresa), 2 = "Tipo Global".
+      fakeLlmChat.mockResolvedValueOnce(
+        chatResult({ documentTypeNumber: 2, confidence: 0.9, suggestedTitle: null })
+      );
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/documents/${docId}/classify`,
+        headers: { authorization: `Bearer ${tokenAdminA}` },
+        payload: { scope: ['type'] },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.catalogSize).toBe(2);
+      expect(body.typeSuggestion.documentTypeId).toBe(GLOBAL_DOC_TYPE_ID);
+    });
   });
 
   it('NÃO auto-aplica tipo/título quando as flags de auto-aplicação estão desligadas para a empresa (permanece consultivo)', async () => {
