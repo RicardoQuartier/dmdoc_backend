@@ -217,6 +217,15 @@ const ListDocumentsQuerySchema = z.object({
   // case-insensitive). Termo sanitizado via `escapeLikePattern` antes de virar
   // padrão `%termo%` — nunca concatenado cru na query (sempre bind param).
   search: z.string().optional(),
+  // Período de upload — filtra `uploaded_at`, inclusivo nos DOIS extremos.
+  // Os dois lados são independentes: passar só `dateFrom` (ou só `dateTo`)
+  // vale como range aberto do outro lado. Nomes convergem com `GET /reports/*`
+  // e `GET /audit-logs`, que já filtram por data com o mesmo contrato.
+  // O front envia dias inteiros já convertidos para instante (início do dia em
+  // `dateFrom`, fim do dia em `dateTo`) no fuso do navegador — o backend não
+  // arredonda nada, só compara os instantes recebidos.
+  dateFrom: z.string().datetime({ offset: true }).optional(),
+  dateTo: z.string().datetime({ offset: true }).optional(),
   sortBy: z.enum(SORT_BY_KEYS).default('uploadedAt'),
   sortDir: z.enum(['asc', 'desc']).default('desc'),
   // Paginação por número de página (OFFSET) — substitui o cursor/keyset
@@ -1019,6 +1028,14 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
 
     const query = ListDocumentsQuerySchema.parse(request.query);
 
+    // Período de upload: comparar como instante, não como string — dois ISO
+    // com offsets diferentes ordenam errado lexicograficamente.
+    const uploadedFrom = query.dateFrom !== undefined ? new Date(query.dateFrom) : undefined;
+    const uploadedTo = query.dateTo !== undefined ? new Date(query.dateTo) : undefined;
+    if (uploadedFrom !== undefined && uploadedTo !== undefined && uploadedFrom > uploadedTo) {
+      throw new ValidationError('dateFrom não pode ser posterior a dateTo');
+    }
+
     const tenantContext = resolveTenantContext(request, { explicitTenantId: query.tenantId, write: false });
 
     const effectiveTenantId: string | null =
@@ -1112,6 +1129,16 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       conditions.push(
         `(d.original_filename ILIKE ${searchParam} ESCAPE '\\' OR d.title ILIKE ${searchParam} ESCAPE '\\')`
       );
+    }
+
+    // Período de upload — entra no mesmo array de condições (AND), então o
+    // COUNT abaixo já sai filtrado por ele. Sempre bind param (`addParam`),
+    // nunca a data interpolada na string.
+    if (uploadedFrom !== undefined) {
+      conditions.push(`d.uploaded_at >= ${addParam(uploadedFrom)}::timestamptz`);
+    }
+    if (uploadedTo !== undefined) {
+      conditions.push(`d.uploaded_at <= ${addParam(uploadedTo)}::timestamptz`);
     }
 
     const whereClause = conditions.join(' AND ');

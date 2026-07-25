@@ -2528,6 +2528,93 @@ describe('GET /documents — ordenação, filtros, busca textual e paginação p
       expect(body.items.some((d) => d.id === DOC_GAMMA_ID)).toBe(false);
     }
   });
+
+  // ── Filtro por período de upload (dateFrom/dateTo) ────────────────────────
+  // uploadedAt dos fixtures: alpha=BASE, beta=+60s, gamma=+120s, delta=+180s.
+  const iso = (offsetMs: number): string => new Date(BASE_TIME + offsetMs).toISOString();
+
+  it('dateFrom sozinho filtra do limite (inclusive) em diante', async () => {
+    const res = await listDocs(`?dateFrom=${encodeURIComponent(iso(60_000))}&sortBy=uploadedAt&sortDir=asc&pageSize=10`);
+    // beta está exatamente no limite — precisa entrar (range inclusivo).
+    expect(res.items.map((d) => d['id'])).toEqual([DOC_BETA_ID, DOC_GAMMA_ID, DOC_DELTA_ID]);
+    expect(res.total).toBe(3);
+  });
+
+  it('dateTo sozinho filtra até o limite (inclusive)', async () => {
+    const res = await listDocs(`?dateTo=${encodeURIComponent(iso(60_000))}&sortBy=uploadedAt&sortDir=asc&pageSize=10`);
+    expect(res.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID, DOC_BETA_ID]);
+    expect(res.total).toBe(2);
+  });
+
+  it('range fechado devolve só a fatia, e total/pageCount refletem o período', async () => {
+    const range = `dateFrom=${encodeURIComponent(iso(60_000))}&dateTo=${encodeURIComponent(iso(120_000))}`;
+    const res = await listDocs(`?${range}&sortBy=uploadedAt&sortDir=asc&pageSize=10`);
+    expect(res.items.map((d) => d['id'])).toEqual([DOC_BETA_ID, DOC_GAMMA_ID]);
+    expect(res.total).toBe(2);
+
+    // O total/pageCount são os do período, não os do acervo inteiro (4 docs).
+    const paged = await listDocs(`?${range}&sortBy=uploadedAt&sortDir=asc&pageSize=1`);
+    expect(paged.total).toBe(2);
+    expect(paged.pageCount).toBe(2);
+    expect(paged.items.map((d) => d['id'])).toEqual([DOC_BETA_ID]);
+  });
+
+  it('período que não cobre nenhum documento devolve lista vazia', async () => {
+    const res = await listDocs(
+      `?dateFrom=${encodeURIComponent(iso(600_000))}&dateTo=${encodeURIComponent(iso(700_000))}&pageSize=10`
+    );
+    expect(res.items).toEqual([]);
+    expect(res.total).toBe(0);
+  });
+
+  it('dateFrom posterior a dateTo → 422', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: `/documents?dateFrom=${encodeURIComponent(iso(120_000))}&dateTo=${encodeURIComponent(iso(60_000))}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('período combinado com status e com busca textual — interseção (AND), nunca união', async () => {
+    const range = `dateFrom=${encodeURIComponent(iso(0))}&dateTo=${encodeURIComponent(iso(120_000))}`;
+
+    // alpha(READY), beta(PENDING), gamma(READY) estão no período; só os READY sobram.
+    const comStatus = await listDocs(`?${range}&status=READY&sortBy=uploadedAt&sortDir=asc&pageSize=10`);
+    expect(comStatus.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID, DOC_GAMMA_ID]);
+    expect(comStatus.total).toBe(2);
+
+    // delta casa com a busca, mas está fora do período — não pode ser trazido de volta.
+    const comBusca = await listDocs(`?${range}&search=delta&pageSize=10`);
+    expect(comBusca.items).toEqual([]);
+    expect(comBusca.total).toBe(0);
+  });
+
+  it('período nunca vaza documento de outro tenant', async () => {
+    const docBId = newId();
+    const hashB = 'j'.repeat(64);
+    await testDb.db`
+      INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id,
+        filename, original_filename, content_hash, size_bytes, mime_type,
+        s3_key, status, failure_reason, tags, index_values,
+        uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
+      ) VALUES (
+        ${docBId}, ${TENANT_B}, ${DEPT_B_ID}, NULL,
+        'periodo-tenant-b.pdf', 'periodo-tenant-b.pdf', ${hashB}, 700, 'application/pdf',
+        ${`tenants/${TENANT_B}/documents/${hashB}/periodo-tenant-b.pdf`}, 'READY', NULL, '{}'::text[], '{}'::jsonb,
+        ${ADMIN_B_ID}, ${new Date(BASE_TIME + 90_000)}, ${new Date(BASE_TIME + 90_000)}, 0, false
+      )
+    `;
+
+    // O documento da Empresa B está dentro do período pedido pelo admin de A.
+    const res = await listDocs(
+      `?dateFrom=${encodeURIComponent(iso(0))}&dateTo=${encodeURIComponent(iso(180_000))}&pageSize=10`
+    );
+    expect(res.items.some((d) => d['id'] === docBId)).toBe(false);
+    expect(res.total).toBe(4);
+  });
 });
 
 // ---------------------------------------------------------------------------
