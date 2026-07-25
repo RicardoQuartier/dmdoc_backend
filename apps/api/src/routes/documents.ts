@@ -298,6 +298,26 @@ const BulkReprocessAiBodySchema = z.object({
   steps: z.array(AiReprocessStepSchema).min(1).optional(),
 });
 
+/**
+ * Escopo do POST /documents/:id/classify (T-53).
+ *
+ * Tipo e título nascem da MESMA chamada de LLM, mas cada um tem seu próprio
+ * botão na tela (card "Tipo e Tags" × card de título). Sem escopo, clicar em
+ * "Reclassificar com IA" sobrescrevia o título do documento — inclusive um
+ * título digitado à mão —, que é justamente o defeito relatado na issue #46.
+ *
+ * Ausente ⇒ {type, title}: preserva o comportamento histórico da rota para
+ * qualquer chamador que não envie body.
+ */
+const ClassifyScopeSchema = z.enum(['type', 'title']);
+type ClassifyScope = z.infer<typeof ClassifyScopeSchema>;
+
+const ClassifyBodySchema = z.object({
+  scope: z.array(ClassifyScopeSchema).min(1).max(2).optional(),
+});
+
+const CLASSIFY_SCOPE_ALL: readonly ClassifyScope[] = ['type', 'title'];
+
 // ---------------------------------------------------------------------------
 // Utilitários
 // ---------------------------------------------------------------------------
@@ -2508,6 +2528,10 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
   // havendo uma escolha confirmada — só preserva o valor atual quando a
   // sugestão desta rodada vier vazia/nula ou (tipo) com confiança insuficiente.
   // Espelha o guard/escopo de `POST /documents/:id/suggest-indexes`.
+  //
+  // Body OPCIONAL `{ scope }` (T-53) delimita a QUE campo a rodada se aplica —
+  // cada botão da tela manda o seu, para nenhum deles mexer no campo do outro.
+  // Ausente ⇒ ambos, como sempre foi.
   // =========================================================================
   app.post('/documents/:id/classify', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
@@ -2515,6 +2539,12 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const sql = app.db;
 
     const { id } = DocumentIdParamsSchema.parse(request.params);
+    // Parse ANTES de resolver o documento/chamar o LLM: body inválido custa 422,
+    // nunca tokens. Fastify entrega `undefined` quando não há corpo.
+    const { scope } = ClassifyBodySchema.parse(request.body ?? {});
+    const classifyScope = scope ?? CLASSIFY_SCOPE_ALL;
+    const scopeHasType = classifyScope.includes('type');
+    const scopeHasTitle = classifyScope.includes('title');
 
     // ------------------------------------------------------------------
     // 1. Resolve o documento respeitando o escopo do role (mesmo padrão de
@@ -2546,14 +2576,25 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const log = request.log.child({ tenantId, documentId: id, userId, traceId: request.id });
 
     // ------------------------------------------------------------------
-    // 2. Feature flags de IA (Fase 6.9) — valor EFETIVO (plataforma AND empresa).
-    //    Classificação de tipo e título sugerido nascem da MESMA chamada de LLM,
-    //    então basta UMA das duas estar ligada para a chamada valer a pena. Se
-    //    AMBAS estiverem desligadas ⇒ 403 ANTES de qualquer custo de IA.
+    // 2. Feature flags de IA (Fase 6.9) — valor EFETIVO (plataforma AND empresa),
+    //    ainda restringido pelo `scope` desta chamada. O escopo só DESLIGA: nunca
+    //    liga o que a empresa desabilitou. Classificação de tipo e título sugerido
+    //    nascem da MESMA chamada de LLM, então basta UMA das duas continuar de pé
+    //    para a chamada valer a pena; com AMBAS fora ⇒ 403 ANTES de qualquer custo.
+    //
+    //    Fora do escopo, `titleSuggestionEnabled: false` faz o núcleo devolver
+    //    `suggestedTitle: null` (applyFlagMask) e o service NÃO tocar em
+    //    `documents.suggested_title` — é assim que "reclassificar o tipo" deixa o
+    //    título inteiramente em paz, sugestão inclusive.
     // ------------------------------------------------------------------
     const aiFlags = await resolveAiFeatureFlags(sql, tenantId);
-    if (!aiFlags.classificationEnabled && !aiFlags.titleSuggestionEnabled) {
-      log.info({}, 'classificação por IA desabilitada para esta empresa — LLM não chamado');
+    const titleSuggestionInScope = aiFlags.titleSuggestionEnabled && scopeHasTitle;
+    const classificationInScope = aiFlags.classificationEnabled && scopeHasType;
+    if (!classificationInScope && !titleSuggestionInScope) {
+      log.info(
+        { scope: classifyScope },
+        'classificação por IA desabilitada para esta empresa ou fora do escopo — LLM não chamado'
+      );
       throw new ForbiddenError('Classificação por IA está desabilitada para esta empresa');
     }
 
@@ -2570,8 +2611,13 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
           tenantId,
           documentId: id,
           flags: {
+            // `classificationEnabled` NÃO é restringido pelo escopo de propósito:
+            // ao contrário de `suggested_title`, a `type_suggestion` é gravada
+            // incondicionalmente pelo service, então mascarar aqui a sobrescreveria
+            // com nulos — apagando a sugestão da rodada anterior. Para o escopo
+            // sem 'type' basta não AUTO-APLICAR o tipo (passo 3.1 abaixo).
             classificationEnabled: aiFlags.classificationEnabled,
-            titleSuggestionEnabled: aiFlags.titleSuggestionEnabled,
+            titleSuggestionEnabled: titleSuggestionInScope,
           },
         },
         { sql, llmProvider, chatModel: config.LLM_MODEL, logger: log }
@@ -2591,6 +2637,8 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         documentTypeId: result.typeSuggestion.documentTypeId,
         confidence: result.typeSuggestion.confidence,
         hasSuggestedTitle: result.suggestedTitle !== null,
+        catalogSize: result.catalogSize,
+        scope: classifyScope,
         costUsd: result.costUsd,
       },
       'classificação sob demanda retornada'
@@ -2603,9 +2651,15 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     //     rodada mesmo já havendo um valor confirmado. Só preserva o valor
     //     atual quando a sugestão desta rodada vier vazia/nula ou (no caso do
     //     tipo) com confiança abaixo do limiar — o gate abaixo garante isso.
+    //
+    //     O `scope` da chamada é a primeira condição de cada gate: fora dele o
+    //     campo não é sequer candidato a mudar (T-53). Para o título isso é
+    //     redundante — `suggestedTitle` já vem null —, mas explicitar mantém a
+    //     regra legível dos dois lados.
     // ------------------------------------------------------------------
     let appliedType: { documentTypeId: string; documentTypeName: string | null } | undefined;
     if (
+      scopeHasType &&
       aiFlags.classificationAutoApplyEnabled &&
       result.typeSuggestion.documentTypeId !== null &&
       result.typeSuggestion.confidence >= config.DMDOC_INDEX_SUGGESTION_MIN_CONFIDENCE
@@ -2625,7 +2679,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     }
 
     let appliedTitle: string | undefined;
-    if (aiFlags.titleAutoApplyEnabled && result.suggestedTitle !== null) {
+    if (scopeHasTitle && aiFlags.titleAutoApplyEnabled && result.suggestedTitle !== null) {
       const applied = await sql`
         UPDATE documents
         SET title = ${result.suggestedTitle}
@@ -2641,6 +2695,8 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     // 4. Resposta 200 — subconjunto do TypeSuggestion (sem rawResponse) +
     //    título sugerido + custo desta chamada. `appliedType`/`appliedTitle`
     //    só aparecem quando a auto-aplicação efetivamente mudou algo.
+    //    `catalogSize` sempre presente: é o que permite à tela explicar POR QUE
+    //    a IA não achou tipo (0 ⇒ nenhum tipo associado ao departamento).
     // ------------------------------------------------------------------
     return reply.status(200).send({
       typeSuggestion: {
@@ -2652,6 +2708,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         suggestedAt: result.typeSuggestion.suggestedAt,
       },
       suggestedTitle: result.suggestedTitle,
+      catalogSize: result.catalogSize,
       costUsd: result.costUsd,
       ...(appliedType !== undefined ? { appliedType } : {}),
       ...(appliedTitle !== undefined ? { appliedTitle } : {}),

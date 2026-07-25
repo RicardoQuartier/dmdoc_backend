@@ -28,6 +28,14 @@ export const MAX_RECOGNITION_KEYWORDS_PER_TYPE = 20;
 export const MAX_RECOGNITION_RULES_CHARS = 500;
 
 /**
+ * Teto de nomes de tipo incluídos no log de "classificação sem tipo" (T-53).
+ * O log existe para o suporte comparar o que a IA escolheu com o que ela tinha
+ * disponível; um punhado de nomes basta e evita inflar a linha de log em
+ * catálogos grandes.
+ */
+const MAX_LOGGED_CATALOG_NAMES = 20;
+
+/**
  * Prompt de classificação automática de tipo de documento.
  *
  * Versão: classify-document-type-v4
@@ -412,7 +420,7 @@ export async function classifyDocumentType(
   // - título DESLIGADO ⇒ não há nada a ganhar com a chamada: pula (economia).
   if (catalog.length === 0 && !flags.titleSuggestionEnabled) {
     logger.info(
-      { promptVersion },
+      { promptVersion, catalogSize: 0 },
       'classificação pulada: catálogo vazio e título desligado'
     );
     return applyFlagMask(
@@ -507,6 +515,24 @@ export async function classifyDocumentType(
   const match =
     resolveByIndex(parsed.documentTypeNumber, catalog) ??
     resolveCatalogType(parsed.documentTypeName, catalog);
+
+  // Sem match, "nenhum tipo compatível" é tudo o que a tela consegue dizer, e a
+  // confiança é zerada logo abaixo — o sinal que a IA deu se perde. Registrar os
+  // DOIS lados da comparação (o que o modelo apontou × o que havia no catálogo)
+  // é o que distingue as causas possíveis: catálogo vazio/pobre para o
+  // departamento, ou modelo apontando para fora da faixa.
+  if (match === null) {
+    logger.warn(
+      {
+        promptVersion,
+        catalogSize: catalog.length,
+        catalogTypeNames: catalog.slice(0, MAX_LOGGED_CATALOG_NAMES).map((t) => t.name),
+        modelDocumentTypeNumber: parsed.documentTypeNumber ?? null,
+        modelDocumentTypeName: parsed.documentTypeName ?? null,
+      },
+      'classificação sem tipo: escolha do modelo não resolveu para nenhum tipo do catálogo'
+    );
+  }
 
   return applyFlagMask(
     {
