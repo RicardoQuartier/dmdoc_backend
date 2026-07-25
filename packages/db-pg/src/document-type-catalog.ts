@@ -2,28 +2,33 @@ import type { Sql } from 'postgres';
 
 /**
  * Helper compartilhado (API + worker) para resolver o CATÁLOGO de tipos de
- * documento visíveis para UM departamento — a base do prompt de classificação
- * automática de tipo por IA (Fase 8).
+ * documento oferecido à classificação automática de tipo por IA (Fase 8):
  *
- * Reproduz EXATAMENTE a regra de visibilidade que `GET /document-types`
- * (`apps/api/src/routes/document-types.ts`) aplica para um usuário
- * UPLOADER/USER, porém escopada a um único departamento (o departamento do
- * documento sendo classificado):
+ * 1. TODOS os tipos GLOBAIS (`is_global = true`, `tenant_id IS NULL`) — a
+ *    associação por departamento (`global_type_tenant_depts`) NÃO restringe o
+ *    catálogo da IA.
+ * 2. Tipos da EMPRESA (`tenant_id = tenantId`) cujo `department_ids`
+ *    denormalizado contenha o `departmentId`.
  *
- * 1. Tipos GLOBAIS (`is_global = true`, `tenant_id IS NULL`) visíveis para o
- *    departamento — ou seja, aqueles com uma configuração em
- *    `global_type_tenant_depts` do próprio tenant (`deleted = false`) cujo
- *    `department_ids` contenha o `departmentId`.
- * 2. Tipos da EMPRESA (`tenant_id = tenantId`) cujo `department_ids` denormalizado
- *    contenha o `departmentId`.
+ * Todos com `deleted = false`.
  *
- * Todos com `deleted = false`. Nunca vaza tipo de outro tenant nem de um
- * departamento não relacionado.
+ * Tipos globais entram SEMPRE (decisão do Owner, 2026-07-25). Antes, um global
+ * só era candidato quando o tenant o tivesse associado àquele departamento — o
+ * que produzia o cenário em que a empresa tem um tipo global "Nota Fiscal"
+ * perfeitamente aplicável, o usuário o vê no seletor, e a IA responde "nenhum
+ * tipo compatível" porque nunca o recebeu. Tipos globais são da plataforma e
+ * visíveis a todos, então passam a ser candidatos em qualquer departamento.
  *
- * Regra de negócio: "Como a IA escolhe entre os tipos de documento existentes"
- * e "Tipos de documento globais e por empresa" — o catálogo oferecido à IA é
- * escopado pelo departamento do documento, a mesma visibilidade de
- * `GET /document-types`.
+ * O escopo por departamento continua valendo integralmente para os tipos da
+ * EMPRESA: a IA nunca vê um tipo de empresa de departamento não relacionado, e
+ * nunca vê tipo de outro tenant.
+ *
+ * NOTA: a variante `GET /document-types?departmentId=` (listagem de UI) mantém
+ * a regra antiga, exigindo a associação — ela controla o que o usuário vê, não
+ * o que a IA considera. Os dois deixaram de ser a mesma regra.
+ *
+ * Regra de negócio: "Classificação de tipo por IA — catálogo e fallback sem
+ * tipo compatível" e "Tipos de documento globais e por empresa".
  */
 
 /**
@@ -57,15 +62,17 @@ interface CatalogRow {
 }
 
 /**
- * Resolve o catálogo de tipos de documento visíveis para um departamento.
+ * Resolve o catálogo de tipos de documento candidatos à classificação por IA.
  *
- * Uma única query cobre os dois escopos (globais visíveis + tipos da empresa
+ * Uma única query cobre os dois escopos (todos os globais + tipos da empresa
  * associados ao departamento), com `deleted = false` e sem duplicatas.
  *
  * @param sql          Cliente postgres.js (pool de conexões).
- * @param tenantId     UUID da empresa dona do documento — filtro de isolamento.
- * @param departmentId UUID do departamento do documento — escopo de visibilidade.
- * @returns Tipos visíveis ordenados por nome; array vazio se nenhum se aplica.
+ * @param tenantId     UUID da empresa dona do documento — filtro de isolamento
+ *                     dos tipos DE EMPRESA (globais não pertencem a ninguém).
+ * @param departmentId UUID do departamento do documento — escopo dos tipos de
+ *                     empresa.
+ * @returns Tipos candidatos ordenados por nome; array vazio se nenhum se aplica.
  */
 export async function resolveDepartmentDocumentTypeCatalog(
   sql: Sql,
@@ -78,19 +85,9 @@ export async function resolveDepartmentDocumentTypeCatalog(
     FROM document_types dt
     WHERE dt.deleted = false
       AND (
-        -- 1) Tipos globais visíveis para este departamento neste tenant
-        (
-          dt.is_global = true
-          AND dt.tenant_id IS NULL
-          AND EXISTS (
-            SELECT 1
-            FROM global_type_tenant_depts g
-            WHERE g.global_type_id = dt.id
-              AND g.tenant_id = ${tenantId}
-              AND g.deleted = false
-              AND g.department_ids && ${[departmentId]}::uuid[]
-          )
-        )
+        -- 1) TODOS os tipos globais — a associação por departamento não
+        --    restringe o catálogo da IA (Owner, 2026-07-25)
+        (dt.is_global = true AND dt.tenant_id IS NULL)
         -- 2) Tipos da empresa associados a este departamento
         OR (
           dt.tenant_id = ${tenantId}

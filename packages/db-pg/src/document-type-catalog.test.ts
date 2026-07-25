@@ -10,15 +10,16 @@ import {
  * Testes de integração de `resolveDepartmentDocumentTypeCatalog` contra um
  * PostgreSQL real (banco `dmdoc_test`, migrado com o mesmo schema do dev).
  *
- * Regra de negócio: "Como a IA escolhe entre os tipos de documento existentes"
- * (Fase 8) — o catálogo oferecido à IA é escopado pelo departamento do
- * documento, reproduzindo a visibilidade de `GET /document-types`.
+ * Regra de negócio: "Classificação de tipo por IA — catálogo e fallback sem
+ * tipo compatível" (Fase 8). O catálogo oferecido à IA é TODOS os tipos
+ * globais + os tipos da EMPRESA associados ao departamento do documento.
  *
- * Cobertura de isolamento:
- * (a) retorna globais visíveis (via global_type_tenant_depts) + tipos da
- *     empresa associados ao departamento;
- * (b) NÃO retorna tipo da empresa de OUTRO departamento;
- * (c) NÃO retorna tipo/config de OUTRO tenant;
+ * Cobertura:
+ * (a) retorna globais + tipos da empresa associados ao departamento;
+ * (b) tipos GLOBAIS entram independentemente da associação por departamento,
+ *     enquanto o tipo de EMPRESA de outro departamento continua fora;
+ * (c) NÃO retorna tipo de EMPRESA de OUTRO tenant (globais não pertencem a
+ *     tenant algum e por isso aparecem para qualquer um);
  * (d) exclui tipos com deleted = true.
  */
 
@@ -133,27 +134,34 @@ describe('resolveDepartmentDocumentTypeCatalog', () => {
     expect(nf?.recognitionRules).toBeNull();
   });
 
-  it('(b) NÃO retorna tipo (global ou empresa) de outro departamento', async () => {
+  it('(b) tipo GLOBAL entra mesmo sem associação ao departamento; tipo de EMPRESA de outro departamento fica fora', async () => {
     const result = await resolveDepartmentDocumentTypeCatalog(sql, TENANT_A, DEPT_A1);
     const ids = result.map((r) => r.id);
 
-    // Tipo da empresa associado só a DEPT_A2.
+    // Tipo da empresa associado só a DEPT_A2 — escopo por departamento continua
+    // valendo integralmente para tipos de empresa.
     expect(ids).not.toContain(TYPE_A_DEPT2);
-    // Global cuja config no tenant A aponta só para DEPT_A2.
-    expect(ids).not.toContain(GLOBAL_HIDDEN);
+    // Global cuja config no tenant A aponta só para DEPT_A2: a associação não
+    // restringe mais o catálogo da IA, então ele É candidato aqui.
+    expect(ids).toContain(GLOBAL_HIDDEN);
   });
 
-  it('(c) NÃO retorna tipo nem visibilidade de outro tenant', async () => {
+  it('(c) NÃO retorna tipo de EMPRESA de outro tenant (mas globais, que não têm dono, aparecem)', async () => {
     const result = await resolveDepartmentDocumentTypeCatalog(sql, TENANT_A, DEPT_A1);
     const ids = result.map((r) => r.id);
 
-    // Tipo de empresa do tenant B.
+    // Tipo de empresa do tenant B: isolamento multi-tenant inegociável.
     expect(ids).not.toContain(TYPE_B_DEPT1);
 
-    // Consultar o tenant B com o departamento do tenant A não deve vazar nada
-    // do tenant A (nem o global via config de A).
+    // Consultar o tenant B com o departamento do tenant A não traz NENHUM tipo
+    // de empresa (nem de A nem de B, que é de outro departamento) — só globais,
+    // que pertencem à plataforma e não a uma empresa.
     const crossTenant = await resolveDepartmentDocumentTypeCatalog(sql, TENANT_B, DEPT_A1);
-    expect(crossTenant).toHaveLength(0);
+    const crossIds = crossTenant.map((r) => r.id);
+    expect(crossIds).not.toContain(TYPE_A_DEPT1);
+    expect(crossIds).not.toContain(TYPE_A_DEPT2);
+    expect(crossIds).not.toContain(TYPE_B_DEPT1);
+    expect(crossTenant.every((r) => r.id === GLOBAL_VISIBLE || r.id === GLOBAL_HIDDEN)).toBe(true);
   });
 
   it('(d) exclui tipos com deleted = true', async () => {
@@ -162,14 +170,15 @@ describe('resolveDepartmentDocumentTypeCatalog', () => {
     expect(ids).not.toContain(TYPE_A_DELETED);
   });
 
-  it('DEPT_A2 vê o global e o tipo de empresa próprios daquele departamento', async () => {
+  it('DEPT_A2 vê os globais e o tipo de empresa daquele departamento', async () => {
     const result = await resolveDepartmentDocumentTypeCatalog(sql, TENANT_A, DEPT_A2);
     const ids = result.map((r) => r.id);
 
+    // Ambos os globais são candidatos em qualquer departamento.
     expect(ids).toContain(GLOBAL_HIDDEN);
+    expect(ids).toContain(GLOBAL_VISIBLE);
     expect(ids).toContain(TYPE_A_DEPT2);
-    // E não enxerga os que pertencem a DEPT_A1.
-    expect(ids).not.toContain(GLOBAL_VISIBLE);
+    // O tipo de EMPRESA de DEPT_A1 continua fora.
     expect(ids).not.toContain(TYPE_A_DEPT1);
   });
 });

@@ -3081,7 +3081,8 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
     expect(content[0]!.cost_breakdown!['totalUsd']).toBeCloseTo(0.012, 6);
     // T-53: body ausente ⇒ escopo COMPLETO (tipo + título), como sempre foi.
     // Este teste é, portanto, também o de retrocompatibilidade do novo `scope`.
-    expect(body.catalogSize).toBe(1);
+    // Catálogo = "Contrato A" (empresa, no departamento) + "Tipo Global".
+    expect(body.catalogSize).toBe(2);
   });
 
   // ===========================================================================
@@ -3239,8 +3240,9 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
       expect(fakeLlmChat).not.toHaveBeenCalled();
     });
 
-    it('catalogSize reporta o catálogo VAZIO do departamento (a causa real de "nenhum tipo compatível")', async () => {
-      // Sem `makeTypeVisibleInDeptA()`: nenhum tipo associado ao departamento.
+    it('catalogSize reporta quantos tipos a IA teve para escolher', async () => {
+      // Sem `makeTypeVisibleInDeptA()`: nenhum tipo DE EMPRESA no departamento.
+      // O tipo GLOBAL entra assim mesmo (ver bloco de tipos globais abaixo).
       const docId = await seedProcessedDoc({ documentTypeId: null });
       fakeLlmChat.mockResolvedValueOnce(
         chatResult({ documentTypeNumber: null, confidence: 0.1, suggestedTitle: 'Título qualquer' })
@@ -3255,10 +3257,65 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
 
       expect(res.statusCode).toBe(200);
       const body = res.json();
-      expect(body.catalogSize).toBe(0);
+      expect(body.catalogSize).toBe(1); // só o tipo global
       expect(body.typeSuggestion.documentTypeId).toBeNull();
-      // Catálogo vazio + título fora do escopo ⇒ nem chega a chamar o LLM.
-      expect(fakeLlmChat).not.toHaveBeenCalled();
+    });
+  });
+
+  // ===========================================================================
+  // Tipos GLOBAIS no catálogo da IA (Owner, 2026-07-25).
+  //
+  // A associação por departamento (`global_type_tenant_depts`) deixou de
+  // restringir a classificação: um tipo global aplicável que a empresa vê no
+  // seletor não pode mais ficar de fora do prompt e produzir um falso "nenhum
+  // tipo compatível".
+  // ===========================================================================
+  describe('tipos globais entram sem associação por departamento', () => {
+    it('global SEM associação alguma é candidato e pode ser sugerido', async () => {
+      // Nenhuma linha em global_type_tenant_depts para este tenant, e nenhum
+      // tipo de empresa no departamento: o catálogo é só o global.
+      const docId = await seedProcessedDoc({ documentTypeId: null });
+      fakeLlmChat.mockResolvedValueOnce(
+        chatResult({ documentTypeNumber: 1, confidence: 0.9, suggestedTitle: null })
+      );
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/documents/${docId}/classify`,
+        headers: { authorization: `Bearer ${tokenAdminA}` },
+        payload: { scope: ['type'] },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.catalogSize).toBe(1);
+      expect(body.typeSuggestion.documentTypeId).toBe(GLOBAL_DOC_TYPE_ID);
+      expect(body.typeSuggestion.documentTypeName).toBe('Tipo Global');
+      expect(body.appliedType).toEqual({
+        documentTypeId: GLOBAL_DOC_TYPE_ID,
+        documentTypeName: 'Tipo Global',
+      });
+    });
+
+    it('global convive com o tipo da empresa do departamento no mesmo catálogo', async () => {
+      await makeTypeVisibleInDeptA();
+      const docId = await seedProcessedDoc({ documentTypeId: null });
+      // Catálogo ordenado por nome: 1 = "Contrato A" (empresa), 2 = "Tipo Global".
+      fakeLlmChat.mockResolvedValueOnce(
+        chatResult({ documentTypeNumber: 2, confidence: 0.9, suggestedTitle: null })
+      );
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/documents/${docId}/classify`,
+        headers: { authorization: `Bearer ${tokenAdminA}` },
+        payload: { scope: ['type'] },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.catalogSize).toBe(2);
+      expect(body.typeSuggestion.documentTypeId).toBe(GLOBAL_DOC_TYPE_ID);
     });
   });
 
