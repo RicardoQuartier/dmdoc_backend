@@ -2206,6 +2206,30 @@ describe('GET /documents — ordenação, filtros, busca textual e paginação p
     expect(desc.items.map((d) => d['id'])).toEqual([DOC_GAMMA_ID, DOC_DELTA_ID, DOC_BETA_ID, DOC_ALPHA_ID]);
   });
 
+  it('ordena por title ASC e DESC usando o título efetivo (fallback no nome do arquivo)', async () => {
+    // Só dois dos quatro documentos têm título confirmado; os outros dois
+    // entram na ordenação pelo `original_filename` (COALESCE no ORDER BY).
+    // Títulos em minúsculas de propósito: o resultado não depende do collation
+    // do banco (em `C`, maiúscula ordenaria antes de qualquer minúscula).
+    await testDb.db`UPDATE documents SET title = 'aaa contrato' WHERE id = ${DOC_GAMMA_ID}`;
+    await testDb.db`UPDATE documents SET title = 'zzz recibo' WHERE id = ${DOC_ALPHA_ID}`;
+    // Título só com espaços conta como AUSENTE (NULLIF/btrim) — este entra pelo
+    // nome do arquivo, `beta.pdf`, e não no topo da lista.
+    await testDb.db`UPDATE documents SET title = '   ' WHERE id = ${DOC_BETA_ID}`;
+
+    // asc: aaa contrato(gamma) < beta.pdf < delta.pdf < zzz recibo(alpha)
+    const asc = await listDocs('?sortBy=title&sortDir=asc&pageSize=10');
+    expect(asc.items.map((d) => d['id'])).toEqual([DOC_GAMMA_ID, DOC_BETA_ID, DOC_DELTA_ID, DOC_ALPHA_ID]);
+
+    const desc = await listDocs('?sortBy=title&sortDir=desc&pageSize=10');
+    expect(desc.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID, DOC_DELTA_ID, DOC_BETA_ID, DOC_GAMMA_ID]);
+
+    // `filename` continua ordenando pelo NOME DO ARQUIVO, ignorando o título —
+    // são duas colunas distintas na tabela.
+    const byFilename = await listDocs('?sortBy=filename&sortDir=asc&pageSize=10');
+    expect(byFilename.items.map((d) => d['id'])).toEqual([DOC_ALPHA_ID, DOC_BETA_ID, DOC_DELTA_ID, DOC_GAMMA_ID]);
+  });
+
   it('ordena por status ASC e DESC (com empate entre dois READY, tiebreak por id)', async () => {
     const asc = await listDocs('?sortBy=status&sortDir=asc&pageSize=10');
     expect(asc.items.map((d) => d['status'])).toEqual(['FAILED', 'PENDING', 'READY', 'READY']);
