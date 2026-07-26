@@ -22,6 +22,30 @@ export const DepartmentSchema = z.object({
 export type Department = z.infer<typeof DepartmentSchema>;
 
 /**
+ * Body de `PATCH /departments/:id/move` — troca o pai do departamento
+ * (reparent), recalculando `level` do nó e de toda a sua subárvore.
+ *
+ * `parentId` é sempre um uuid: o move **não** promove departamento a raiz
+ * (a ACL concede acesso só por raiz — ver artigo de wiki
+ * "Permissões por departamento (ACL)"). Raízes são criadas, não promovidas.
+ *
+ * Também não existe reordenação entre irmãos: `departments` não tem coluna
+ * de ordem e a listagem ordena por `level ASC, name ASC`.
+ *
+ * O schema **não** é `.strict()`, por decisão: o react-arborist envia um
+ * `index` (posição de drop) junto do payload, e ele é descartado em silêncio —
+ * coerente com "reordenação entre irmãos é no-op". Tornar o schema estrito
+ * quebraria o front.
+ *
+ * Spec §7 (Departamentos).
+ */
+export const MoveDepartmentBodySchema = z.object({
+  parentId: z.string().uuid(),
+});
+
+export type MoveDepartmentBody = z.infer<typeof MoveDepartmentBodySchema>;
+
+/**
  * Permissão de acesso de um usuário a um departamento.
  * Substituição completa via PUT — ver spec §7.
  *

@@ -90,7 +90,7 @@
           "tenantId": { "type": "string", "format": "uuid" },
           "parentId": { "type": "string", "format": "uuid", "nullable": true },
           "name": { "type": "string" },
-          "level": { "type": "integer", "minimum": 0, "maximum": 3 },
+          "level": { "type": "integer", "minimum": 0, "description": "Profundidade na árvore (0 = raiz). Sem teto — a profundidade é ilimitada." },
           "tags": { "type": "array", "items": { "type": "string" } },
           "createdAt": { "type": "string", "format": "date-time" }
         }
@@ -638,6 +638,40 @@
         "responses": {
           "204": { "description": "Removido com sucesso" },
           "409": { "description": "Departamento possui sub-departamentos ativos" }
+        }
+      }
+    },
+    "/departments/{id}/move": {
+      "patch": {
+        "tags": ["Departamentos"],
+        "summary": "Mover departamento na árvore (trocar de pai)",
+        "description": "TENANT_ADMIN. Troca o pai do departamento (reparent) e recalcula o `level` do nó e de toda a sua subárvore. Não promove departamento a raiz: `parentId` é sempre um uuid. Não existe reordenação entre irmãos — a listagem ordena por `level ASC, name ASC`. Idempotente: se `parentId` já for o pai atual, responde 200 sem escrita e sem registro de auditoria.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Departamento a mover" },
+          { "name": "tenantId", "in": "query", "schema": { "type": "string", "format": "uuid" }, "description": "Obrigatório para SUPER_ADMIN e MULTI_TENANT_ADMIN (operação de escrita). Para papéis normais o parâmetro é ignorado — o tenant vem do token." }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["parentId"],
+                "properties": {
+                  "parentId": { "type": "string", "format": "uuid", "description": "Novo pai. Sempre um uuid do mesmo tenant — não aceita null." }
+                }
+              },
+              "example": { "parentId": "3f2b1a90-8c4d-4e77-9a55-1c0d2e3f4a5b" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Departamento movido (ou já estava sob esse pai — caso idempotente)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Department" } } } },
+          "400": { "description": "BAD_REQUEST — body ausente ou JSON malformado" },
+          "403": { "description": "Papel abaixo de TENANT_ADMIN" },
+          "404": { "description": "NOT_FOUND — `id` ou `parentId` inexistente, soft-deletado ou de outro tenant (cross-tenant é sempre 404, nunca 403); também quando um MULTI_TENANT_ADMIN omite `tenantId` nesta escrita ou informa um `tenantId` fora das empresas permitidas" },
+          "409": { "description": "CONFLICT — destino é descendente do próprio nó (ciclo); OU o nó movido tem concessão ativa em `department_permissions` (a mensagem traz a contagem de usuários afetados); OU um SUPER_ADMIN não informou `tenantId` na query (obrigatório em escrita)" },
+          "422": { "description": "VALIDATION_ERROR — `parentId` ausente, null ou não-uuid; `id` não-uuid; `parentId` igual ao `id`" }
         }
       }
     },
