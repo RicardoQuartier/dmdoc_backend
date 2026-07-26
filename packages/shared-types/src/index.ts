@@ -34,6 +34,8 @@ export {
 export {
   DepartmentSchema,
   type Department,
+  MoveDepartmentBodySchema,
+  type MoveDepartmentBody,
   DepartmentPermissionSchema,
   type DepartmentPermission,
 } from './department.js';

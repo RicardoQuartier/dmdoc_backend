@@ -155,6 +155,14 @@ const DownloadQuerySchema = z.object({
  * `documentTypeName` (via `document_type_id`, FK nullable).
  */
 const SORT_COLUMNS = {
+  // Título EFETIVO — o mesmo texto que a listagem mostra na coluna "Título":
+  // título confirmado quando existe, nome do arquivo como fallback (ver wiki
+  // "Título de exibição sugerido por IA"). `nullable: false` porque
+  // `original_filename` é NOT NULL, então o COALESCE nunca resulta em NULL.
+  // `NULLIF(btrim(...))`: título só com espaços (ou vazio) conta como ausente,
+  // igual ao `documentDisplayName` do front — senão esses documentos ordenariam
+  // todos juntos no topo com a célula em branco.
+  title: { expr: "COALESCE(NULLIF(btrim(d.title), ''), d.original_filename)", nullable: false },
   filename: { expr: 'd.original_filename', nullable: false },
   status: { expr: 'd.status', nullable: false },
   companyName: { expr: 't.name', nullable: false },
