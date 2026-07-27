@@ -3,7 +3,6 @@ import {
   LoginRequestSchema,
   RefreshRequestSchema,
   type LoginResponse,
-  type AuthUser,
   type AllowedTenantSummary,
 } from '@dmdoc/shared-types';
 import { UnauthorizedError } from '../errors/index.js';

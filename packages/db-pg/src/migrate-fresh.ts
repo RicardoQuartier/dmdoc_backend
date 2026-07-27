@@ -14,6 +14,30 @@ import postgres from 'postgres';
 const PACKAGE_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
+ * Aplica as migrations pendentes (`drizzle-kit migrate`) no banco indicado.
+ *
+ * Extraído de `migrateFresh` para poder ser usado sozinho por quem já parte de
+ * um banco vazio — caso do `globalSetup` dos testes, que cria um banco novo por
+ * execução e não tem schema nenhum a dropar antes.
+ */
+export function applyMigrations(databaseUrl: string): void {
+  console.log('⏳ aplicando migrations...');
+  // cwd fixo na raiz do pacote db-pg: é onde `drizzle.config.ts` vive, e o
+  // PATH ganha o `.bin` local do pacote na frente — necessário quando este
+  // código roda a partir de outro pacote (ex.: artisan), cujo cwd/PATH
+  // padrão do pnpm não incluem o binário `drizzle-kit` deste pacote.
+  execSync('drizzle-kit migrate', {
+    cwd: PACKAGE_ROOT,
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl,
+      PATH: `${path.join(PACKAGE_ROOT, 'node_modules', '.bin')}${path.delimiter}${process.env['PATH'] ?? ''}`,
+    },
+  });
+}
+
+/**
  * Drop completo do schema + re-aplica todas as migrations via drizzle-kit.
  * Equivalente ao `migrate:fresh` do Laravel.
  *
@@ -43,20 +67,7 @@ export async function migrateFresh(): Promise<void> {
     await sql.end();
   }
 
-  console.log('⏳ aplicando migrations...');
-  // cwd fixo na raiz do pacote db-pg: é onde `drizzle.config.ts` vive, e o
-  // PATH ganha o `.bin` local do pacote na frente — necessário quando este
-  // código roda a partir de outro pacote (ex.: artisan), cujo cwd/PATH
-  // padrão do pnpm não incluem o binário `drizzle-kit` deste pacote.
-  execSync('drizzle-kit migrate', {
-    cwd: PACKAGE_ROOT,
-    stdio: 'inherit',
-    env: {
-      ...process.env,
-      DATABASE_URL: databaseUrl,
-      PATH: `${path.join(PACKAGE_ROOT, 'node_modules', '.bin')}${path.delimiter}${process.env['PATH'] ?? ''}`,
-    },
-  });
+  applyMigrations(databaseUrl);
   console.log('✅ migrate:fresh concluído');
 }
 

@@ -5,8 +5,9 @@ import { resetDomainTables } from './helpers.js';
 /**
  * setupFile do Vitest aplicado a TODA suíte de `apps/api`.
  *
- * Os arquivos de teste compartilham o mesmo Postgres (`dmdoc_test`). Sem um
- * ponto de partida limpo, o estado semeado por um arquivo (ou deixado por uma
+ * Os arquivos de teste compartilham o banco desta execução
+ * (`dmdoc_test_<chave>`, criado pelo `global-setup.ts`). Sem um ponto de
+ * partida limpo, o estado semeado por um arquivo (ou deixado por uma
  * asserção que falhou antes do cleanup) vazava para o próximo, causando uma
  * cascata de falhas por violação de FK e colisão de dados.
  *

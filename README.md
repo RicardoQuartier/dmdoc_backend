@@ -58,6 +58,16 @@ pnpm --filter db-pg seed
 pnpm --filter db-pg db:fresh
 ```
 
+#### Testes
+
+```bash
+pnpm --filter @dmdoc/db-pg test
+```
+
+Batem em PostgreSQL real. Cada execução cria e dropa um banco próprio
+(`dmdoc_test_<chave>`), então duas suítes concorrentes não se atrapalham e
+**não é preciso passar `TEST_DATABASE_URL`** — ver `packages/db-pg/README.md`.
+
 ---
 
 ### MongoDB (`@dmdoc/db-mongo`)
@@ -106,6 +116,12 @@ pnpm --filter @dmdoc/api typecheck  # verificação de tipos
 pnpm --filter @dmdoc/api lint       # ESLint
 pnpm --filter @dmdoc/api test       # testes (Vitest)
 ```
+
+Os testes batem em PostgreSQL real. Cada execução **cria e dropa um banco
+próprio** (`dmdoc_test_<chave>`) — duas suítes concorrentes não se atrapalham e
+**não é preciso passar `TEST_DATABASE_URL`**: a URL base é derivada do
+`DATABASE_URL` do ambiente, trocando só o nome do banco. Mesmo mecanismo do
+`@dmdoc/db-pg` — detalhes em `packages/db-pg/README.md`.
 
 ### Worker (`@dmdoc/worker`)
 
