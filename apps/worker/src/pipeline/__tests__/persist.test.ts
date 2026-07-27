@@ -173,8 +173,21 @@ function makeSqlStub(events: UploadEvent[]): Sql {
 
   // sql.json(value) — encapsula para JSONB
   (sqlFn as unknown as Record<string, unknown>)['json'] = (val: unknown) => val;
+  attachBeginStub(sqlFn);
 
   return sqlFn as unknown as Sql;
+}
+
+/**
+ * `persistProcessingResult` regrava os chunks dentro de `sql.begin(...)` para
+ * manter DELETE + INSERT atômicos e reler o departamento sob row lock. Os stubs
+ * executam a callback passando eles mesmos como handle de transação — as
+ * queries continuam caindo nos mesmos ramos de detecção.
+ */
+function attachBeginStub(sqlFn: unknown): void {
+  (sqlFn as Record<string, unknown>)['begin'] = async (
+    cb: (tx: Sql) => Promise<unknown>
+  ): Promise<unknown> => cb(sqlFn as Sql);
 }
 
 describe('persistProcessingResult — backfill de pageCount em document_events', () => {
@@ -340,6 +353,7 @@ function makeDocumentsSqlStub(
   );
 
   (sqlFn as unknown as Record<string, unknown>)['json'] = (val: unknown) => val;
+  attachBeginStub(sqlFn);
 
   return sqlFn as unknown as Sql;
 }
@@ -417,6 +431,195 @@ describe('persistProcessingResult — invariante: só grava suggested_title, nun
 });
 
 /**
+ * Testes da INVARIANTE de ACL da busca (épico E-9 / T-105):
+ *
+ * `chunks.department_id` é a coluna que a busca lexical, vetorial e híbrida usa
+ * para filtrar acesso por departamento — NÃO `documents.department_id`. Por
+ * isso o `persist` não pode gravar o departamento lido no INÍCIO do pipeline
+ * (minutos antes, em pipeline/index.ts): se o documento tiver sido movido nesse
+ * intervalo, os chunks nasceriam com o departamento antigo e vazariam o
+ * conteúdo para quem já não deveria mais vê-lo — permanentemente, já que o
+ * `UPDATE chunks` do move rodou antes de eles existirem.
+ *
+ * O `persist` relê `department_id` (e `document_type_id`) de `documents` sob
+ * `FOR SHARE`, dentro da mesma transação do DELETE + INSERT dos chunks.
+ */
+const DEPT_ANTIGO = '00000000-0000-0000-0000-0000000000d1';
+const DEPT_NOVO = '00000000-0000-0000-0000-0000000000d2';
+
+interface ChunkPersistStub {
+  sql: Sql;
+  insertedChunkRows: Array<Record<string, unknown>>;
+  selectQueries: string[];
+}
+
+/**
+ * Stub focado na regravação dos chunks: responde ao SELECT do documento com a
+ * linha ATUAL (simulando o estado do banco no momento do persist) e captura as
+ * linhas passadas ao bulk insert.
+ */
+function makeChunkPersistSqlStub(current: {
+  departmentId: string | null;
+  documentTypeId: string | null;
+  documentTypeName: string | null;
+}): ChunkPersistStub {
+  const noopResult = Object.assign([], { count: 0 });
+  const insertedChunkRows: Array<Record<string, unknown>> = [];
+  const selectQueries: string[] = [];
+
+  const sqlFn = vi.fn().mockImplementation(
+    (strings: TemplateStringsArray | string, ...values: unknown[]) => {
+      if (typeof strings === 'string') return { __pgIdentifier: strings };
+      if (Array.isArray(strings) && !('raw' in strings)) {
+        return { __pgBulkRows: strings };
+      }
+
+      const query = (strings as TemplateStringsArray).join('?').toLowerCase();
+
+      if (query.includes('from documents')) {
+        selectQueries.push(query);
+        if (current.departmentId === null) return Promise.resolve([]);
+        return Promise.resolve([
+          {
+            department_id: current.departmentId,
+            document_type_id: current.documentTypeId,
+          },
+        ]);
+      }
+
+      if (query.includes('from document_types')) {
+        return Promise.resolve(
+          current.documentTypeName === null ? [] : [{ name: current.documentTypeName }]
+        );
+      }
+
+      if (query.includes('insert into chunks')) {
+        const bulk = values.find(
+          (v): v is { __pgBulkRows: Array<Record<string, unknown>> } =>
+            typeof v === 'object' && v !== null && '__pgBulkRows' in v
+        );
+        if (bulk) insertedChunkRows.push(...bulk.__pgBulkRows);
+        return Promise.resolve(noopResult);
+      }
+
+      return Promise.resolve(noopResult);
+    }
+  );
+
+  (sqlFn as unknown as Record<string, unknown>)['json'] = (val: unknown) => val;
+  attachBeginStub(sqlFn);
+
+  return { sql: sqlFn as unknown as Sql, insertedChunkRows, selectQueries };
+}
+
+/** Chunk cujo `departmentId` é o do INÍCIO do pipeline (potencialmente obsoleto). */
+function makeEmbeddedChunk(departmentId: string, chunkIndex = 0) {
+  return {
+    text: 'trecho do documento',
+    tokenCount: 4,
+    pageNumber: 1,
+    chunkIndex,
+    documentId: DOCUMENT_ID,
+    tenantId: TENANT_A,
+    departmentId,
+    documentTypeName: 'Tipo Antigo',
+    embedding: [0.1, 0.2, 0.3],
+  };
+}
+
+describe('persistProcessingResult — chunks acompanham o departamento ATUAL do documento', () => {
+  it('grava o departamento relido do banco quando o documento foi movido durante o processamento', async () => {
+    const { sql, insertedChunkRows, selectQueries } = makeChunkPersistSqlStub({
+      // O move commitou enquanto os embeddings rodavam.
+      departmentId: DEPT_NOVO,
+      documentTypeId: 'type-novo',
+      documentTypeName: 'Tipo Atual',
+    });
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(1),
+        // Os chunks carregam o departamento lido no início do pipeline.
+        embeddedChunks: [makeEmbeddedChunk(DEPT_ANTIGO, 0), makeEmbeddedChunk(DEPT_ANTIGO, 1)],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: null,
+        suggestedTitle: null,
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    expect(insertedChunkRows).toHaveLength(2);
+    // A invariante: nenhum chunk fica com o departamento antigo.
+    for (const row of insertedChunkRows) {
+      expect(row['department_id']).toBe(DEPT_NOVO);
+    }
+    expect(insertedChunkRows.some((r) => r['department_id'] === DEPT_ANTIGO)).toBe(false);
+    // E o nome do tipo também acompanha o valor atual, não o congelado.
+    expect(insertedChunkRows[0]?.['document_type_name']).toBe('Tipo Atual');
+
+    // A releitura precisa tomar row lock — é o que serializa contra o move.
+    expect(selectQueries.some((q) => q.includes('for share'))).toBe(true);
+  });
+
+  it('mantém o departamento do início do pipeline quando nada mudou', async () => {
+    const { sql, insertedChunkRows } = makeChunkPersistSqlStub({
+      departmentId: DEPT_ANTIGO,
+      documentTypeId: null,
+      documentTypeName: null,
+    });
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(1),
+        embeddedChunks: [makeEmbeddedChunk(DEPT_ANTIGO)],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: null,
+        suggestedTitle: null,
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    expect(insertedChunkRows[0]?.['department_id']).toBe(DEPT_ANTIGO);
+    // Sem tipo confirmado, o nome denormalizado é limpo (não herda o congelado).
+    expect(insertedChunkRows[0]?.['document_type_name']).toBeNull();
+  });
+
+  it('cai no valor do início do pipeline quando o documento sumiu durante o processamento', async () => {
+    const { sql, insertedChunkRows } = makeChunkPersistSqlStub({
+      // SELECT sem linha: documento excluído no meio do processamento.
+      departmentId: null,
+      documentTypeId: null,
+      documentTypeName: null,
+    });
+
+    await persistProcessingResult(
+      {
+        job: makeJob(TENANT_A),
+        extractResult: makeExtractResult(1),
+        embeddedChunks: [makeEmbeddedChunk(DEPT_ANTIGO)],
+        totalEmbeddingsUsd: 0,
+        typeSuggestion: null,
+        suggestedTitle: null,
+        classificationUsd: 0,
+        pipelineStartedAt: new Date(),
+        typeAutoApplyMinConfidence: 0.5,
+      },
+      { sql, logger: makeSilentLogger() }
+    );
+
+    expect(insertedChunkRows[0]?.['department_id']).toBe(DEPT_ANTIGO);
+  });
+});
+
+/**
  * Testes da auto-aplicação de tipo/título (pedido do Owner, 2026-07-22) —
  * cobre tanto o upload (documento novo, campos sempre NULL) quanto o
  * reprocessamento individual via `POST /documents/:id/reprocess` (mesmo
@@ -443,6 +646,7 @@ function makeAutoApplySqlStub(): { sql: Sql; documentsUpdates: Array<{ query: st
     }
   );
   (sqlFn as unknown as Record<string, unknown>)['json'] = (val: unknown) => val;
+  attachBeginStub(sqlFn);
 
   return { sql: sqlFn as unknown as Sql, documentsUpdates };
 }

@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { TenantRepository } from '@dmdoc/db-pg';
 import type { TenantDocument } from '@dmdoc/db-pg';
-import { MoveDepartmentBodySchema } from '@dmdoc/shared-types';
+import { MoveDepartmentBodySchema, RoleSchema, ROLE_LEVEL } from '@dmdoc/shared-types';
 import { ConflictError, NotFoundError, ValidationError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantId, resolveTenantContext } from '../auth/resolve-tenant.js';
@@ -170,12 +170,31 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
       deleted: r.deleted,
     })) as (DepartmentDoc & { documentCount?: number })[];
 
-    // Filtro de ESCRITA
+    // Filtro de ESCRITA — precisa espelhar EXATAMENTE o gate de escrita real
+    // (`assertCanWriteDepartment`, documents.ts:517-547), senão o front oferece
+    // destinos que o backend recusa com 404.
     if (writable) {
       const userId = request.user?.sub;
       if (typeof userId !== 'string') {
         throw new Error('userId ausente no contexto da request');
       }
+
+      // Camada 1 — gate por NÍVEL DE PAPEL (fail-closed). Papel abaixo de
+      // UPLOADER não escreve em lugar nenhum, mesmo com raiz concedida ativa:
+      // a concessão dá leitura, o papel é que habilita a escrita (wiki
+      // "Permissões por departamento (ACL)"). Papel desconhecido resolve para
+      // nível 0 e também recebe lista vazia, nunca liberado.
+      const parsedRole = RoleSchema.safeParse(role);
+      const roleLevel = parsedRole.success ? ROLE_LEVEL[parsedRole.data] : 0;
+      if (roleLevel < ROLE_LEVEL.UPLOADER) {
+        request.log.debug(
+          { tenantId: aclTenantId, userId, role },
+          'writable=true com papel sem capacidade de escrita; devolvendo lista vazia',
+        );
+        return reply.status(200).send([]);
+      }
+
+      // Camada 2 — ACL por raiz concedida (`null` = admin sem restrição).
       const accessible = await resolveAccessibleDepartmentIds(
         sql,
         userId,

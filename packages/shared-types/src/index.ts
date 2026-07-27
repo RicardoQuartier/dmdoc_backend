@@ -44,6 +44,11 @@ export {
   type DocumentStatus,
   DocumentSchema,
   type Document,
+  MoveDocumentBodySchema,
+  type MoveDocumentBody,
+  BULK_MOVE_MAX,
+  BulkMoveDocumentsBodySchema,
+  type BulkMoveDocumentsBody,
 } from './document.js';
 export {
   ExtractionResultSchema,

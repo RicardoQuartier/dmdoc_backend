@@ -3037,6 +3037,82 @@ describe('PATCH /documents/:id — título de exibição (Fase 8.1)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// PATCH /documents/:id — `departmentId` é rejeitado com 422 (E-9 / T-109).
+// Antes, o campo era descartado em silêncio pelo Zod: 200, nenhum efeito e o
+// chamador achando que tinha movido o documento.
+// ---------------------------------------------------------------------------
+
+describe('PATCH /documents/:id — departmentId rejeitado (E-9)', () => {
+  async function uploadDoc(token: string, departmentId: string): Promise<string> {
+    const { payload, headers } = buildUploadForm({ departmentId });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/documents',
+      headers: { authorization: `Bearer ${token}`, ...headers },
+      payload,
+    });
+    expect(res.statusCode).toBe(201);
+    return res.json().id as string;
+  }
+
+  it('departmentId no body → 422 apontando para a rota /move, sem mover nada', async () => {
+    const outroDeptId = newId();
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES (${outroDeptId}, ${TENANT_A}, NULL, 'Jurídico A', 0, '{}'::text[], false, NOW())
+    `;
+    const docId = await uploadDoc(tokenAdminA, DEPT_A_ID);
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { departmentId: outroDeptId },
+    });
+
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
+    expect(res.json().error.message).toContain('/move');
+
+    const rows = await testDb.db<Array<{ department_id: string }>>`
+      SELECT department_id FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]?.department_id).toBe(DEPT_A_ID);
+  });
+
+  it('departmentId rejeitado mesmo quando vem junto de campos válidos', async () => {
+    const docId = await uploadDoc(tokenAdminA, DEPT_A_ID);
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: 'Contrato X', departmentId: DEPT_A_ID },
+    });
+    expect(res.statusCode).toBe(422);
+
+    // Nada do PATCH é aplicado: a checagem roda ANTES de qualquer escrita.
+    const rows = await testDb.db<Array<{ title: string | null }>>`
+      SELECT title FROM documents WHERE id = ${docId}
+    `;
+    expect(rows[0]?.title).toBeNull();
+  });
+
+  it('campo extra desconhecido que NÃO é departmentId continua sendo ignorado', async () => {
+    const docId = await uploadDoc(tokenAdminA, DEPT_A_ID);
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${tokenAdminA}` },
+      payload: { title: 'Contrato Y', campoQueNaoExiste: 'ruído' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().title).toBe('Contrato Y');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // POST /documents/:id/classify — classificação automática de tipo por IA
 // (Fase 8, entregável #61). Re-sugere o tipo sob demanda; sempre PERSISTE a
 // sugestão consultiva (type_suggestion/suggested_title) e, com as flags de

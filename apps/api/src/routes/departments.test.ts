@@ -317,10 +317,26 @@ describe('GET /departments?writable=true — filtro de escrita (seletor de uploa
     expect(ids).toEqual([FINANCEIRO, CONTAS_A_PAGAR].sort());
   });
 
-  it('USER com raiz concedida → subárvore expandida (ACL leitura==escrita)', async () => {
+  /**
+   * Gate por PAPEL (T-110): `USER` é somente leitura. Mesmo com raiz concedida
+   * ATIVA — que lhe dá leitura da subárvore inteira — ele não escreve em lugar
+   * nenhum, então o seletor de destino tem de vir vazio. Antes desta correção o
+   * ramo `writable` resolvia só a ACL e devolvia a subárvore, fazendo o front
+   * oferecer destinos que `assertCanWriteDepartment` (documents.ts:517-547)
+   * recusa com 404.
+   */
+  it('USER com raiz concedida ATIVA → [] (200): papel abaixo de UPLOADER não escreve', async () => {
     await seedTreeAndActors();
     await grantRoot(USER_A_ID, FINANCEIRO);
     const token = await login('user-a@empresa.com');
+
+    // Pré-condição: a concessão existe e está ativa — o vazio vem do PAPEL,
+    // não da ausência de ACL.
+    const grants = await testDb.db<Array<{ department_id: string }>>`
+      SELECT department_id FROM department_permissions
+      WHERE user_id = ${USER_A_ID} AND deleted = false
+    `;
+    expect(grants.map((g) => g.department_id)).toEqual([FINANCEIRO]);
 
     const res = await app.inject({
       method: 'GET',
@@ -329,8 +345,23 @@ describe('GET /departments?writable=true — filtro de escrita (seletor de uploa
     });
 
     expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([]);
+  });
+
+  it('USER com raiz concedida continua ENXERGANDO a árvore em GET /departments (só o writable muda)', async () => {
+    await seedTreeAndActors();
+    await grantRoot(USER_A_ID, FINANCEIRO);
+    const token = await login('user-a@empresa.com');
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments',
+      headers: { authorization: `Bearer ${token}` },
+    });
+
+    expect(res.statusCode).toBe(200);
     const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
-    expect(ids).toEqual([FINANCEIRO, CONTAS_A_PAGAR].sort());
+    expect(ids).toEqual([FINANCEIRO, CONTAS_A_PAGAR, RH].sort());
   });
 
   it('TENANT_ADMIN → todos os departamentos ATIVOS do tenant (sem restrição de ACL)', async () => {
