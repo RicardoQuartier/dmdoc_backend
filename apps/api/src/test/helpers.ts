@@ -64,6 +64,7 @@ export async function resetDomainTables(db: Sql): Promise<void> {
       departments,
       document_content,
       document_events,
+      document_reprocess_batch,
       document_type_index_fields,
       document_types,
       documents,
