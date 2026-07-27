@@ -567,6 +567,49 @@ export const aiReprocessBatches = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// document_reprocess_batch
+// ---------------------------------------------------------------------------
+
+/**
+ * Registro de um LOTE de reprocessamento COMPLETO em massa (épico E-7) — o
+ * pipeline integral (extração → embeddings → IA), não só as etapas de IA.
+ *
+ * NÃO TEM `done`/`failed`/`status`/`updated_at` DE PROPÓSITO — não adicione.
+ * O progresso é DERIVADO em tempo de leitura agregando `documents.status` dos
+ * ids em `documentIds` (ver `deriveDocumentReprocessBatchProgress` em
+ * `document-reprocess-batch.ts`). O worker nunca escreve aqui: o payload de
+ * `document-processing` é validado por um `z.object` que strippa chaves
+ * desconhecidas (o `batchId` não sobreviveria), e a fila roda `attempts: 3`
+ * com o pipeline re-lançando o erro — um contador contaria a mesma falha 3×.
+ * O lote de IA (`aiReprocessBatches`) usa push apenas porque tem fila
+ * dedicada com `attempts: 1`.
+ *
+ * `documentIds`: lista imutável dos ELEGÍVEIS enfileirados.
+ * `total`: denominador estável (as linhas que sumirem de `documents` viram
+ * `gone` na derivação e contam como falha, deixando o lote FECHAR).
+ * `skipped`: selecionados pelo usuário que não eram elegíveis (não estavam em
+ * FAILED) — informativo, fora da conta do progresso.
+ */
+export const documentReprocessBatches = pgTable(
+  'document_reprocess_batch',
+  {
+    id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    // Ator que disparou o lote. Nullable para sobreviver à purga de usuário.
+    createdBy: uuid('created_by').references(() => users.id),
+    documentIds: uuid('document_ids').array().notNull(),
+    total: integer('total').notNull(),
+    skipped: integer('skipped').notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .default(sql`now()`),
+  },
+  (t) => [index('document_reprocess_batch_by_tenant').on(t.tenantId)],
+);
+
+// ---------------------------------------------------------------------------
 // audit_logs
 // ---------------------------------------------------------------------------
 

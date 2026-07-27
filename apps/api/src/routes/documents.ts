@@ -12,8 +12,14 @@ import {
   getAiReprocessBatch,
   getAiReprocessBatchGlobal,
   getAiReprocessBatchInTenants,
+  createDocumentReprocessBatch,
+  getDocumentReprocessBatch,
+  getDocumentReprocessBatchGlobal,
+  getDocumentReprocessBatchInTenants,
+  deriveDocumentReprocessBatchProgress,
   type AiReprocessBatchRecord,
   type AiReprocessBatchStep,
+  type DocumentReprocessBatchRecord,
 } from '@dmdoc/db-pg';
 import type { TenantDocument } from '@dmdoc/db-pg';
 import type { Sql, JSONValue } from '@dmdoc/db-pg';
@@ -314,6 +320,47 @@ const BULK_REPROCESS_AI_MAX = 500;
 const BulkReprocessAiBodySchema = z.object({
   documentIds: z.array(z.string().uuid()).min(1).max(BULK_REPROCESS_AI_MAX),
   steps: z.array(AiReprocessStepSchema).min(1).optional(),
+});
+
+/**
+ * Teto de documentos por disparo de reprocessamento COMPLETO em massa (E-7).
+ * Mesmo teto do lote de IA (500) e do `pageSize` máximo de `GET /documents` —
+ * o front resolve "selecionar todos do filtro" enviando os ids da página. Aqui
+ * o teto pesa ainda mais: cada documento elegível roda o pipeline INTEGRAL
+ * (extração + OCR + embeddings + as 3 etapas de IA), ou seja, equivale a 500
+ * uploads completos concorrendo com a fila de uploads da empresa.
+ */
+const BULK_REPROCESS_MAX = 500;
+
+/**
+ * Schema do body do POST /documents/bulk-reprocess.
+ *
+ * `documentIds`: lista EXPLÍCITA de documentos (1..500). SEM `steps` — ao
+ * contrário do lote de IA (E-4), aqui o pipeline é integral por definição:
+ * não existe subconjunto de etapas a escolher.
+ */
+const BulkReprocessBodySchema = z.object({
+  documentIds: z.array(z.string().uuid()).min(1).max(BULK_REPROCESS_MAX),
+});
+
+/**
+ * Teto de documentos por disparo de exclusão em massa (E-8).
+ * Mesmo teto das demais operações em lote (500) e do `pageSize` máximo de
+ * `GET /documents` — o front resolve "selecionar todos do filtro" enviando os
+ * ids da página. Aqui o teto é uma trava de segurança, não de custo: a operação
+ * é IRREVERSÍVEL (apaga chunks, texto extraído e o objeto no S3).
+ */
+const BULK_DELETE_MAX = 500;
+
+/**
+ * Schema do body do POST /documents/bulk-delete.
+ *
+ * `documentIds`: lista EXPLÍCITA de documentos (1..500). SEM filtro por status —
+ * documento em qualquer status é elegível (o `DELETE /documents/:id` individual
+ * também não tem guarda de status).
+ */
+const BulkDeleteBodySchema = z.object({
+  documentIds: z.array(z.string().uuid()).min(1).max(BULK_DELETE_MAX),
 });
 
 /**
@@ -2185,6 +2232,606 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       });
     }
   );
+
+  // =========================================================================
+  // POST /documents/bulk-reprocess — reprocessamento COMPLETO em massa (E-7)
+  // =========================================================================
+  /**
+   * Dispara o pipeline INTEGRAL (extração → chunking → embeddings → IA) para um
+   * LOTE de documentos em falha: apaga o conteúdo anterior dos elegíveis, volta
+   * cada um para `PENDING`, registra o lote (`document_reprocess_batch`) e
+   * enfileira um job `process-document` por documento na fila padrão de upload.
+   * O progresso é acompanhado por `GET /documents/bulk-reprocess/:batchId`.
+   *
+   * NÃO CONFUNDIR com `POST /documents/bulk-reprocess-ai` (E-4), que roda SÓ as
+   * etapas de IA sobre texto JÁ extraído e por isso não serve para documento
+   * `FAILED` (sem texto extraído) — foi essa lacuna que originou esta rota.
+   *
+   * ELEGIBILIDADE: só documentos em `FAILED`. `READY`/`PENDING`/`PROCESSING` da
+   * seleção são PULADOS EM SILÊNCIO (contados em `skipped`/`skippedByStatus`) e
+   * NADA neles é tocado. A AUSÊNCIA DE 409 É INTENCIONAL — o reprocess
+   * individual devolve 409 para `PENDING`/`PROCESSING`, mas em lote a decisão de
+   * produto é pular e explicar na resposta, não recusar a seleção inteira.
+   * Não "conserte" isso adicionando 409.
+   *
+   * PERMISSÃO — DUAS CAMADAS (mesmas do lote de IA):
+   *   1. GATE DE PAPEL (403): exclusivo de SUPER_ADMIN, MULTI_TENANT_ADMIN e
+   *      TENANT_ADMIN. O individual continua UPLOADER+ACL; aqui não, porque o
+   *      lote equivale a até 500 uploads completos (OCR + embeddings + 3 etapas
+   *      de IA) e, com FIFO na fila compartilhada, atrasa os uploads de toda a
+   *      empresa. O gate roda ANTES de qualquer leitura de documento — o 403 não
+   *      revela existência de nada.
+   *   2. ESCOPO + ACL (404): `assertCanWriteDepartment` por documento. Documento
+   *      de outra empresa ou sem ACL resolve para 404, nunca 403.
+   *
+   * FILA: `opts` idênticas ao reprocess individual (`attempts: 3`, backoff
+   * exponencial 2s) e SEM `priority` — decisão de produto: FIFO, o lote compete
+   * de igual para igual com os uploads.
+   */
+  app.post(
+    '/documents/bulk-reprocess',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      // Gate de papel: operação administrativa (pipeline integral em massa).
+      // UPLOADER/USER → 403 antes de qualquer leitura de documento.
+      requireRole(request, ...ADMIN_ROLES);
+
+      const userId = request.user!.sub;
+      const role = request.user!.role;
+      const sql = app.db;
+
+      const { documentIds } = BulkReprocessBodySchema.parse(request.body);
+
+      // Ids repetidos na seleção contariam duas vezes em `requested`/`total` e
+      // gerariam job duplicado — deduplica antes de qualquer coisa.
+      const dedupedIds = [...new Set(documentIds)];
+
+      // ------------------------------------------------------------------
+      // 1. Resolve os documentos DENTRO do escopo do ator (multi-tenant).
+      //    Documento fora do escopo → 404 genérico (nunca revela qual id).
+      // ------------------------------------------------------------------
+      interface ScopedDocRow {
+        id: string;
+        tenant_id: string;
+        department_id: string;
+        status: DocumentRow['status'];
+        s3_key: string;
+        mime_type: string;
+      }
+      let foundDocs: ScopedDocRow[];
+
+      if (role === 'SUPER_ADMIN') {
+        foundDocs = await sql<ScopedDocRow[]>`
+          SELECT id, tenant_id, department_id, status, s3_key, mime_type
+          FROM documents
+          WHERE id = ANY(${dedupedIds}::uuid[])
+            AND deleted = false
+        `;
+      } else if (role === 'MULTI_TENANT_ADMIN') {
+        const allowed = request.user?.allowedTenantIds ?? [];
+        foundDocs = allowed.length === 0
+          ? []
+          : await sql<ScopedDocRow[]>`
+              SELECT id, tenant_id, department_id, status, s3_key, mime_type
+              FROM documents
+              WHERE id = ANY(${dedupedIds}::uuid[])
+                AND tenant_id = ANY(${allowed}::uuid[])
+                AND deleted = false
+            `;
+      } else {
+        const scopedTenantId = request.tenantId as string;
+        foundDocs = await sql<ScopedDocRow[]>`
+          SELECT id, tenant_id, department_id, status, s3_key, mime_type
+          FROM documents
+          WHERE id = ANY(${dedupedIds}::uuid[])
+            AND tenant_id = ${scopedTenantId}
+            AND deleted = false
+        `;
+      }
+
+      if (foundDocs.length !== dedupedIds.length) {
+        // Algum id não existe ou está fora do escopo do ator → 404 genérico,
+        // ANTES de qualquer escrita (nada é reprocessado numa seleção inválida).
+        throw new NotFoundError('Documento não encontrado');
+      }
+
+      // ------------------------------------------------------------------
+      // 2. Todos os documentos precisam pertencer à MESMA empresa (o lote é
+      //    escopado por tenant). Para SUPER_ADMIN/MTA, seleção cross-tenant
+      //    é uso inválido da API (não vazamento) → 422.
+      // ------------------------------------------------------------------
+      const distinctTenantIds = [...new Set(foundDocs.map((d) => d.tenant_id))];
+      if (distinctTenantIds.length > 1) {
+        throw new ValidationError('Todos os documentos devem pertencer à mesma empresa');
+      }
+      const tenantId = distinctTenantIds[0]!;
+
+      // ------------------------------------------------------------------
+      // 3. ACL por documento — mesmo choke point do reprocess individual.
+      //    USER (nível < UPLOADER) ou sem ACL do departamento → 404.
+      // ------------------------------------------------------------------
+      for (const doc of foundDocs) {
+        await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
+      }
+
+      // ------------------------------------------------------------------
+      // 4. Elegíveis = só os FAILED. Os demais são pulados em silêncio e
+      //    explicados na resposta (é o que responde "selecionei 412, por que
+      //    o lote diz 400").
+      // ------------------------------------------------------------------
+      const eligible = foundDocs.filter((doc) => doc.status === 'FAILED');
+      const skippedByStatus: Record<string, number> = {};
+      for (const doc of foundDocs) {
+        if (doc.status === 'FAILED') continue;
+        skippedByStatus[doc.status] = (skippedByStatus[doc.status] ?? 0) + 1;
+      }
+      const skipped = foundDocs.length - eligible.length;
+
+      if (eligible.length === 0) {
+        throw new ValidationError(
+          'Nenhum documento selecionado está em falha (FAILED) — nada a reprocessar'
+        );
+      }
+
+      // ------------------------------------------------------------------
+      // 5. Transação: limpa o conteúdo dos ELEGÍVEIS e os devolve a PENDING.
+      //
+      //    ATENÇÃO: os DELETEs e o UPDATE valem SOMENTE sobre `eligibleIds`,
+      //    NUNCA sobre `dedupedIds`. Aplicá-los à seleção inteira destruiria
+      //    `document_content`/`chunks` de documentos READY que o usuário
+      //    selecionou junto — o pior bug possível desta rota.
+      //
+      //    Um statement com `= ANY` por operação (3 round-trips para 500
+      //    documentos, não 1500). `::uuid[]` explícito: postgres.js serializa
+      //    `string[]` como `text[]` e o Postgres não converte implicitamente.
+      //
+      //    Diferente do reprocess individual (que faz os DELETEs e o UPDATE
+      //    soltos), aqui o risco é 500× maior e a transação custa uma chamada.
+      // ------------------------------------------------------------------
+      const eligibleIds = eligible.map((doc) => doc.id);
+
+      const { batch, requeued } = await sql.begin(async (tx) => {
+        await tx`
+          DELETE FROM chunks
+          WHERE tenant_id = ${tenantId}
+            AND document_id = ANY(${eligibleIds}::uuid[])
+        `;
+        await tx`
+          DELETE FROM document_content
+          WHERE tenant_id = ${tenantId}
+            AND document_id = ANY(${eligibleIds}::uuid[])
+        `;
+
+        // `AND status = 'FAILED'` é o guarda de corrida: se alguém disparou o
+        // reprocess individual entre a leitura (passo 1) e este UPDATE, o
+        // documento já não está FAILED, não é tocado, não vira job duplicado e
+        // não entra no `document_ids` do lote. O RETURNING — e não
+        // `eligible.length` — é a fonte de verdade do `total`.
+        const requeuedRows = await tx<Array<{ id: string; s3_key: string; mime_type: string }>>`
+          UPDATE documents
+          SET status = 'PENDING',
+              failure_reason = NULL
+          WHERE tenant_id = ${tenantId}
+            AND id = ANY(${eligibleIds}::uuid[])
+            AND status = 'FAILED'
+          RETURNING id, s3_key, mime_type
+        `;
+
+        if (requeuedRows.length === 0) {
+          // Corrida perdida por completo: nada mais estava FAILED. Lançar aqui
+          // faz o ROLLBACK dos DELETEs (postgres.js) — nada é destruído.
+          throw new ValidationError(
+            'Nenhum documento selecionado está em falha (FAILED) — nada a reprocessar'
+          );
+        }
+
+        const created = await createDocumentReprocessBatch(tx as unknown as Sql, {
+          tenantId,
+          createdBy: userId,
+          documentIds: requeuedRows.map((row) => row.id),
+          total: requeuedRows.length,
+          skipped,
+        });
+
+        return {
+          batch: created,
+          requeued: requeuedRows.map((row) => ({
+            id: row.id,
+            s3Key: row.s3_key,
+            mimeType: row.mime_type,
+          })),
+        };
+      });
+
+      // ------------------------------------------------------------------
+      // 6. Enfileiramento DEPOIS do commit, nunca dentro: dentro, um commit
+      //    falho deixaria jobs fantasmas sobre documentos ainda FAILED. Depois,
+      //    o pior caso é "PENDING sem job" — visível na listagem e recuperável.
+      //
+      //    Se o `addBulk` falhar (Redis fora do ar), COMPENSA: devolve os
+      //    documentos a FAILED e responde 502. Sem isso, uma queda do Redis no
+      //    disparo prenderia 500 documentos em PENDING sem nada que os tirasse
+      //    de lá.
+      // ------------------------------------------------------------------
+      const requeuedIds = requeued.map((doc) => doc.id);
+
+      if (app.queue !== null) {
+        try {
+          await app.queue.addBulk(
+            requeued.map((doc) => ({
+              name: 'process-document',
+              data: DocumentProcessingJobDataSchema.parse({
+                tenantId,
+                documentId: doc.id,
+                s3Key: doc.s3Key,
+                mimeType: doc.mimeType,
+              }),
+              // Mesmas opts do reprocess individual. SEM `priority`: FIFO por
+              // decisão de produto — o lote não fura a fila dos uploads.
+              opts: {
+                attempts: 3,
+                backoff: { type: 'exponential' as const, delay: 2000 },
+              },
+            }))
+          );
+        } catch (queueError) {
+          try {
+            await sql`
+              UPDATE documents
+              SET status = 'FAILED',
+                  failure_reason = ${'Falha ao enfileirar reprocessamento em lote'}
+              WHERE tenant_id = ${tenantId}
+                AND id = ANY(${requeuedIds}::uuid[])
+                AND status = 'PENDING'
+            `;
+          } catch (compensationError) {
+            request.log.error(
+              { err: compensationError, tenantId, userId, batchId: batch.id, count: requeuedIds.length },
+              'falha ao compensar documentos após erro de enfileiramento em lote'
+            );
+          }
+
+          request.log.error(
+            { err: queueError, tenantId, userId, batchId: batch.id, count: requeuedIds.length },
+            'falha ao enfileirar lote de reprocessamento completo'
+          );
+
+          throw new UpstreamServiceError(
+            'Falha ao enfileirar o reprocessamento em lote. Nenhum documento foi reprocessado.'
+          );
+        }
+      } else {
+        request.log.warn(
+          { tenantId, batchId: batch.id, count: requeuedIds.length },
+          'fila de documentos não configurada — lote criado sem enfileirar jobs'
+        );
+      }
+
+      // ------------------------------------------------------------------
+      // 7. AuditLog (não-bloqueante).
+      // ------------------------------------------------------------------
+      const auditLogger = new AuditLogger(sql);
+      try {
+        await auditLogger.record({
+          tenantId,
+          userId,
+          action: 'document.bulk_reprocess',
+          resource: `documents/bulk-reprocess/${batch.id}`,
+          metadata: {
+            batchId: batch.id,
+            requested: dedupedIds.length,
+            total: batch.total,
+            skipped,
+          },
+        });
+      } catch (auditError) {
+        request.log.error(
+          { err: auditError, tenantId, userId, batchId: batch.id, count: batch.total },
+          'falha ao registrar audit log de reprocessamento completo em massa'
+        );
+      }
+
+      request.log.info(
+        {
+          tenantId,
+          userId,
+          batchId: batch.id,
+          requested: dedupedIds.length,
+          total: batch.total,
+          skipped,
+          traceId: request.id,
+        },
+        'lote de reprocessamento completo enfileirado'
+      );
+
+      return reply.status(202).send({
+        batchId: batch.id,
+        requested: dedupedIds.length,
+        total: batch.total,
+        skipped,
+        skippedByStatus,
+      });
+    }
+  );
+
+  // =========================================================================
+  // GET /documents/bulk-reprocess/:batchId — progresso DERIVADO do lote (E-7)
+  // =========================================================================
+  /**
+   * Retorna o progresso de um lote de reprocessamento completo para o polling
+   * do front. Os contadores NÃO são persistidos: são derivados de
+   * `documents.status` sobre a lista imutável de ids do lote
+   * (`deriveDocumentReprocessBatchProgress`) — ver o cabeçalho de
+   * `packages/db-pg/src/document-reprocess-batch.ts` para o porquê.
+   *
+   * PERMISSÃO: mesmo gate de papel do disparo (UPLOADER/USER → 403) e mesmo
+   * dispatch por papel do E-4. Lote de outra empresa → 404 (nunca 403: não
+   * vaza a existência de lote alheio).
+   */
+  app.get(
+    '/documents/bulk-reprocess/:batchId',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      requireRole(request, ...ADMIN_ROLES);
+
+      const role = request.user!.role;
+      const sql = app.db;
+
+      const { batchId } = z.object({ batchId: z.string().uuid() }).parse(request.params);
+
+      let batch: DocumentReprocessBatchRecord | null;
+      if (role === 'SUPER_ADMIN') {
+        batch = await getDocumentReprocessBatchGlobal(sql, batchId);
+      } else if (role === 'MULTI_TENANT_ADMIN') {
+        batch = await getDocumentReprocessBatchInTenants(
+          sql,
+          request.user?.allowedTenantIds ?? [],
+          batchId
+        );
+      } else {
+        batch = await getDocumentReprocessBatch(sql, request.tenantId as string, batchId);
+      }
+
+      if (batch === null) {
+        throw new NotFoundError('Lote de reprocessamento não encontrado');
+      }
+
+      const progress = await deriveDocumentReprocessBatchProgress(sql, batch);
+
+      return reply.status(200).send({
+        batchId: batch.id,
+        total: progress.total,
+        done: progress.done,
+        failed: progress.failed,
+        pending: progress.pending,
+        skipped: batch.skipped,
+        status: progress.status,
+        stalled: progress.stalled,
+        createdAt: batch.createdAt.toISOString(),
+      });
+    }
+  );
+
+  // =========================================================================
+  // POST /documents/bulk-delete — exclusão em massa (E-8)
+  // =========================================================================
+  /**
+   * Aplica a MESMA exclusão do `DELETE /documents/:id` a até 500 documentos numa
+   * chamada: soft delete do documento (`deleted = true`), remoção FÍSICA de
+   * `chunks` e `document_content` e remoção do objeto no S3.
+   *
+   * SÍNCRONA, sem lote/fila/polling — ao contrário dos reprocessamentos em massa
+   * (E-4/E-7), aqui não há trabalho a acompanhar: são 3 statements por `= ANY`
+   * que fecham em milissegundos mesmo para 500 documentos. Responde 200 com a
+   * contagem do que foi efetivamente excluído.
+   *
+   * SEM ELEGIBILIDADE POR STATUS: documento em qualquer status pode ser
+   * excluído (deletar é deletar; o individual também não tem guarda), logo não
+   * existe `skipped`/`skippedByStatus` aqui.
+   *
+   * PERMISSÃO — DUAS CAMADAS:
+   *   1. GATE DE PAPEL (403): exclusivo de SUPER_ADMIN, MULTI_TENANT_ADMIN e
+   *      TENANT_ADMIN. ASSIMETRIA DELIBERADA em relação ao `DELETE
+   *      /documents/:id`, que continua permitido a UPLOADER com ACL — o estrago
+   *      de um clique é proporcional à seleção. O gate roda ANTES de qualquer
+   *      leitura de documento, então o 403 não revela existência de nada.
+   *   2. ESCOPO + ACL (404): `assertCanWriteDepartment` por documento. Documento
+   *      de outra empresa ou sem ACL resolve para 404, nunca 403.
+   *
+   * `document_events` NÃO é tocado: o histórico de uso/cobrança preserva o
+   * upload que aconteceu, mesmo que o documento não exista mais.
+   */
+  app.post('/documents/bulk-delete', { preHandler: app.authenticate }, async (request, reply) => {
+    // Gate de papel: operação administrativa e IRREVERSÍVEL.
+    // UPLOADER/USER → 403 antes de qualquer leitura de documento.
+    requireRole(request, ...ADMIN_ROLES);
+
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const sql = app.db;
+
+    const { documentIds } = BulkDeleteBodySchema.parse(request.body);
+
+    // Ids repetidos contariam duas vezes em `requested` e gerariam uma segunda
+    // tentativa de remoção do mesmo objeto no S3 — deduplica antes de tudo.
+    const dedupedIds = [...new Set(documentIds)];
+
+    // ------------------------------------------------------------------
+    // 1. Resolve os documentos DENTRO do escopo do ator (multi-tenant).
+    //    Documento fora do escopo → 404 genérico (nunca revela qual id).
+    // ------------------------------------------------------------------
+    interface ScopedDocRow {
+      id: string;
+      tenant_id: string;
+      department_id: string;
+      s3_key: string;
+    }
+    let foundDocs: ScopedDocRow[];
+
+    if (role === 'SUPER_ADMIN') {
+      foundDocs = await sql<ScopedDocRow[]>`
+        SELECT id, tenant_id, department_id, s3_key
+        FROM documents
+        WHERE id = ANY(${dedupedIds}::uuid[])
+          AND deleted = false
+      `;
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      const allowed = request.user?.allowedTenantIds ?? [];
+      foundDocs = allowed.length === 0
+        ? []
+        : await sql<ScopedDocRow[]>`
+            SELECT id, tenant_id, department_id, s3_key
+            FROM documents
+            WHERE id = ANY(${dedupedIds}::uuid[])
+              AND tenant_id = ANY(${allowed}::uuid[])
+              AND deleted = false
+          `;
+    } else {
+      const scopedTenantId = request.tenantId as string;
+      foundDocs = await sql<ScopedDocRow[]>`
+        SELECT id, tenant_id, department_id, s3_key
+        FROM documents
+        WHERE id = ANY(${dedupedIds}::uuid[])
+          AND tenant_id = ${scopedTenantId}
+          AND deleted = false
+      `;
+    }
+
+    if (foundDocs.length !== dedupedIds.length) {
+      // Algum id não existe, já foi excluído ou está fora do escopo do ator →
+      // 404 genérico, ANTES de qualquer escrita. Uma seleção inválida não
+      // exclui NADA — nem os ids válidos que vieram junto.
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    // ------------------------------------------------------------------
+    // 2. Todos os documentos precisam pertencer à MESMA empresa (a operação é
+    //    escopada por tenant). Para SUPER_ADMIN/MTA, seleção cross-tenant é
+    //    uso inválido da API (não vazamento) → 422.
+    // ------------------------------------------------------------------
+    const distinctTenantIds = [...new Set(foundDocs.map((d) => d.tenant_id))];
+    if (distinctTenantIds.length > 1) {
+      throw new ValidationError('Todos os documentos devem pertencer à mesma empresa');
+    }
+    const tenantId = distinctTenantIds[0]!;
+
+    // ------------------------------------------------------------------
+    // 3. ACL por documento — mesmo choke point do delete individual.
+    //    Sem permissão de ESCRITA no departamento → 404.
+    // ------------------------------------------------------------------
+    for (const doc of foundDocs) {
+      await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Transação: soft delete + remoção física de chunks e texto extraído.
+    //
+    //    Um statement com `= ANY` por operação (3 round-trips para 500
+    //    documentos, não 1500). `::uuid[]` explícito: postgres.js serializa
+    //    `string[]` como `text[]` e o Postgres não converte implicitamente.
+    //
+    //    `AND deleted = false` no UPDATE + `RETURNING` é o guarda de corrida:
+    //    se outra sessão excluiu um documento entre o passo 1 e este UPDATE,
+    //    ele não é recontado. O RETURNING — e NUNCA `foundDocs.length` — é a
+    //    fonte de verdade da contagem e da lista de chaves S3 a remover.
+    //
+    //    Os DELETEs valem sobre `targetIds` (e não sobre as linhas do
+    //    RETURNING) de propósito: um documento que perdeu a corrida já foi
+    //    excluído por quem venceu, e apagar chunks/conteúdo dele é idempotente.
+    // ------------------------------------------------------------------
+    const targetIds = foundDocs.map((doc) => doc.id);
+
+    const deletedDocs = await sql.begin(async (tx) => {
+      const rows = await tx<Array<{ id: string; s3_key: string }>>`
+        UPDATE documents
+        SET deleted = true
+        WHERE tenant_id = ${tenantId}
+          AND id = ANY(${targetIds}::uuid[])
+          AND deleted = false
+        RETURNING id, s3_key
+      `;
+
+      await tx`
+        DELETE FROM chunks
+        WHERE tenant_id = ${tenantId}
+          AND document_id = ANY(${targetIds}::uuid[])
+      `;
+      await tx`
+        DELETE FROM document_content
+        WHERE tenant_id = ${tenantId}
+          AND document_id = ANY(${targetIds}::uuid[])
+      `;
+
+      // Materializa em objetos simples: o resultado de postgres.js carrega
+      // metadados que não sobrevivem ao unwrap do `begin`.
+      return rows.map((row) => ({ id: row.id, s3Key: row.s3_key }));
+    });
+
+    const deletedCount = deletedDocs.length;
+
+    // ------------------------------------------------------------------
+    // 5. S3 DEPOIS do commit, nunca dentro: apagar antes arriscaria destruir o
+    //    arquivo de uma transação que não commitou.
+    //
+    //    Best-effort com `Promise.allSettled` — 500 deleções não podem virar
+    //    500 rejeições não tratadas. Falha só loga e NÃO desfaz a exclusão,
+    //    exatamente como no delete individual: o documento excluído continua
+    //    excluído (o pior caso é um objeto órfão no bucket).
+    // ------------------------------------------------------------------
+    const s3Results = await Promise.allSettled(
+      deletedDocs.map((doc) => app.s3.deleteFile(doc.s3Key))
+    );
+    s3Results.forEach((result, i) => {
+      if (result.status === 'rejected') {
+        request.log.error(
+          {
+            err: result.reason,
+            tenantId,
+            userId,
+            documentId: deletedDocs[i]!.id,
+            s3Key: deletedDocs[i]!.s3Key,
+            traceId: request.id,
+          },
+          'falha ao remover arquivo do S3 em exclusão em massa'
+        );
+      }
+    });
+
+    // ------------------------------------------------------------------
+    // 6. AuditLog (não-bloqueante).
+    // ------------------------------------------------------------------
+    const auditLogger = new AuditLogger(sql);
+    try {
+      await auditLogger.record({
+        tenantId,
+        userId,
+        action: 'document.bulk_delete',
+        resource: 'documents/bulk-delete',
+        metadata: {
+          documentIds: deletedDocs.map((doc) => doc.id),
+          count: deletedCount,
+        },
+      });
+    } catch (auditError) {
+      request.log.error(
+        { err: auditError, tenantId, userId, count: deletedCount },
+        'falha ao registrar audit log de exclusão em massa'
+      );
+    }
+
+    request.log.info(
+      {
+        tenantId,
+        userId,
+        requested: dedupedIds.length,
+        deleted: deletedCount,
+        traceId: request.id,
+      },
+      'documentos excluídos em massa'
+    );
+
+    return reply.status(200).send({ deleted: deletedCount });
+  });
 
   // =========================================================================
   // DELETE /documents/:id — exclusão lógica + limpeza de chunks/S3

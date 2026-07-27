@@ -366,6 +366,72 @@ function isDateFilterValue(value: string | number): value is string {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value);
 }
 
+/**
+ * Semi-join que amarra um chunk ao documento VIVO correspondente
+ * (`deleted = false` e `status = 'READY'`).
+ *
+ * POR QUE EXISTE (T-99). As buscas por chunk liam `chunks` direto, sem tocar em
+ * `documents`. A única coisa que barrava um chunk de documento excluído era o
+ * `filterDocumentIds` que a rota resolve a partir de `documents` — e ele é
+ * `null` sempre que a busca não traz filtro estruturado, que é o caso da busca
+ * livre e do RAG. Medido: documento com `deleted = true` cujo chunk foi
+ * reinserido depois (o worker termina a ingestão DEPOIS da exclusão) voltava em
+ * `lexicalSearch`, `vectorSearch` e `hybridSearch`, com o TEXTO — que no RAG
+ * entra no prompt do LLM. `searchDocumentsPaged` nunca vazou porque a CTE
+ * `merged` já semi-junta com `filtered`, que carrega os dois predicados; este
+ * builder leva a mesma garantia para o caminho por chunk.
+ *
+ * O predicado vale SEMPRE, independente de `filterDocumentIds`: a barreira não
+ * pode depender de a requisição ter filtros.
+ *
+ * Forma: `EXISTS` correlacionado pela PK de `documents`, de propósito. O planner
+ * o converte em semi-join e, com a tabela de documentos grande, resolve cada
+ * candidato por `Memoize` + `documents_pkey` — nested loop, que PRESERVA a ordem
+ * do lado externo e por isso não inviabiliza nem o corte por `ts_rank` nem o
+ * índice HNSW do lado vetorial.
+ *
+ * MEDIDO com EXPLAIN (ANALYZE, BUFFERS) em base descartável — 24.000 chunks,
+ * 202.000 documentos, 10% de chunks órfãos, PG16 + pgvector 0.8.3 — mediana de
+ * 5 execuções, antes → depois:
+ *
+ *   busca de UMA empresa (o caso de todo dia)
+ *     lexicalSearch  0,47 → 0,91 ms   mesmo `chunks_fts_tenant_gin`, mais um
+ *                                     nested loop de 240 lookups por PK
+ *     vectorSearch   9,07 → 0,37 ms   o plano TROCOU: o custo do semi-join sobre
+ *                                     1.200 linhas tornou o caminho "varre o
+ *                                     tenant inteiro e ordena" mais caro que o
+ *                                     HNSW, que passou a ser usado
+ *     hybridSearch   6,39 → 1,73 ms   mesma forma (2 CTEs → FULL OUTER JOIN),
+ *                                     com o semi-join DENTRO das duas, antes do
+ *                                     LIMIT de topK*3
+ *
+ *   SUPER_ADMIN sem filtro de tenant (pior caso, termo pouco seletivo)
+ *     lexicalSearch  6,13 → 10,64 ms  4.800 candidatos × lookup memoizado
+ *     vectorSearch   0,35 → 0,36 ms   HNSW preservado (22 linhas do índice para
+ *                                     devolver 20 — o filtro é aplicado sobre o
+ *                                     fluxo do índice, não depois dele)
+ *     hybridSearch   8,58 → 11,56 ms
+ *
+ * Com a tabela de documentos pequena (1.800 linhas) o planner prefere hash
+ * semi-join com seq scan em `documents`; é escolha de custo e se corrige sozinha
+ * conforme a tabela cresce — foi o que se observou ao passar de 1.800 para
+ * 202.000 documentos.
+ *
+ * RESÍDUO CONHECIDO (não introduzido aqui, mas exposto por esta medição): com o
+ * lado vetorial servido pelo HNSW e `hnsw.ef_search` no padrão 40, um filtro
+ * seletivo faz o índice devolver MENOS candidatos que o `topK*3` pedido (27 de
+ * 60 na medição por empresa). É a limitação conhecida de busca vetorial filtrada
+ * do pgvector — `hnsw.iterative_scan` está `off`. Avaliar em tarefa própria,
+ * com NDCG/MRR medido; não mexer aqui.
+ *
+ * `chunkAlias` é o nome pelo qual a tabela `chunks` é referenciada no escopo
+ * onde o fragmento for inlinado (`chunks` quando sem alias, `c` no JOIN final da
+ * híbrida). Não gasta parâmetro: os dois valores são constantes literais.
+ */
+export function buildLiveDocumentPredicate(chunkAlias = 'chunks'): string {
+  return `EXISTS (SELECT 1 FROM documents ld WHERE ld.id = ${chunkAlias}.document_id AND ld.deleted = false AND ld.status = 'READY')`;
+}
+
 // ---------------------------------------------------------------------------
 // documentMetadataSearch
 // ---------------------------------------------------------------------------
@@ -440,6 +506,9 @@ export async function documentMetadataSearch(
  * `ts_rank()` retorna um score em [0, 1] que reflete a frequência dos termos
  * no chunk, usado para ordenação e exposição no campo `score`.
  *
+ * Só devolve chunks de documento vivo e `READY` — ver
+ * `buildLiveDocumentPredicate` (T-99).
+ *
  * Spec §9 (etapa 3 — busca lexical).
  */
 export async function lexicalSearch(
@@ -453,6 +522,9 @@ export async function lexicalSearch(
   const queryParam = alloc.add(queryText); // $1 — tsquery
 
   let whereClause = `text_search_pt @@ plainto_tsquery('portuguese', ${queryParam}::text)`;
+
+  // Documento vivo e READY — sempre, mesmo sem filtros estruturados (T-99).
+  whereClause += ` AND ${buildLiveDocumentPredicate()}`;
 
   // Filtro de tenant
   if (tenantIds !== undefined && tenantIds.length > 0) {
@@ -853,6 +925,9 @@ export async function searchDocumentsPaged(
  * search.ts, mas não tem efeito no PostgreSQL — o HNSW usa `hnsw.ef_search`
  * configurado no índice.
  *
+ * Só devolve chunks de documento vivo e `READY` — ver
+ * `buildLiveDocumentPredicate` (T-99).
+ *
  * Spec §9 (etapa 3 — busca vetorial).
  */
 export async function vectorSearch(
@@ -869,6 +944,9 @@ export async function vectorSearch(
   const embParam = alloc.add(embeddingLiteral); // $1 — embedding literal
 
   let whereClause = '1=1';
+
+  // Documento vivo e READY — sempre, mesmo sem filtros estruturados (T-99).
+  whereClause += ` AND ${buildLiveDocumentPredicate()}`;
 
   // Filtro de tenant
   if (tenantIds !== undefined && tenantIds.length > 0) {
@@ -980,10 +1058,11 @@ export async function vectorSearch(
  * tem esse dilema (nenhum índice fornece ordem de `ts_rank`), então lá o
  * desempate por id entra também no corte.
  *
- * FILTROS. tenant/dept e `filterDocumentIds` são aplicados DENTRO de cada CTE,
- * antes do corte de `topK*3` candidatos. Aplicar o filtro de documentos só no
- * JOIN final (como era até T-60) descartava resultados válidos: os candidatos
- * eram escolhidos ignorando o filtro e podiam não conter nenhum documento que
+ * FILTROS. tenant/dept, `filterDocumentIds` e o semi-join de documento vivo
+ * (`buildLiveDocumentPredicate`, T-99) são aplicados DENTRO de cada CTE, antes
+ * do corte de `topK*3` candidatos. Aplicar o filtro de documentos só no JOIN
+ * final (como era até T-60) descartava resultados válidos: os candidatos eram
+ * escolhidos ignorando o filtro e podiam não conter nenhum documento que
  * passasse nele, devolvendo menos que `topK` — às vezes zero — mesmo havendo
  * muitos chunks elegíveis. O mesmo placeholder `$N` é reusado nas três
  * posições (allocator da T-58), então empurrar o filtro para dentro não
@@ -1046,6 +1125,17 @@ export async function hybridSearch(
 
   const topKParam = alloc.add(topK); // último parâmetro — LIMIT final
 
+  // Documento vivo e READY. Entra nas DUAS CTEs, ANTES do corte de topK*3
+  // (T-99): aplicado só no JOIN final, um chunk de documento excluído ainda
+  // ocuparia uma vaga do pool de candidatos e sumiria depois, devolvendo menos
+  // que topK e degradando o recall sem ninguém perceber — o mesmo defeito que a
+  // T-60 corrigiu para `filterDocumentIds`. A repetição no JOIN final é
+  // redundante por construção (todo chunk_id do RRF veio de uma das CTEs) e
+  // custa um semi-join sobre ≤ topK*3 linhas; fica como segunda barreira, no
+  // mesmo espírito de `docFilterAliased`.
+  const liveDocFilter = ` AND ${buildLiveDocumentPredicate()}`;
+  const liveDocFilterAliased = ` AND ${buildLiveDocumentPredicate('c')}`;
+
   const query = `
     WITH lexical_ranked AS (
       SELECT
@@ -1060,6 +1150,7 @@ export async function hybridSearch(
           ${tenantFilter}
           ${deptFilter}
           ${docFilter}
+          ${liveDocFilter}
         ORDER BY lex_rank DESC, id ASC
         LIMIT ${candidateLimitParam}
       ) l
@@ -1077,6 +1168,7 @@ export async function hybridSearch(
           ${tenantFilter}
           ${deptFilter}
           ${docFilter}
+          ${liveDocFilter}
         ORDER BY embedding <=> ${embParam}::vector
         LIMIT ${candidateLimitParam}
       ) v
@@ -1105,6 +1197,7 @@ export async function hybridSearch(
     JOIN chunks c ON c.id = r.chunk_id
     WHERE 1=1
       ${docFilterAliased}
+      ${liveDocFilterAliased}
     ORDER BY r.rrf_score DESC, c.id ASC
     LIMIT ${topKParam}
   `;

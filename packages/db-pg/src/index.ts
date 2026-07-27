@@ -9,6 +9,7 @@ export * from './user-write-validation.js';
 export * from './tenant-deletion.js';
 export * from './ai-feature-flags.js';
 export * from './ai-reprocess-batch.js';
+export * from './document-reprocess-batch.js';
 export * from './document-type-catalog.js';
 export { dbFresh } from './db-fresh.js';
 export { seed } from './seed.js';
