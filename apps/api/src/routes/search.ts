@@ -148,11 +148,35 @@ async function resolveFilteredDocumentIds(
  * departamento estar dentro de TODAS as CTEs da query de busca — tanto no ramo
  * de conteúdo quanto no de metadados. Se algum dia esse filtro sair de lá, esta
  * função vira o vazamento.
+ *
+ * SEGUNDA BARREIRA (T-99): resultado cujo documento NÃO aparece nesta query é
+ * DESCARTADO, não anonimizado. Antes o item seguia na resposta com
+ * `documentName`/`title` nulos e `tags`/`indexValues` vazios — mas com o `text`
+ * intacto, que é justamente o payload que vai para a tela e para o prompt do
+ * LLM. Meta ausente só acontece por motivo ruim:
+ *
+ *   1. documento excluído ou fora de `READY` — conteúdo que não deveria mais
+ *      ser recuperável;
+ *   2. documento de outra empresa — o filtro de tenant acima o derruba;
+ *   3. documento que sumiu ENTRE a busca e o enriquecimento — são duas queries
+ *      em snapshots diferentes, então um `bulk-delete` que commita no meio ainda
+ *      produz esse caso mesmo com o semi-join de `buildLiveDocumentPredicate`
+ *      dentro da busca (`packages/db-pg/src/search.ts`). É a janela de corrida
+ *      que esta barreira fecha.
+ *
+ * Nenhum dos três é caso de "mostrar mesmo assim": sem nome, título e tags o
+ * item vira um cartão anônimo que o usuário não consegue abrir.
+ *
+ * Consequência aceita: a resposta pode vir com MENOS itens do que o `topK`
+ * (ou do que o `pageSize`) pedido. O contrato paginado não promete página cheia
+ * — `total`/`pageCount` continuam vindo da query de busca, que já aplica
+ * `deleted = false AND status = 'READY'`.
  */
 async function enrichResultsToChunks(
   sql: Sql,
   results: EnrichableResult[],
   scope: TenantScope,
+  log: FastifyBaseLogger,
 ): Promise<SearchChunk[]> {
   const { singleTenantId, multiTenantIds } = scope;
   const uniqueDocIds = [...new Set(results.map((r) => r.documentId))];
@@ -171,6 +195,7 @@ async function enrichResultsToChunks(
       FROM documents d
       WHERE d.id = ANY(${uniqueDocIds}::uuid[])
         AND d.deleted = false
+        AND d.status = 'READY'
         ${tenantFilter}
     `;
 
@@ -221,22 +246,45 @@ async function enrichResultsToChunks(
     }
   }
 
-  return results.map((r) => {
+  const chunks: SearchChunk[] = [];
+  const droppedDocIds = new Set<string>();
+
+  for (const r of results) {
     const meta = docMetaMap.get(r.documentId);
-    return {
+    if (meta === undefined) {
+      // Documento não está mais vivo/`READY`/no escopo: o item inteiro cai,
+      // inclusive o `text`. Ver o bloco de doc acima.
+      droppedDocIds.add(r.documentId);
+      continue;
+    }
+    chunks.push({
       documentId: r.documentId,
-      documentName: meta?.originalFilename ?? null,
-      title: meta?.title ?? null,
-      indexValues: meta?.indexValues ?? [],
-      tags: meta?.tags ?? [],
+      documentName: meta.originalFilename,
+      title: meta.title,
+      indexValues: meta.indexValues,
+      tags: meta.tags,
       tenantId: r.tenantId,
       documentTypeName: r.documentTypeName,
       pageNumber: r.pageNumber,
       chunkIndex: r.chunkIndex,
       text: r.text,
       score: r.score,
-    };
-  });
+    });
+  }
+
+  if (droppedDocIds.size > 0) {
+    // Sinal de corrida ou de inconsistência entre `chunks` e `documents`; não é
+    // erro de requisição, mas nunca deve ser silencioso.
+    log.warn(
+      {
+        droppedResults: results.length - chunks.length,
+        droppedDocumentIds: [...droppedDocIds],
+      },
+      'resultados de busca descartados: documento sem metadados vivos no enriquecimento',
+    );
+  }
+
+  return chunks;
 }
 
 /**
@@ -403,7 +451,16 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
         pageSize,
       });
 
-      const chunks = await enrichResultsToChunks(sql, items, { singleTenantId, multiTenantIds });
+      // `chunks.length` pode ser MENOR que `items.length` quando um documento é
+      // excluído entre a busca e o enriquecimento (snapshots distintos). `total`
+      // e `pageCount` continuam vindo da query de busca — a página fica curta,
+      // que é o comportamento correto; o contrato não promete página cheia.
+      const chunks = await enrichResultsToChunks(
+        sql,
+        items,
+        { singleTenantId, multiTenantIds },
+        log,
+      );
       const pageCount = Math.ceil(total / pageSize);
 
       log.info(
@@ -583,10 +640,12 @@ export const searchRoutes: FastifyPluginAsync<SearchRoutesOptions> = async (app,
 
     const allSearchResults = [...searchResults, ...metadataChunks];
 
-    const chunks: SearchChunk[] = await enrichResultsToChunks(sql, allSearchResults, {
-      singleTenantId,
-      multiTenantIds,
-    });
+    const chunks: SearchChunk[] = await enrichResultsToChunks(
+      sql,
+      allSearchResults,
+      { singleTenantId, multiTenantIds },
+      log,
+    );
 
     if (!generateAnswer || chunks.length === 0) {
       // Este caminho não pagina: devolve o conjunto ranqueado inteiro (truncado
