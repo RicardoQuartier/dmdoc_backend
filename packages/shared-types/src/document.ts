@@ -62,3 +62,53 @@ export const DocumentSchema = z.object({
 });
 
 export type Document = z.infer<typeof DocumentSchema>;
+
+/**
+ * Body de `PATCH /documents/:id/move` — troca o departamento de um documento já
+ * enviado.
+ *
+ * Por que uma rota própria em vez de um campo no `PATCH /documents/:id`: mover
+ * é uma mudança ESTRUTURAL com efeito em ACL. A busca lexical/vetorial/híbrida
+ * filtra acesso por `chunks.department_id` (coluna denormalizada), não por
+ * `documents.department_id` — então o move precisa atualizar as duas tabelas na
+ * MESMA transação, sob pena de vazar conteúdo para quem perdeu o acesso. O
+ * PATCH comum roda fora de transação e ainda dispara uma chamada de LLM no
+ * meio, o que abriria exatamente essa janela.
+ *
+ * `departmentId` é sempre um uuid de departamento ATIVO do mesmo tenant — a
+ * rota valida existência, tenant e `deleted = false` além da ACL.
+ *
+ * Não é `.strict()`, pela mesma razão de `MoveDepartmentBodySchema`: campos
+ * extras enviados pelo cliente são descartados em silêncio, sem quebrar o front.
+ */
+export const MoveDocumentBodySchema = z.object({
+  departmentId: z.string().uuid(),
+});
+
+export type MoveDocumentBody = z.infer<typeof MoveDocumentBodySchema>;
+
+/**
+ * Teto de documentos por operação de move em massa.
+ *
+ * Deliberadamente MENOR que os demais `BULK_*_MAX` da API (500): mover exige um
+ * `UPDATE` em `chunks`, e cada linha de chunk carrega um `vector(1536)` (~6 KB).
+ * Como `department_id` é indexado (`chunks_by_tenant_department` e o GIN
+ * `chunks_fts_tenant_gin`), o HOT update é impossível — cada linha atualizada
+ * gera nova entrada no HNSW e no GIN. 100 documentos já são ~5 mil chunks
+ * reescritos numa única transação; 500 seriam ~150 MB de WAL.
+ */
+export const BULK_MOVE_MAX = 100;
+
+/**
+ * Body de `POST /documents/bulk-move` — move vários documentos para um mesmo
+ * departamento de destino, numa única transação.
+ *
+ * Semântica all-or-nothing: se qualquer id estiver fora do escopo do ator ou
+ * faltar ACL em algum departamento envolvido, nada é escrito (404).
+ */
+export const BulkMoveDocumentsBodySchema = z.object({
+  documentIds: z.array(z.string().uuid()).min(1).max(BULK_MOVE_MAX),
+  departmentId: z.string().uuid(),
+});
+
+export type BulkMoveDocumentsBody = z.infer<typeof BulkMoveDocumentsBodySchema>;

@@ -48,16 +48,19 @@ export interface PersistDeps {
  * Etapa final do pipeline: persiste os resultados no PostgreSQL.
  *
  * Sequência (idempotente — tolera reexecução):
- * 1. Deletar chunks existentes do documentId (idempotência).
- * 2. Bulk insert dos chunks com embeddings via ON CONFLICT (document_id, chunk_index) DO NOTHING.
+ * 1+2. Numa única transação: deletar os chunks existentes do documentId e fazer
+ *      o bulk insert dos novos, com `department_id` RELIDO de `documents` sob
+ *      `FOR SHARE` (ver comentário no corpo — é o que impede vazamento de ACL
+ *      quando o documento é movido de departamento durante o processamento).
  * 3. Upsert do `document_content` com fullText, extraction e costBreakdown via ON CONFLICT DO UPDATE.
  * 4. Atualizar `documents.status = READY`, `processed_at`, `cost_usd_cents`.
  * 5. Backfill de `page_count` nos `document_events` via `DocumentEventsRepository`
  *    (única mutação permitida na tabela append-only, escopada por tenantId).
  *
- * Nota: se esta função falhar após DELETE mas antes de INSERT, o
- * status volta para `FAILED` no handler do worker (o erro é re-thrown aqui,
- * e o pipeline/index.ts captura e atualiza o status).
+ * Nota: o DELETE e o INSERT dos chunks são atômicos entre si; uma falha ali
+ * desfaz os dois. Se qualquer etapa falhar, o status volta para `FAILED` no
+ * handler do worker (o erro é re-thrown aqui, e o pipeline/index.ts captura e
+ * atualiza o status).
  */
 export async function persistProcessingResult(
   params: PersistParams,
@@ -83,27 +86,72 @@ export async function persistProcessingResult(
   // Custo total do documento = embeddings + classificação (Fase 8), em centavos.
   const costUsdCents = Math.ceil((totalEmbeddingsUsd + classificationUsd) * 100);
 
-  // 1. Idempotência: remover chunks anteriores do mesmo documento
-  const deleteResult = await sql`
-    DELETE FROM chunks
-    WHERE document_id = ${documentId}
-      AND tenant_id = ${tenantId}
-  `;
+  // 1 + 2. Chunks: DELETE (idempotência) + bulk INSERT numa ÚNICA transação,
+  //        com o departamento RELIDO de `documents` sob row lock.
+  //
+  //        Por que reler em vez de usar `c.departmentId`: aquele valor foi lido
+  //        no INÍCIO do pipeline (pipeline/index.ts), antes da extração e dos
+  //        embeddings — minutos atrás. Se o documento tiver sido movido de
+  //        departamento nesse intervalo (PATCH /documents/:id/move), gravar o
+  //        valor antigo criaria chunks com `department_id` obsoleto — e a busca
+  //        filtra ACL POR ESSA COLUNA, não por `documents.department_id` (ver
+  //        packages/db-pg/src/search.ts). O resultado seria vazamento
+  //        permanente do conteúdo para quem já não deveria mais vê-lo, sem nada
+  //        que o reconciliasse depois.
+  //
+  //        O `FOR SHARE` fecha a janela nos dois sentidos:
+  //        - o move commitou antes → lemos já o valor novo;
+  //        - o persist pegou o lock primeiro → o `UPDATE documents` do move
+  //          espera este commit e, ao destravar, o `UPDATE chunks` do próprio
+  //          move corrige as linhas recém-inseridas.
+  const { deletedChunks, insertedChunks } = await sql.begin(async (tx) => {
+    const freshRows = await tx<
+      Array<{ department_id: string; document_type_id: string | null }>
+    >`
+      SELECT department_id, document_type_id
+      FROM documents
+      WHERE id = ${documentId}
+        AND tenant_id = ${tenantId}
+      FOR SHARE
+    `;
+    const fresh = freshRows[0];
 
-  log.debug(
-    { deletedChunks: deleteResult.count },
-    'chunks anteriores removidos'
-  );
+    // Fallback para o valor do início do pipeline quando o documento sumiu
+    // (excluído durante o processamento): não é papel desta etapa mudar esse
+    // comportamento — o INSERT falha ou fica órfão como já acontecia.
+    const effectiveDepartmentId =
+      fresh?.department_id ?? embeddedChunks[0]?.departmentId ?? '';
 
-  // 2. Bulk insert dos chunks via ON CONFLICT (document_id, chunk_index) DO NOTHING
-  if (embeddedChunks.length > 0) {
+    // `document_type_name` é denormalizado no chunk pelo mesmo motivo (evitar
+    // lookup na busca) e sofre da mesma defasagem — relemos junto, de graça.
+    // Nota: a auto-aplicação de tipo por IA roda só na seção 4.1, DEPOIS deste
+    // insert; nesse caminho o nome continua refletindo o tipo confirmado antes
+    // da rodada, como já era o comportamento.
+    let effectiveDocumentTypeName: string | null = null;
+    if (fresh?.document_type_id) {
+      const typeRows = await tx<Array<{ name: string }>>`
+        SELECT name FROM document_types WHERE id = ${fresh.document_type_id}
+      `;
+      effectiveDocumentTypeName = typeRows[0]?.name ?? null;
+    }
+
+    const deleteResult = await tx`
+      DELETE FROM chunks
+      WHERE document_id = ${documentId}
+        AND tenant_id = ${tenantId}
+    `;
+
+    if (embeddedChunks.length === 0) {
+      return { deletedChunks: deleteResult.count, insertedChunks: 0 };
+    }
+
     const now = new Date();
     const chunkRows = embeddedChunks.map((c) => ({
       id: newId(),
       document_id: c.documentId,
       tenant_id: c.tenantId,
-      department_id: c.departmentId,
-      document_type_name: c.documentTypeName,
+      department_id: effectiveDepartmentId,
+      document_type_name: effectiveDocumentTypeName,
       page_number: c.pageNumber,
       chunk_index: c.chunkIndex,
       text: c.text,
@@ -115,13 +163,15 @@ export async function persistProcessingResult(
     }));
 
     // postgres.js sql(rows) faz bulk insert nativo
-    await sql`
-      INSERT INTO chunks ${sql(chunkRows)}
+    await tx`
+      INSERT INTO chunks ${tx(chunkRows)}
       ON CONFLICT (document_id, chunk_index) DO NOTHING
     `;
 
-    log.debug({ chunkCount: chunkRows.length }, 'chunks inseridos');
-  }
+    return { deletedChunks: deleteResult.count, insertedChunks: chunkRows.length };
+  });
+
+  log.debug({ deletedChunks, insertedChunks }, 'chunks regravados');
 
   // 3. Upsert do document_content
   const extraction = {

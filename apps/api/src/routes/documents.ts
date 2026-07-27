@@ -5,7 +5,6 @@ import type { MultipartFile } from '@fastify/multipart';
 import {
   TenantRepository,
   DocumentEventsRepository,
-  DOCUMENT_EVENTS_COLLECTION,
   newId,
   resolveAiFeatureFlags,
   createAiReprocessBatch,
@@ -44,6 +43,8 @@ import {
   AiReprocessJobDataSchema,
   AI_REPROCESS_STEPS,
   AiReprocessStepSchema,
+  MoveDocumentBodySchema,
+  BulkMoveDocumentsBodySchema,
   type AiReprocessStep,
 } from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
@@ -64,6 +65,7 @@ import { getConfig, type Config } from '../config.js';
 import { suggestDocumentIndexes } from '../services/index-suggestion.js';
 import { classifyDocument } from '../services/classify-document.js';
 import { generateDocumentTags } from '../services/tag-generation.js';
+import { moveDocumentsToDepartment } from '../services/move-documents.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais que mapeiam as tabelas do PostgreSQL (spec §5.3)
@@ -75,13 +77,6 @@ interface TenantRow {
   disk_quota_bytes: bigint;
   user_quota: number;
   active: boolean;
-  created_at: Date;
-}
-
-interface DocumentTypeRow extends TenantDocument {
-  name: string;
-  description: string | null;
-  is_global: boolean;
   created_at: Date;
 }
 
@@ -1662,6 +1657,24 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
 
     const { id } = request.params as { id: string };
 
+    // `departmentId` é deliberadamente REJEITADO aqui: mover documento é uma
+    // mudança estrutural com efeito em ACL e exige sincronizar
+    // `chunks.department_id` na mesma transação — ver `PATCH
+    // /documents/:id/move`. Sem esta checagem o campo era descartado em
+    // silêncio pelo Zod (200 e nenhum efeito), o que passa a ser uma armadilha
+    // agora que a rota de move existe.
+    //
+    // Checagem DIRIGIDA, e não `.strict()` no schema: campos extras
+    // desconhecidos continuam sendo ignorados de propósito (o projeto evita
+    // quebrar clientes que mandam ruído inofensivo — ver comentário em
+    // `packages/shared-types/src/department.ts`).
+    const rawBody: unknown = request.body;
+    if (rawBody !== null && typeof rawBody === 'object' && 'departmentId' in rawBody) {
+      throw new ValidationError(
+        'Use PATCH /documents/:id/move para alterar o departamento do documento.'
+      );
+    }
+
     const body = PatchDocumentBodySchema.parse(request.body);
 
     let doc: DocumentRow | null;
@@ -1877,6 +1890,121 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       ...(suggestedIndexFields !== undefined ? { suggestedIndexFields } : {}),
       ...(appliedIndexValues !== undefined ? { appliedIndexValues } : {}),
     });
+  });
+
+  // =========================================================================
+  // PATCH /documents/:id/move — move o documento para outro departamento (E-9)
+  // =========================================================================
+  /**
+   * Rota DEDICADA para a mudança de departamento — o `PATCH /documents/:id`
+   * rejeita `departmentId` com 422 e aponta para cá.
+   *
+   * O motivo está no cabeçalho de `services/move-documents.ts`: mover exige
+   * atualizar `documents.department_id` e `chunks.department_id` na MESMA
+   * transação (é `chunks` que a busca usa para filtrar ACL), e o PATCH roda
+   * fora de transação, com uma chamada de LLM no meio.
+   *
+   * PERMISSÃO — SEM `requireRole`, ASSIMETRIA DELIBERADA em relação ao
+   * `POST /documents/bulk-delete` (que exige `ADMIN_ROLES`): excluir é
+   * irreversível, mover não é — basta mover de volta. Quem tem ACL de ESCRITA
+   * na origem E no destino pode mover, o que inclui o `UPLOADER`, que já podia
+   * enviar um documento novo em qualquer um desses departamentos. O papel
+   * `USER` (somente leitura) é barrado dentro de `assertCanWriteDepartment` e
+   * recebe 404, nunca 403.
+   *
+   * Documento em `PENDING`/`PROCESSING` é aceito de propósito (sem 409): a
+   * corrida com o worker foi fechada no `persist` do pipeline, que relê o
+   * departamento sob `FOR SHARE` antes de gravar os chunks.
+   */
+  app.patch('/documents/:id/move', { preHandler: app.authenticate }, async (request, reply) => {
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const sql = app.db;
+
+    // `DocumentIdParamsSchema` de verdade — ao contrário do `PATCH
+    // /documents/:id`, que lê os params crus e transforma um id não-uuid em
+    // erro 22P02 do Postgres (500) em vez de 422.
+    const { id } = DocumentIdParamsSchema.parse(request.params);
+    const { departmentId: toDepartmentId } = MoveDocumentBodySchema.parse(request.body);
+
+    const outcome = await moveDocumentsToDepartment({
+      sql,
+      userId,
+      role,
+      requestTenantId: request.tenantId ?? null,
+      allowedTenantIds: request.user?.allowedTenantIds ?? [],
+      documentIds: [id],
+      toDepartmentId,
+    });
+
+    const { tenantId } = outcome;
+    // Estado ANTES do update — o `RETURNING` da transação já traz o valor novo.
+    const before = outcome.documents[0]!;
+    const fromDepartmentId = before.department_id;
+    const moved = outcome.movedIds.length > 0;
+
+    // Relê a linha para responder com o documento COMPLETO e já atualizado
+    // (o helper devolve só as colunas que usa nas validações).
+    const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
+    const fresh = await repo.findById(id);
+    if (!fresh) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    if (!moved) {
+      // Idempotência: destino já é o departamento atual — 200, sem audit,
+      // mesma semântica do no-op de `PATCH /departments/:id/move`.
+      request.log.info(
+        {
+          tenantId,
+          userId,
+          documentId: id,
+          fromDepartmentId,
+          toDepartmentId,
+          chunksUpdated: outcome.chunksUpdated,
+          traceId: request.id,
+        },
+        'move de documento sem efeito (destino já é o departamento atual)'
+      );
+      return reply.status(200).send(rowToDocument(fresh));
+    }
+
+    const auditLogger = new AuditLogger(sql);
+    try {
+      await auditLogger.record({
+        tenantId,
+        userId,
+        action: 'document.move',
+        resource: `documents/${id}`,
+        metadata: {
+          documentId: id,
+          fromDepartmentId,
+          toDepartmentId,
+          chunksUpdated: outcome.chunksUpdated,
+          status: before.status,
+        },
+      });
+    } catch (auditError) {
+      request.log.error(
+        { err: auditError, tenantId, userId, documentId: id },
+        'falha ao registrar audit log de move de documento'
+      );
+    }
+
+    request.log.info(
+      {
+        tenantId,
+        userId,
+        documentId: id,
+        fromDepartmentId,
+        toDepartmentId,
+        chunksUpdated: outcome.chunksUpdated,
+        traceId: request.id,
+      },
+      'documento movido de departamento'
+    );
+
+    return reply.status(200).send(rowToDocument(fresh));
   });
 
   // =========================================================================
@@ -2831,6 +2959,102 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     );
 
     return reply.status(200).send({ deleted: deletedCount });
+  });
+
+  // =========================================================================
+  // POST /documents/bulk-move — move vários documentos de departamento (E-9)
+  // =========================================================================
+  /**
+   * Mesma operação do `PATCH /documents/:id/move` aplicada a um lote, numa
+   * ÚNICA transação. Toda a lógica (escopo por papel, all-or-nothing, ACL de
+   * origem e destino, destino ativo, os dois UPDATEs) vive em
+   * `services/move-documents.ts` — esta rota só valida o body, delega e
+   * registra. Bifurcar a validação aqui daria dois donos à invariante
+   * `chunks.department_id` × `documents.department_id`.
+   *
+   * Rota ESTÁTICA sob `/documents/*`, como `bulk-delete`: o roteador do Fastify
+   * (find-my-way) resolve segmento estático antes de paramétrico, então
+   * `/documents/:id` nunca captura `bulk-move`, independentemente da ordem de
+   * registro.
+   *
+   * TETO DE 100 (`BULK_MOVE_MAX`), e não os 500 dos demais `BULK_*_MAX`:
+   * mover reescreve `chunks`, e cada linha carrega um `vector(1536)` (~6 KB).
+   * Como `department_id` é indexado (`chunks_by_tenant_department` + o GIN
+   * `chunks_fts_tenant_gin`), não há HOT update — cada linha atualizada gera
+   * entrada nova no HNSW e no GIN. 100 documentos já são ~5 mil chunks numa só
+   * transação. Subir o teto exige medição em QA antes.
+   *
+   * SEM `requireRole`, pelo mesmo motivo da rota individual: mover é
+   * reversível (o `bulk-delete` não é) e exige apenas ACL de escrita nos dois
+   * lados. `USER` é barrado dentro de `assertCanWriteDepartment` → 404.
+   */
+  app.post('/documents/bulk-move', { preHandler: app.authenticate }, async (request, reply) => {
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const sql = app.db;
+
+    const { documentIds, departmentId: toDepartmentId } = BulkMoveDocumentsBodySchema.parse(
+      request.body
+    );
+
+    // Dedupe também aqui (o helper deduplica de novo, por ser a fronteira dele)
+    // porque `requested` da resposta precisa contar documentos, não ids.
+    const dedupedIds = [...new Set(documentIds)];
+
+    const outcome = await moveDocumentsToDepartment({
+      sql,
+      userId,
+      role,
+      requestTenantId: request.tenantId ?? null,
+      allowedTenantIds: request.user?.allowedTenantIds ?? [],
+      documentIds: dedupedIds,
+      toDepartmentId,
+    });
+
+    const { tenantId } = outcome;
+    // Fonte de verdade da contagem é o `RETURNING` da transação, NUNCA
+    // `foundDocs.length`: documento que já estava no destino não é "movido".
+    const movedCount = outcome.movedIds.length;
+
+    if (movedCount > 0) {
+      const auditLogger = new AuditLogger(sql);
+      try {
+        await auditLogger.record({
+          tenantId,
+          userId,
+          action: 'document.bulk_move',
+          resource: 'documents/bulk-move',
+          metadata: {
+            documentIds: outcome.movedIds,
+            count: movedCount,
+            toDepartmentId,
+            fromDepartmentIds: outcome.fromDepartmentIds,
+            chunksUpdated: outcome.chunksUpdated,
+          },
+        });
+      } catch (auditError) {
+        request.log.error(
+          { err: auditError, tenantId, userId, count: movedCount },
+          'falha ao registrar audit log de move em massa'
+        );
+      }
+    }
+
+    request.log.info(
+      {
+        tenantId,
+        userId,
+        requested: dedupedIds.length,
+        moved: movedCount,
+        fromDepartmentIds: outcome.fromDepartmentIds,
+        toDepartmentId,
+        chunksUpdated: outcome.chunksUpdated,
+        traceId: request.id,
+      },
+      movedCount > 0 ? 'documentos movidos em massa' : 'move em massa sem efeito'
+    );
+
+    return reply.status(200).send({ moved: movedCount, requested: dedupedIds.length });
   });
 
   // =========================================================================

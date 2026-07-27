@@ -28,7 +28,6 @@ import {
   bigint,
   timestamp,
   jsonb,
-  primaryKey,
   unique,
   uniqueIndex,
   index,

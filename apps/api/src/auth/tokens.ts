@@ -1,6 +1,6 @@
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
-import { RoleSchema, type Role } from '@dmdoc/shared-types';
+import { RoleSchema } from '@dmdoc/shared-types';
 import type { Config } from '../config.js';
 
 /**
