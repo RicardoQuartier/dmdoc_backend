@@ -47,6 +47,20 @@ const ListDepartmentsQuerySchema = z.object({
     .enum(['true', 'false'])
     .optional()
     .transform((v) => v === 'true'),
+  /**
+   * `readable=true` → filtro de LEITURA: subárvore expandida das raízes
+   * concedidas, SEM o gate por papel do `writable`. É o que o filtro de
+   * departamentos da tela de Busca precisa: um `USER` lê (e busca) na subárvore
+   * concedida, mesmo não podendo escrever em lugar nenhum.
+   *
+   * Não confundir com `writable=true` (destino de upload/move, exige papel
+   * >= UPLOADER) nem com a listagem crua (gestão: todos os deptos do tenant).
+   * Se os dois vierem juntos, `writable` vence — é o mais restritivo.
+   */
+  readable: z
+    .enum(['true', 'false'])
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 const CreateDepartmentBodySchema = z.object({
@@ -91,7 +105,11 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
    * GET /departments — retorna departamentos em array plano ordenado.
    */
   app.get('/departments', { preHandler: app.authenticate }, async (request, reply) => {
-    const { tenantId: tenantIdParam, writable } = ListDepartmentsQuerySchema.parse(request.query);
+    const {
+      tenantId: tenantIdParam,
+      writable,
+      readable,
+    } = ListDepartmentsQuerySchema.parse(request.query);
     const sql = app.db;
     const role = request.user?.role;
 
@@ -201,6 +219,24 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
         aclTenantId,
         role ?? ''
       );
+      if (accessible !== null) {
+        const accessibleSet = new Set(accessible);
+        items = items.filter((dept) => accessibleSet.has(dept.id));
+      }
+    } else if (readable) {
+      // Filtro de LEITURA — mesma ACL por raiz do `writable`, mas SEM o gate por
+      // papel: a concessão de raiz já dá leitura da subárvore inteira, e o papel
+      // só limita a ESCRITA (wiki "Permissões por departamento (ACL)"). Sem este
+      // ramo, a tela de Busca pedia `writable=true` para montar o filtro de
+      // departamentos e o `USER` recebia lista vazia — sem conseguir filtrar por
+      // departamentos que ele enxerga e busca normalmente.
+      const userId = request.user?.sub;
+      if (typeof userId !== 'string') {
+        throw new Error('userId ausente no contexto da request');
+      }
+
+      // `null` = admin sem restrição de ACL: devolve a árvore inteira do escopo.
+      const accessible = await resolveAccessibleDepartmentIds(sql, userId, aclTenantId, role ?? '');
       if (accessible !== null) {
         const accessibleSet = new Set(accessible);
         items = items.filter((dept) => accessibleSet.has(dept.id));
