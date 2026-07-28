@@ -432,4 +432,107 @@ describe('GET /departments?writable=true — filtro de escrita (seletor de uploa
     // independente da ACL de escrita.
     expect(ids).toEqual([FINANCEIRO, CONTAS_A_PAGAR, RH].sort());
   });
+
+  /**
+   * `readable=true` — filtro de LEITURA (filtro de departamentos da tela de Busca).
+   *
+   * Bug corrigido: a tela de Busca pedia `writable=true` para montar o filtro, e
+   * o gate por papel do ramo `writable` devolvia lista vazia para `USER` — o
+   * combo aparecia como "Sem departamentos disponíveis" mesmo com raiz concedida.
+   * A leitura vem da CONCESSÃO; o papel só limita a ESCRITA.
+   */
+  describe('GET /departments?readable=true — filtro de leitura (tela de Busca)', () => {
+    it('USER com raiz concedida → subárvore concedida (não vazio, ao contrário do writable)', async () => {
+      await seedTreeAndActors();
+      await grantRoot(USER_A_ID, FINANCEIRO);
+      const token = await login('user-a@empresa.com');
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/departments?readable=true',
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
+      // Financeiro + Contas a Pagar; RH (raiz não concedida) fica de fora.
+      expect(ids).toEqual([FINANCEIRO, CONTAS_A_PAGAR].sort());
+    });
+
+    it('USER sem nenhuma raiz concedida → [] (200)', async () => {
+      await seedTreeAndActors();
+      const token = await login('user-a@empresa.com');
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/departments?readable=true',
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual([]);
+    });
+
+    it('UPLOADER com raiz concedida → mesma subárvore do writable', async () => {
+      await seedTreeAndActors();
+      await grantRoot(UPLOADER_A_ID, FINANCEIRO);
+      const token = await login('uploader-a@empresa.com');
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/departments?readable=true',
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
+      expect(ids).toEqual([FINANCEIRO, CONTAS_A_PAGAR].sort());
+    });
+
+    it('TENANT_ADMIN → todos os deptos ATIVOS do tenant (ACL resolve para sem restrição)', async () => {
+      await seedTreeAndActors();
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/departments?readable=true',
+        headers: { authorization: `Bearer ${tokenA}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const ids = (res.json() as Array<{ id: string }>).map((d) => d.id).sort();
+      expect(ids).toEqual([FINANCEIRO, CONTAS_A_PAGAR, RH].sort());
+      expect(ids).not.toContain(DEPT_TENANT_B);
+    });
+
+    it('multi-tenant: USER do TENANT_A nunca enxerga depto do TENANT_B', async () => {
+      await seedTreeAndActors();
+      await grantRoot(USER_A_ID, FINANCEIRO);
+      const token = await login('user-a@empresa.com');
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/departments?readable=true',
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const ids = (res.json() as Array<{ id: string }>).map((d) => d.id);
+      expect(ids).not.toContain(DEPT_TENANT_B);
+    });
+
+    it('writable vence quando os dois vêm juntos (mais restritivo): USER → []', async () => {
+      await seedTreeAndActors();
+      await grantRoot(USER_A_ID, FINANCEIRO);
+      const token = await login('user-a@empresa.com');
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/departments?readable=true&writable=true',
+        headers: { authorization: `Bearer ${token}` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual([]);
+    });
+  });
 });
