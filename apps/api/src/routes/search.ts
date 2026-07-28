@@ -41,6 +41,14 @@ type DocMetaRow = {
   document_type_id: string | null;
   index_values: Record<string, string | number | null> | null;
   tags: string[] | null;
+  department_id: string;
+  mime_type: string;
+};
+
+/** Linha da query em lote de caminho de departamento (`leaf_id` → nomes raiz→folha). */
+type DeptPathRow = {
+  leaf_id: string;
+  path: string[];
 };
 
 /** Campo de índice showOnSearch de um tipo de documento (query em lote). */
@@ -58,6 +66,10 @@ type DocMeta = {
   title: string | null;
   indexValues: SearchChunkIndexValue[];
   tags: string[];
+  departmentId: string;
+  /** Nomes da RAIZ até o departamento, inclusive. Vazio só em dado inconsistente. */
+  departmentPath: string[];
+  mimeType: string;
 };
 
 /**
@@ -191,7 +203,8 @@ async function enrichResultsToChunks(
           : sql``;
 
     const docRows = await sql<DocMetaRow[]>`
-      SELECT d.id, d.original_filename, d.title, d.document_type_id, d.index_values, d.tags
+      SELECT d.id, d.original_filename, d.title, d.document_type_id, d.index_values, d.tags,
+             d.department_id, d.mime_type
       FROM documents d
       WHERE d.id = ANY(${uniqueDocIds}::uuid[])
         AND d.deleted = false
@@ -223,6 +236,51 @@ async function enrichResultsToChunks(
       }
     }
 
+    // Caminho do departamento (raiz → folha) dos documentos da página, numa
+    // query só — os departamentos DISTINTOS, subindo pela cadeia de `parent_id`.
+    //
+    // Resolver isso no servidor (e não no front, a partir da lista de
+    // departamentos) é o que faz o caminho vir COMPLETO para quem tem ACL
+    // restrita: `resolveAccessibleDepartmentIds` entrega ao front apenas a
+    // subárvore da raiz concedida, então um USER com acesso a "Notas Fiscais"
+    // veria "Notas Fiscais / 2026" sem o "Financeiro" acima.
+    //
+    // Detalhes que NÃO são cosméticos:
+    //  - `ORDER BY depth DESC` porque a recursão SOBE: o maior `depth` é a raiz.
+    //  - `CYCLE id SET is_cycle USING path` (pg14+; rodamos pg16) evita loop
+    //    infinito se os dados já contiverem um ciclo herdado — mesma proteção do
+    //    move de departamento (`routes/departments.ts`).
+    //  - a recursão NÃO filtra `deleted`: ancestral soft-deletado continua sendo
+    //    elo real da cadeia de `parent_id` (mesma escolha de
+    //    `auth/department-access.ts`), e filtrar abriria buraco no meio do caminho.
+    //  - o `tenantFilter` da query acima é reaproveitado na ÂNCORA porque ele é
+    //    escrito sobre o alias `d` — daí a âncora manter esse alias. Os leaves já
+    //    vêm de documentos autorizados, mas o filtro fica como rede de segurança:
+    //    multi-tenancy é inegociável.
+    const deptPathMap = new Map<string, string[]>();
+    const uniqueDeptIds = [...new Set(docRows.map((d) => d.department_id))];
+
+    if (uniqueDeptIds.length > 0) {
+      const pathRows = await sql<DeptPathRow[]>`
+        WITH RECURSIVE chain AS (
+          SELECT d.id AS leaf_id, d.id, d.parent_id, d.name, 0 AS depth
+            FROM departments d
+           WHERE d.id = ANY(${uniqueDeptIds}::uuid[])
+             ${tenantFilter}
+          UNION ALL
+          SELECT c.leaf_id, p.id, p.parent_id, p.name, c.depth + 1
+            FROM departments p
+            JOIN chain c ON p.id = c.parent_id
+        ) CYCLE id SET is_cycle USING path
+        SELECT leaf_id, array_agg(name ORDER BY depth DESC) AS path
+          FROM chain
+         GROUP BY leaf_id
+      `;
+      for (const row of pathRows) {
+        deptPathMap.set(row.leaf_id, row.path);
+      }
+    }
+
     for (const d of docRows) {
       const fields = d.document_type_id !== null ? fieldsByType.get(d.document_type_id) ?? [] : [];
       const values = d.index_values ?? {};
@@ -242,6 +300,12 @@ async function enrichResultsToChunks(
         title: d.title,
         indexValues,
         tags: d.tags ?? [],
+        departmentId: d.department_id,
+        // Departamento sem linha na CTE é dado inconsistente, não motivo para
+        // derrubar o resultado: o descarte é reservado a documento sem metadados
+        // vivos. O front já trata caminho vazio omitindo a linha.
+        departmentPath: deptPathMap.get(d.department_id) ?? [],
+        mimeType: d.mime_type,
       });
     }
   }
@@ -265,6 +329,13 @@ async function enrichResultsToChunks(
       tags: meta.tags,
       tenantId: r.tenantId,
       documentTypeName: r.documentTypeName,
+      // Departamento ATUAL do documento, lido de `documents` — a fonte canônica.
+      // `chunks.department_id` é cópia denormalizada (mantida em sincronia pelo
+      // move, na mesma transação); ler da fonte tira a exibição dessa dependência,
+      // e o caminho por chunk nem sempre carrega o campo até aqui.
+      departmentId: meta.departmentId,
+      departmentPath: meta.departmentPath,
+      mimeType: meta.mimeType,
       pageNumber: r.pageNumber,
       chunkIndex: r.chunkIndex,
       text: r.text,

@@ -104,6 +104,26 @@ export type SearchChunkIndexValue = z.infer<typeof SearchChunkIndexValueSchema>;
  * SUGERIDAS pela IA (`document_content.suggested_tags`) nunca aparecem aqui: só
  * o confirmado pelo usuário vale na busca. Array vazio quando o documento não
  * tem tags.
+ *
+ * `departmentId`, `departmentPath` e `mimeType` (E-10 / T-87) respondem "onde
+ * está" e "o que é" o documento, para o card ser reconhecível sem abrir:
+ *
+ * - `departmentId` é o departamento ATUAL do documento, lido de `documents` — a
+ *   fonte canônica. `chunks.department_id` é cópia denormalizada (o move
+ *   atualiza as duas na mesma transação); a exibição não depende dessa sincronia.
+ * - `departmentPath` vai da RAIZ até o departamento, INCLUSIVE:
+ *   `["Financeiro", "Notas Fiscais", "2026"]`. O último elemento é onde o
+ *   documento está; os anteriores são o caminho até lá. Vem COMPLETO mesmo
+ *   quando quem busca só tem ACL de um ramo abaixo da raiz — nome de
+ *   departamento-pai não é dado sigiloso, e caminho truncado confunde mais do
+ *   que informa. Array vazio só em dado inconsistente (departamento sumido).
+ * - `mimeType` é o mime CRU (`documents.mime_type`). O rótulo legível
+ *   (PDF/DOCX/TXT) é derivado no front por `fileFormatLabel` — o backend não
+ *   formata.
+ *
+ * Os três são NÃO-NULOS: o enriquecimento descarta o item inteiro quando não
+ * encontra os metadados vivos do documento (barreira do T-99), então todo chunk
+ * que chega aqui tem documento vivo e, portanto, departamento e mime.
  */
 export const SearchChunkSchema = z.object({
   documentId: z.string(),
@@ -113,6 +133,9 @@ export const SearchChunkSchema = z.object({
   tags: z.array(z.string()),
   tenantId: z.string().nullable(),
   documentTypeName: z.string().nullable(),
+  departmentId: z.string(),
+  departmentPath: z.array(z.string()),
+  mimeType: z.string(),
   pageNumber: z.number().nullable(),
   chunkIndex: z.number(),
   text: z.string(),
