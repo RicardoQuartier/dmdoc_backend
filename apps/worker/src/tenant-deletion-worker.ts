@@ -3,10 +3,12 @@ import type { Logger } from 'pino';
 import type { Sql } from 'postgres';
 import { purgeTenantData } from '@dmdoc/db-pg';
 import { TenantDeletionJobDataSchema } from '@dmdoc/shared-types';
+import type { S3Config } from '@dmdoc/storage';
 import { config } from './config.js';
 import { createRedisConnection } from './redis.js';
 import { TENANT_DELETION_QUEUE, type TenantDeletionJobData } from './queues.js';
-import type { WorkerS3 } from './s3.js';
+import type { StorageForTenant } from './storage.js';
+import { purgeTenantStorage } from './tenant-storage-purge.js';
 
 /**
  * Concorrência baixa: a purga de uma empresa é pesada (transação grande no
@@ -21,8 +23,14 @@ const TENANT_DELETION_CONCURRENCY = 1;
  */
 export interface TenantDeletionWorkerDeps {
   sql: Sql;
-  s3: WorkerS3;
+  /** Resolve o destino de armazenamento — por CONFIGURAÇÃO, não só o ativo. */
+  storage: StorageForTenant;
   logger: Logger;
+  /**
+   * Bucket DA PLATAFORMA. Necessário para identificar o destino de plataforma na
+   * varredura: ele é o único que não tem linha em `tenant_storage_configs`.
+   */
+  platformS3Config: S3Config;
 }
 
 /**
@@ -30,8 +38,24 @@ export interface TenantDeletionWorkerDeps {
  *
  * O payload é revalidado na borda do worker com `TenantDeletionJobDataSchema`
  * (mesmo schema usado pelo produtor na API). `purgeTenantData` é idempotente,
- * então o retry exponencial da fila é seguro após falha parcial — a remoção do
- * storage é feita via callback `deleteS3Prefix`.
+ * então o retry exponencial da fila é seguro após falha parcial — a remoção dos
+ * arquivos é feita via callback `deleteStoragePrefix`.
+ *
+ * ## O que o callback faz (T-142)
+ *
+ * Varre o prefixo em TODOS os destinos que a empresa já usou, não apenas no
+ * atual: configurações ativas e aposentadas, mais o bucket da plataforma quando
+ * ainda houver documento apontando para lugar nenhum. Uma empresa com migração
+ * pela metade — ou concluída sem `cleanup-source` — tem o acervo em dois lugares
+ * ao mesmo tempo, e varrer só o corrente deixaria arquivo de cliente para trás.
+ * O levantamento, a deduplicação por lugar físico e a tolerância a falha por
+ * destino estão em `tenant-storage-purge.ts`.
+ *
+ * A resolução acontece DENTRO do callback, e não no boot, porque o destino é por
+ * empresa e este worker atende todas. E o callback roda ANTES da transação de
+ * banco (inversão deliberada da T-142): é lá que estão tanto as credenciais
+ * (`tenant_storage_configs.encrypted_secret`) quanto o inventário de destinos
+ * (`documents.storage_config_id`) — depois da purga, nenhum dos dois existe.
  */
 function createTenantDeletionProcessor(deps: TenantDeletionWorkerDeps) {
   return async (job: Job<TenantDeletionJobData>): Promise<void> => {
@@ -40,7 +64,20 @@ function createTenantDeletionProcessor(deps: TenantDeletionWorkerDeps) {
     deps.logger.info({ jobId: job.id, tenantId }, 'iniciando purga de tenant');
 
     await purgeTenantData(deps.sql, tenantId, {
-      deleteS3Prefix: (prefix) => deps.s3.deleteByPrefix(prefix),
+      // `tenantId` vem do contrato (e não do closure) de propósito: é a chave
+      // com que a varredura levanta os destinos.
+      deleteStoragePrefix: async ({ tenantId: target, prefix }) => {
+        await purgeTenantStorage(
+          {
+            sql: deps.sql,
+            storage: deps.storage,
+            logger: deps.logger,
+            platformS3Config: deps.platformS3Config,
+          },
+          target,
+          prefix
+        );
+      },
       logger: deps.logger,
     });
   };

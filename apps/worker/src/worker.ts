@@ -10,13 +10,15 @@ import { logger } from './logger.js';
 import { createRedisConnection } from './redis.js';
 import {
   DOCUMENT_PROCESSING_QUEUE,
+  STORAGE_MIGRATION_QUEUE,
   TENANT_DELETION_QUEUE,
   type DocumentProcessingJobData,
 } from './queues.js';
 import { runPipeline, type PipelineDeps } from './pipeline/index.js';
-import { createWorkerS3 } from './s3.js';
+import { buildPlatformS3Config, createWorkerStorage } from './storage.js';
 import { createTenantDeletionWorker } from './tenant-deletion-worker.js';
 import { createAiReprocessWorker } from './ai-reprocess-worker.js';
+import { createStorageMigrationWorker } from './storage-migration-worker.js';
 
 /**
  * Concorrência do worker (spec §8).
@@ -130,8 +132,12 @@ async function main(): Promise<void> {
     'extractor Redis criado'
   );
 
+  // Destino de armazenamento por empresa. A config do `.env` deixa de ser "o
+  // storage" e passa a ser o FALLBACK de plataforma, exatamente como na API.
+  const storage = createWorkerStorage(sql, config);
+
   const deps: PipelineDeps = {
-    s3Bucket: config.AWS_S3_BUCKET,
+    storage,
     extractor,
     openai,
     embeddingModel: config.EMBEDDING_MODEL,
@@ -141,6 +147,7 @@ async function main(): Promise<void> {
     logger,
     chunkTargetTokens: config.CHUNK_TARGET_TOKENS,
     chunkOverlapTokens: config.CHUNK_OVERLAP_TOKENS,
+    downloadUrlTtlSecs: config.EXTRACT_URL_TTL_SECS,
     indexSuggestionMinConfidence: config.DMDOC_INDEX_SUGGESTION_MIN_CONFIDENCE,
   };
 
@@ -153,8 +160,16 @@ async function main(): Promise<void> {
 
   // Worker de exclusão de empresa (tenant). Sobe ao lado do worker de documentos
   // e consome a fila `tenant-deletion`, executando a purga pesada em background.
-  const s3 = createWorkerS3(config);
-  const tenantDeletionWorker = createTenantDeletionWorker({ sql, s3, logger });
+  // Recebe o MESMO resolvedor: os arquivos da empresa purgada saem de TODOS os
+  // destinos que ela já usou (T-142), não do bucket da plataforma por default.
+  // A config da plataforma entra porque o bucket dela é o único destino sem
+  // linha em `tenant_storage_configs` para descrevê-lo.
+  const tenantDeletionWorker = createTenantDeletionWorker({
+    sql,
+    storage,
+    logger,
+    platformS3Config: buildPlatformS3Config(config),
+  });
 
   logger.info(
     { queue: TENANT_DELETION_QUEUE },
@@ -177,9 +192,24 @@ async function main(): Promise<void> {
     'worker de reprocessamento de IA iniciado e ouvindo a fila'
   );
 
+  // Worker de migração de acervo entre destinos (épico E-11 / T-141). Recebe o
+  // MESMO resolvedor: ele precisa abrir a configuração de ORIGEM de cada
+  // documento (aposentada, inclusive) e a ATIVA, que é o destino.
+  const storageMigrationWorker = createStorageMigrationWorker({ sql, storage, logger });
+
+  logger.info(
+    { queue: STORAGE_MIGRATION_QUEUE },
+    'worker de migração de acervo iniciado e ouvindo a fila'
+  );
+
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, 'encerrando worker');
-    await Promise.all([worker.close(), tenantDeletionWorker.close(), aiReprocessWorker.close()]);
+    await Promise.all([
+      worker.close(),
+      tenantDeletionWorker.close(),
+      aiReprocessWorker.close(),
+      storageMigrationWorker.close(),
+    ]);
     extractionPushConn.disconnect();
     await sql.end();
     process.exit(0);

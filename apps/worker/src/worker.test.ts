@@ -15,9 +15,12 @@ import {
  * apenas validar config e a construção da fila, não exercitar a fila.
  */
 
+/** Chave mestra de storage válida (32 bytes em hex), exigida pelo schema. */
+const STORAGE_SECRET_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
 describe('config', () => {
   it('aplica defaults e valida o ambiente', () => {
-    const config = loadConfig({});
+    const config = loadConfig({ STORAGE_SECRET_KEY });
 
     expect(config.NODE_ENV).toBe('development');
     expect(config.LOG_LEVEL).toBe('info');
@@ -29,6 +32,7 @@ describe('config', () => {
       NODE_ENV: 'test',
       LOG_LEVEL: 'silent',
       REDIS_URL: 'redis://cache:6380',
+      STORAGE_SECRET_KEY,
     });
 
     expect(config.NODE_ENV).toBe('test');
@@ -37,15 +41,24 @@ describe('config', () => {
   });
 
   it('rejeita REDIS_URL inválida', () => {
-    expect(() => loadConfig({ REDIS_URL: 'not-a-url' })).toThrow(
+    expect(() => loadConfig({ REDIS_URL: 'not-a-url', STORAGE_SECRET_KEY })).toThrow(
       /Configuração de ambiente inválida/
     );
   });
 
   it('rejeita LOG_LEVEL fora do enum', () => {
-    expect(() => loadConfig({ LOG_LEVEL: 'verbose' })).toThrow(
+    expect(() => loadConfig({ LOG_LEVEL: 'verbose', STORAGE_SECRET_KEY })).toThrow(
       /Configuração de ambiente inválida/
     );
+  });
+
+  it('rejeita boot sem STORAGE_SECRET_KEY', () => {
+    // Falhar no boot, e não no primeiro job de uma empresa com destino próprio.
+    expect(() => loadConfig({})).toThrow(/STORAGE_SECRET_KEY/);
+  });
+
+  it('rejeita STORAGE_SECRET_KEY com tamanho errado', () => {
+    expect(() => loadConfig({ STORAGE_SECRET_KEY: 'abcdef' })).toThrow(/32 bytes/);
   });
 });
 

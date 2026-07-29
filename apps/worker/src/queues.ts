@@ -3,6 +3,7 @@ import {
   type DocumentProcessingJobData,
   type TenantDeletionJobData,
   type AiReprocessJobData,
+  type StorageMigrationJobData,
 } from '@dmdoc/shared-types';
 
 export type {
@@ -97,6 +98,56 @@ export function createAiReprocessQueue(
     connection,
     defaultJobOptions: {
       attempts: 1,
+    },
+  });
+}
+
+/**
+ * Nome da fila de migração de acervo entre destinos de armazenamento
+ * (épico E-11 / T-141).
+ *
+ * Enfileirada pela API (`POST /admin/tenants/:id/storage/migrate`) depois de
+ * criar a linha em `storage_migrations`; consumida pelo worker dedicado, que
+ * copia os arquivos dos destinos anteriores para o ativo.
+ */
+export const STORAGE_MIGRATION_QUEUE = 'storage-migration';
+
+/**
+ * Payload do job de migração de acervo.
+ *
+ * `migrationId` é a linha de `storage_migrations` — a autoridade sobre o estado
+ * da migração (progresso, cancelamento, resultado). O job carrega só o id: o
+ * destino e a lista de documentos são resolvidos NO WORKER, no instante em que
+ * ele começa, e não congelados no payload. Congelá-los reintroduziria a janela
+ * em que a fila trabalha sobre um mundo que já mudou.
+ *
+ * O schema nasceu declarado aqui, enquanto `@dmdoc/shared-types` não tinha a
+ * forma; promovido para lá (dona: violet-chan), este arquivo volta a ser só o
+ * ponto de re-exportação, como já é para os outros três jobs acima. Duas
+ * declarações da MESMA forma é o que produz produtor e consumidor validando
+ * contratos que divergiram sem ninguém perceber.
+ */
+export {
+  StorageMigrationJobDataSchema,
+  type StorageMigrationJobData,
+} from '@dmdoc/shared-types';
+
+/**
+ * Fábrica da fila de migração de acervo.
+ *
+ * `attempts: 3` com backoff exponencial: a migração é idempotente e RETOMÁVEL —
+ * uma nova tentativa reseleciona o que ainda falta (`IS DISTINCT FROM`) e não
+ * recopia o que já passou. Diferente do `ai-reprocess`, aqui o retry não
+ * corrompe contador nenhum, porque os contadores são zerados a cada passada.
+ */
+export function createStorageMigrationQueue(
+  connection: ConnectionOptions
+): Queue<StorageMigrationJobData> {
+  return new Queue<StorageMigrationJobData>(STORAGE_MIGRATION_QUEUE, {
+    connection,
+    defaultJobOptions: {
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 5000 },
     },
   });
 }
