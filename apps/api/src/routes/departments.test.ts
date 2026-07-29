@@ -81,7 +81,7 @@ describe('DELETE /departments/:id — preserva documentos e permissões', () => 
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, tags, index_values, uploaded_by_id, uploaded_at, deleted
+        storage_key, status, tags, index_values, uploaded_by_id, uploaded_at, deleted
       ) VALUES (
         ${docId}, ${TENANT_A}, ${deptId}, NULL,
         'nota-fiscal.pdf', 'nota-fiscal.pdf', ${newId()}, 1024, 'application/pdf',
@@ -182,7 +182,7 @@ describe('GET /departments — documentCount', () => {
 
     // 2 documentos ativos + 1 deletado
     await testDb.db`
-      INSERT INTO documents (id, tenant_id, department_id, document_type_id, filename, original_filename, content_hash, size_bytes, mime_type, s3_key, status, tags, index_values, uploaded_by_id, uploaded_at, deleted)
+      INSERT INTO documents (id, tenant_id, department_id, document_type_id, filename, original_filename, content_hash, size_bytes, mime_type, storage_key, status, tags, index_values, uploaded_by_id, uploaded_at, deleted)
       VALUES
         (${newId()}, ${TENANT_A}, ${deptComDocs}, NULL, 'f1.pdf', 'f1.pdf', ${newId()}, 100, 'application/pdf', 'k1', 'READY', '{}'::text[], '{}'::jsonb, ${ADMIN_A_ID}, NOW(), false),
         (${newId()}, ${TENANT_A}, ${deptComDocs}, NULL, 'f2.pdf', 'f2.pdf', ${newId()}, 100, 'application/pdf', 'k2', 'READY', '{}'::text[], '{}'::jsonb, ${ADMIN_A_ID}, NOW(), false),

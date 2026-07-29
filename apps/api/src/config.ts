@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parseSecretKey } from '@dmdoc/storage';
 
 /**
  * Schema de variáveis de ambiente da API.
@@ -46,6 +47,26 @@ const EnvSchema = z.object({
     .string()
     .transform((v) => v === 'true')
     .default('false'),
+
+  // Chave mestra (AES-256-GCM, 32 bytes em hexadecimal) que cifra o segredo de
+  // armazenamento de cada empresa em `tenant_storage_configs.encrypted_secret`
+  // (épico E-11). Validada com `parseSecretKey` AQUI, no boot: uma chave com
+  // tamanho errado só apareceria no primeiro upload de um cliente com bucket
+  // próprio, muito depois do deploy que a quebrou.
+  // Trocar a chave torna ilegível todo segredo já gravado.
+  STORAGE_SECRET_KEY: z
+    .string()
+    .min(1, 'STORAGE_SECRET_KEY é obrigatória')
+    .superRefine((value, ctx) => {
+      try {
+        parseSecretKey(value);
+      } catch (error) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: error instanceof Error ? error.message : 'chave inválida',
+        });
+      }
+    }),
 
   // Redis — BullMQ (spec §12). Fila de processamento de documentos.
   REDIS_URL: z.string().min(1, 'REDIS_URL é obrigatória'),

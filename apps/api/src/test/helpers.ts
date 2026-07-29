@@ -1,7 +1,33 @@
 import { createPgClient, type Sql } from '@dmdoc/db-pg';
+import type { StorageDriver, StorageResolver } from '@dmdoc/storage';
 import { loadConfig, type Config } from '../config.js';
 import { hashPassword } from '../auth/password.js';
 import type { UserDocument } from '../auth/user-store.js';
+
+/** Chave mestra de storage usada em teste (32 bytes em hexadecimal). */
+export const TEST_STORAGE_SECRET_KEY_HEX =
+  '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+/**
+ * Resolvedor de storage que devolve SEMPRE o mesmo driver, para qualquer
+ * empresa.
+ *
+ * É o que a maioria dos testes quer: eles não exercitam storage por empresa,
+ * só precisam de um destino falso que não chame o SDK. Quem testa a resolução
+ * por empresa injeta um `createStorageResolver` de verdade, com um banco de
+ * teste e fábricas de driver falsas (ver `documents-storage-per-tenant.test.ts`).
+ */
+export function staticStorage(driver: StorageDriver): StorageResolver {
+  return {
+    forTenant: () => Promise.resolve(driver),
+    // `storageConfigId: null` = S3 da plataforma, que é onde todo documento
+    // desses testes nasce — o mesmo estado de todo o acervo anterior ao E-11.
+    activeDestination: () => Promise.resolve({ driver, storageConfigId: null }),
+    forStorageConfig: () => Promise.resolve(driver),
+    invalidate: () => undefined,
+    invalidateAll: () => undefined,
+  };
+}
 
 /**
  * Config hermética para testes — injeta segredos JWT e DATABASE_URL fixos,
@@ -9,8 +35,9 @@ import type { UserDocument } from '../auth/user-store.js';
  * os testes que precisam de banco injetam um `Sql` real via `buildApp({ db })`,
  * então a conexão via config nunca é usada na prática.
  *
- * AWS/S3: placeholders — os testes de upload injetam um mock de S3Service via
- * `buildApp({ s3: mockS3 })`, portanto nunca chamam o SDK real.
+ * AWS/S3: placeholders — os testes de upload injetam um driver falso via
+ * `buildApp({ storage: staticStorage(mockDriver) })`, portanto nunca chamam o
+ * SDK real.
  * REDIS_URL: placeholder — os testes injetam `queue: null` em `buildApp`,
  * portanto nunca conectam ao Redis.
  */
@@ -28,6 +55,9 @@ export function testConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): Config {
     AWS_S3_BUCKET: 'test-bucket',
     AWS_ACCESS_KEY_ID: 'test-key-id',
     AWS_SECRET_ACCESS_KEY: 'test-secret-key',
+    // Chave mestra de storage — 32 bytes em hex. Valor fixo de teste: nenhum
+    // segredo real é cifrado com ela.
+    STORAGE_SECRET_KEY: TEST_STORAGE_SECRET_KEY_HEX,
     // Redis — placeholder; queue: null injetado via buildApp
     REDIS_URL: 'redis://placeholder:6379',
     // Rate limit efetivamente desligado nos testes: a suíte E2E dispara centenas
@@ -70,6 +100,8 @@ export async function resetDomainTables(db: Sql): Promise<void> {
       documents,
       global_type_tenant_depts,
       platform_settings,
+      storage_migrations,
+      tenant_storage_configs,
       tenants,
       users
     RESTART IDENTITY CASCADE

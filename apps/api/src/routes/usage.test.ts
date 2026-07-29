@@ -1,19 +1,20 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb } from '../test/helpers.js';
-import type { S3Service } from '../services/s3.js';
+import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb, staticStorage } from '../test/helpers.js';
+import type { StorageDriver } from '@dmdoc/storage';
 import { newId } from '@dmdoc/db-pg';
 
 // ---------------------------------------------------------------------------
 // Mock S3
 // ---------------------------------------------------------------------------
-function createMockS3(): S3Service {
+function createMockS3(): StorageDriver {
   return {
-    uploadFile: async () => undefined,
-    getSignedDownloadUrl: async () => 'https://mock',
-    deleteFile: async () => undefined,
-  } as unknown as S3Service;
+    provider: 's3',
+    put: async () => undefined,
+    getDownloadUrl: async () => 'https://mock',
+    delete: async () => undefined,
+  } as unknown as StorageDriver;
 }
 
 // ---------------------------------------------------------------------------
@@ -44,7 +45,7 @@ beforeAll(async () => {
     config: testConfig(),
     db: testDb.db,
     queue: null,
-    s3: createMockS3(),
+    storage: staticStorage(createMockS3()),
   });
 });
 
@@ -117,7 +118,7 @@ async function insertDocument(
     INSERT INTO documents (
       id, tenant_id, department_id, document_type_id,
       filename, original_filename, content_hash, size_bytes, mime_type,
-      s3_key, status, failure_reason, tags, index_values,
+      storage_key, status, failure_reason, tags, index_values,
       uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
     ) VALUES (
       ${id}, ${tenantId}, ${deptId}, NULL,

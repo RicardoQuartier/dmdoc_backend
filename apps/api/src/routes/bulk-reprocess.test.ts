@@ -3,8 +3,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import type { FastifyInstance } from 'fastify';
 import type { Queue } from 'bullmq';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
-import type { S3Service } from '../services/s3.js';
+import { startTestDb, seedUser, testConfig, type TestDb, staticStorage } from '../test/helpers.js';
+import type { StorageDriver } from '@dmdoc/storage';
 import { newId } from '@dmdoc/db-pg';
 
 /**
@@ -28,12 +28,13 @@ import { newId } from '@dmdoc/db-pg';
  * compensação injeta uma fila falsa cujo `addBulk` rejeita.
  */
 
-function createMockS3(): S3Service {
+function createMockS3(): StorageDriver {
   return {
-    uploadFile: vi.fn().mockResolvedValue(undefined),
-    getSignedDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
-    deleteFile: vi.fn().mockResolvedValue(undefined),
-  } as unknown as S3Service;
+    provider: 's3',
+    put: vi.fn().mockResolvedValue(undefined),
+    getDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
+    delete: vi.fn().mockResolvedValue(undefined),
+  } as unknown as StorageDriver;
 }
 
 const TENANT_A = crypto.randomUUID();
@@ -89,7 +90,7 @@ async function seedDocument(
   await testDb.db`
     INSERT INTO documents (
       id, tenant_id, department_id, document_type_id, filename, original_filename,
-      content_hash, size_bytes, mime_type, s3_key, status, failure_reason,
+      content_hash, size_bytes, mime_type, storage_key, status, failure_reason,
       uploaded_by_id, uploaded_at, index_values, tags, deleted
     ) VALUES (
       ${id}, ${tenantId}, ${departmentId}, NULL, ${'f-' + id + '.pdf'}, 'doc.pdf',
@@ -148,7 +149,7 @@ beforeAll(async () => {
     db: testDb.db,
     queue: null, // sem Redis — lote é criado, jobs não enfileirados
     aiReprocessQueue: null,
-    s3: createMockS3(),
+    storage: staticStorage(createMockS3()),
   });
 });
 
@@ -384,7 +385,7 @@ describe('POST /documents/bulk-reprocess — compensação de enfileiramento', (
       db: testDb.db,
       queue: failingQueue,
       aiReprocessQueue: null,
-      s3: createMockS3(),
+      storage: staticStorage(createMockS3()),
     });
 
     try {
@@ -415,7 +416,7 @@ describe('POST /documents/bulk-reprocess — compensação de enfileiramento', (
       db: testDb.db,
       queue: okQueue,
       aiReprocessQueue: null,
-      s3: createMockS3(),
+      storage: staticStorage(createMockS3()),
     });
 
     try {
