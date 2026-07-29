@@ -2,8 +2,18 @@
 
 Modos de operação:
   - Fila Redis (primário): consumer loop BRPOP em 'extract:requests'; baixa o
-    arquivo do S3 diretamente; publica resultado em 'extract:result:{requestId}'.
-    Elimina timeout HTTP — o worker aguarda via BLPOP sem limite de tempo.
+    arquivo pela URL temporária que vem no pedido; publica resultado em
+    'extract:result:{requestId}'. Elimina timeout HTTP — o worker aguarda via
+    BLPOP sem limite de tempo.
+
+    O pedido é { requestId, fileUrl, mimeType, filename }. Este serviço NÃO
+    conhece o destino de armazenamento: quem enfileira (o worker Node) resolve o
+    driver da empresa e entrega uma URL já autenticada — bucket da plataforma,
+    bucket do cliente ou SharePoint chegam aqui como um simples GET.
+
+    `filename` é campo próprio do pedido, e não algo derivado da URL: a escolha
+    de parser usa a extensão do arquivo, e uma URL assinada termina em query
+    string ('?X-Amz-Signature=...').
   - Endpoint HTTP /extract (legado): mantido para compatibilidade e testes manuais.
   - Endpoint HTTP /convert/pdf: conversão Office→PDF para preview, não afetado.
 
@@ -29,10 +39,11 @@ import subprocess
 import tempfile
 import threading
 import zipfile
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-import boto3
 import redis as redis_lib
+import requests
 
 import cv2
 import pytesseract
@@ -118,11 +129,13 @@ REQUEST_TIMEOUT_S = int(os.environ.get("EXTRACT_TIMEOUT_S", "120"))
 
 # Configuração do consumer Redis
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "")
-S3_BUCKET = os.environ.get("S3_BUCKET", "dmdoc-documents")
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+# Timeouts do download do arquivo (segundos): (conexão, leitura entre pacotes).
+# O de leitura NÃO limita o download inteiro — vale por chunk recebido, então um
+# arquivo grande em rede lenta continua baixando enquanto houver progresso, mas
+# um destino que abre a conexão e emudece falha rápido em vez de travar o
+# consumer (que processa um pedido por vez).
+DOWNLOAD_CONNECT_TIMEOUT_S = float(os.environ.get("DOWNLOAD_CONNECT_TIMEOUT_S", "15"))
+DOWNLOAD_READ_TIMEOUT_S = float(os.environ.get("DOWNLOAD_READ_TIMEOUT_S", "120"))
 # TTL do result key no Redis — cleanup automático se o worker morrer antes de ler.
 RESULT_KEY_TTL_SECS = 3600
 EXTRACT_REQUEST_QUEUE = "extract:requests"
@@ -185,15 +198,38 @@ app = FastAPI(title="DMDoc Extractor", version="1.0.0")
 # ──────────────────────────── Redis consumer ────────────────────────────
 
 
-def _make_s3_client():
-    kwargs = dict(
-        region_name=AWS_REGION,
-        aws_access_key_id=AWS_ACCESS_KEY_ID or None,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY or None,
-    )
-    if S3_ENDPOINT:
-        kwargs["endpoint_url"] = S3_ENDPOINT
-    return boto3.client("s3", **kwargs)
+def _safe_url(url: str) -> str:
+    """Host + caminho de uma URL, SEM a query string.
+
+    A query de uma URL assinada carrega a credencial de leitura do arquivo
+    (X-Amz-Signature no S3/MinIO, token no SharePoint) enquanto ela valer — não
+    pode ir para o log nem para a mensagem de erro devolvida ao worker, que a
+    grava em `documents.failure_reason` e a exibe na tela.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "<url inválida>"
+    if not parts.netloc:
+        return "<url inválida>"
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
+def _download_file(url: str) -> bytes:
+    """Baixa o arquivo da URL temporária entregue pelo worker.
+
+    Status != 2xx vira exceção com a URL higienizada e um trecho do corpo — em
+    S3/MinIO o motivo real (assinatura expirada, chave inexistente) vem no XML
+    da resposta, e sem ele o diagnóstico vira adivinhação.
+    """
+    timeout = (DOWNLOAD_CONNECT_TIMEOUT_S, DOWNLOAD_READ_TIMEOUT_S)
+    with requests.get(url, timeout=timeout, stream=True) as resp:
+        if not (200 <= resp.status_code < 300):
+            detail = resp.text[:300].replace("\n", " ").strip()
+            raise RuntimeError(
+                f"download falhou: HTTP {resp.status_code} em {_safe_url(url)} — {detail}"
+            )
+        return resp.content
 
 
 def _extraction_consumer_loop() -> None:
@@ -208,7 +244,6 @@ def _extraction_consumer_loop() -> None:
     import time
 
     rconn = redis_lib.from_url(REDIS_URL, decode_responses=True)
-    s3 = _make_s3_client()
     logger.info("extraction consumer loop iniciado (fila=%s)", EXTRACT_REQUEST_QUEUE)
 
     while True:
@@ -225,30 +260,48 @@ def _extraction_consumer_loop() -> None:
                 continue
 
             request_id = payload.get("requestId", "")
-            s3_key = payload.get("s3Key", "")
-            s3_bucket = payload.get("s3Bucket", S3_BUCKET)
+            file_url = payload.get("fileUrl", "")
             mime = payload.get("mimeType", "")
+            # O nome vem no pedido. O basename da URL é só a rede de segurança:
+            # serve quando o campo chega vazio, e nunca é confiável sozinho
+            # (numa URL assinada o caminho pode nem terminar no nome do arquivo).
+            name = (payload.get("filename") or urlsplit(file_url).path.split("/")[-1]).lower()
             result_key = f"{EXTRACT_RESULT_PREFIX}{request_id}"
+            safe_url = _safe_url(file_url)
 
-            logger.info(
-                "extraindo s3Key=%s mime=%s",
-                s3_key, mime,
-                extra={"traceId": request_id, "s3Key": s3_key, "mimeType": mime},
-            )
-
+            # A partir daqui TUDO fica dentro do try que publica {error}, o log
+            # inclusive: qualquer exceção que escape daqui sobe para o `except`
+            # do loop, que não publica resultado nenhum — e o worker fica preso
+            # no BLPOP até o timeout (15 min) por causa de uma linha de log.
             try:
-                s3_resp = s3.get_object(Bucket=s3_bucket, Key=s3_key)
-                data = s3_resp["Body"].read()
-                name = s3_key.split("/")[-1].lower()
+                # `fileName`, e não `filename`: `filename` é atributo reservado
+                # do LogRecord (o arquivo-fonte que emitiu o log) e passá-lo em
+                # `extra=` levanta KeyError no logging da stdlib.
+                logger.info(
+                    "extraindo fileName=%s mime=%s",
+                    name, mime,
+                    extra={
+                        "traceId": request_id,
+                        "fileName": name,
+                        "mimeType": mime,
+                        "fileUrl": safe_url,
+                    },
+                )
+                if not file_url:
+                    raise RuntimeError("pedido de extração sem fileUrl")
+                data = _download_file(file_url)
                 result = _dispatch_extract(data, mime, name)
                 result["engine"] = "python"
                 out = json.dumps(result)
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
-                    "falha ao processar s3Key=%s: %s",
-                    s3_key, exc,
-                    extra={"traceId": request_id, "s3Key": s3_key},
+                    "falha ao processar fileName=%s: %s",
+                    name, exc,
+                    extra={"traceId": request_id, "fileName": name, "fileUrl": safe_url},
                 )
+                # Mesmo formato de sempre: o worker traduz {error} em
+                # ExtractionError e marca o documento FAILED — um erro de
+                # download não é um caminho novo para ele.
                 out = json.dumps({"error": str(exc), "text": "", "pageCount": 1, "ocrPages": []})
 
             pipe = rconn.pipeline()
@@ -266,9 +319,8 @@ def _extraction_consumer_loop() -> None:
             time.sleep(5)
             try:
                 rconn = redis_lib.from_url(REDIS_URL, decode_responses=True)
-                s3 = _make_s3_client()
             except Exception:  # noqa: BLE001
-                logger.exception("falha ao reconectar Redis/S3")
+                logger.exception("falha ao reconectar Redis")
         except Exception as exc:  # noqa: BLE001
             logger.exception("erro inesperado no consumer loop: %s", exc)
             time.sleep(1)
