@@ -13,8 +13,11 @@ import { z } from 'zod';
  * Campos:
  * - `tenantId` / `documentId`: identificam o documento sem necessidade de
  *   lookup adicional no início do job.
- * - `s3Key`: chave completa no bucket S3 para o worker baixar o arquivo
- *   original sem precisar consultar o banco.
+ * - `storageKey`: chave do arquivo original no destino de armazenamento da
+ *   empresa, para o worker baixá-lo sem precisar consultar o banco. É uma chave
+ *   OPACA: só o driver de storage resolvido para o tenant sabe interpretá-la
+ *   (objeto em bucket S3, item no SharePoint etc.) — nada aqui pode assumir que
+ *   ela é uma chave S3.
  * - `mimeType`: indica ao extrator qual parser usar sem precisar detectar
  *   o tipo novamente.
  *
@@ -23,7 +26,7 @@ import { z } from 'zod';
 export const DocumentProcessingJobDataSchema = z.object({
   tenantId: z.string().uuid(),
   documentId: z.string().uuid(),
-  s3Key: z.string().min(1),
+  storageKey: z.string().min(1),
   mimeType: z.string().min(1),
 });
 
@@ -34,7 +37,8 @@ export type DocumentProcessingJobData = z.infer<typeof DocumentProcessingJobData
  *
  * Enfileirado pela API (DELETE /admin/tenants/:id) após marcar o tenant como
  * `deleted=true`. O worker consome este job e executa a purga definitiva dos
- * dados da empresa (S3, banco) em background.
+ * dados da empresa (arquivos no destino de armazenamento configurado para ela,
+ * banco) em background.
  *
  * Como o restante do contrato de jobs, é a única fonte de verdade do payload:
  * o produtor valida com `TenantDeletionJobDataSchema` antes de enfileirar; o
@@ -94,3 +98,33 @@ export const AiReprocessJobDataSchema = z.object({
 });
 
 export type AiReprocessJobData = z.infer<typeof AiReprocessJobDataSchema>;
+
+/**
+ * Payload de um job de migração de acervo entre destinos de armazenamento
+ * (épico E-11 / T-141) na fila BullMQ `storage-migration`.
+ *
+ * Enfileirado pela API (`POST /admin/tenants/:id/storage/migrate`) depois de
+ * criar a linha em `storage_migrations`; consumido pelo worker dedicado
+ * (`apps/worker/src/storage-migration-worker.ts`), que copia os arquivos dos
+ * destinos anteriores para o ativo. Produtor e consumidor vivem em apps
+ * diferentes, e é por isso que o contrato mora aqui: é a mesma razão dos três
+ * schemas de job acima.
+ *
+ * Campos:
+ * - `tenantId`: empresa cujo acervo está sendo movido (isolamento multi-tenant).
+ * - `migrationId`: linha de `storage_migrations`, que é a **autoridade** sobre o
+ *   estado da migração (progresso, cancelamento, resultado). O job carrega só o
+ *   id: o destino ativo e a lista de documentos a copiar são resolvidos NO
+ *   WORKER, no instante em que ele começa, e não congelados no payload.
+ *   Congelá-los reintroduziria a janela em que a fila trabalha sobre um mundo
+ *   que já mudou — e a seleção precisa ser recalculada a cada tentativa, já que
+ *   o retry do BullMQ é o mecanismo de retomada da migração.
+ *
+ * Spec §5.5 (`storage_migrations`) e §7 (endpoints de migração de acervo).
+ */
+export const StorageMigrationJobDataSchema = z.object({
+  tenantId: z.string().uuid(),
+  migrationId: z.string().uuid(),
+});
+
+export type StorageMigrationJobData = z.infer<typeof StorageMigrationJobDataSchema>;

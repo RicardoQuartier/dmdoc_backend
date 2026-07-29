@@ -27,6 +27,10 @@ export type DocumentStatus = z.infer<typeof DocumentStatusSchema>;
  *   nunca exibida como título oficial. Reprocessar sobrescreve `suggestedTitle`,
  *   mas NUNCA toca o `title` já confirmado. `originalFilename` permanece
  *   imutável (atrelado ao arquivo físico) e nenhuma sugestão de IA o substitui.
+ * - `storageKey` é a chave do arquivo no destino de armazenamento da empresa e
+ *   é OPACA: só o driver de storage resolvido para o tenant sabe interpretá-la
+ *   (objeto em bucket S3, item no SharePoint etc.). Nenhuma camada acima pode
+ *   assumir que ela é uma chave S3 nem derivar URL a partir dela.
  * - `mongoContentId` aponta para o `_id` do documento na coleção
  *   `document_content` — preenchido após a extração de texto pelo worker.
  * - `indexValues` é um mapa aberto: chaves correspondem ao `name` dos campos
@@ -48,7 +52,7 @@ export const DocumentSchema = z.object({
   contentHash: z.string().length(64), // SHA-256 hex
   sizeBytes: z.number().int().nonnegative(),
   mimeType: z.string().min(1).max(200),
-  s3Key: z.string().min(1).max(1000),
+  storageKey: z.string().min(1).max(1000),
   status: DocumentStatusSchema,
   failureReason: z.string().nullable(),
   tags: z.array(z.string()),
