@@ -38,12 +38,6 @@ importers:
 
   apps/api:
     dependencies:
-      '@aws-sdk/client-s3':
-        specifier: ^3.1064.0
-        version: 3.1064.0
-      '@aws-sdk/s3-request-presigner':
-        specifier: ^3.1064.0
-        version: 3.1064.0
       '@dmdoc/db-pg':
         specifier: workspace:*
         version: link:../../packages/db-pg
@@ -56,6 +50,9 @@ importers:
       '@dmdoc/shared-types':
         specifier: workspace:*
         version: link:../../packages/shared-types
+      '@dmdoc/storage':
+        specifier: workspace:*
+        version: link:../../packages/storage
       '@fastify/cors':
         specifier: ^11.2.0
         version: 11.2.0
@@ -111,9 +108,6 @@ importers:
 
   apps/worker:
     dependencies:
-      '@aws-sdk/client-s3':
-        specifier: ^3.782.0
-        version: 3.1064.0
       '@dmdoc/db-pg':
         specifier: workspace:*
         version: link:../../packages/db-pg
@@ -129,6 +123,9 @@ importers:
       '@dmdoc/shared-types':
         specifier: workspace:*
         version: link:../../packages/shared-types
+      '@dmdoc/storage':
+        specifier: workspace:*
+        version: link:../../packages/storage
       bullmq:
         specifier: ^5.34.0
         version: 5.78.0
@@ -292,6 +289,25 @@ importers:
         specifier: ^3.24.1
         version: 3.25.76
     devDependencies:
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.19.20)
+
+  packages/storage:
+    dependencies:
+      '@aws-sdk/client-s3':
+        specifier: ^3.1064.0
+        version: 3.1064.0
+      '@aws-sdk/s3-request-presigner':
+        specifier: ^3.1064.0
+        version: 3.1064.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.19.20
       typescript:
         specifier: ^5.7.2
         version: 5.9.3
