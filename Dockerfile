@@ -18,6 +18,7 @@ RUN corepack enable
 COPY . .
 RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @dmdoc/shared-types build \
+ && pnpm --filter @dmdoc/storage build \
  && pnpm --filter @dmdoc/extractor build \
  && pnpm --filter @dmdoc/logger build \
  && pnpm --filter @dmdoc/llm-provider build \
