@@ -46,7 +46,7 @@ async function insertDocument(
   await sql`
     INSERT INTO documents (
       id, tenant_id, department_id, filename, original_filename,
-      content_hash, size_bytes, mime_type, s3_key, status, uploaded_by_id, deleted
+      content_hash, size_bytes, mime_type, storage_key, status, uploaded_by_id, deleted
     ) VALUES (
       ${id}, ${TENANT_A}, ${DEPT_A}, 'f.pdf', 'f.pdf',
       ${`hash-${id}`}, ${1234}, 'application/pdf', ${`tenants/${TENANT_A}/${id}`},

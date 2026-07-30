@@ -39,7 +39,26 @@ async function main(): Promise<void> {
     },
   });
 
-  const app = await buildApp({ config, queue, tenantDeletionQueue, aiReprocessQueue });
+  // Fila BullMQ de migração de acervo entre destinos de armazenamento
+  // (épico E-11 / T-141). O worker consome desta fila e copia os arquivos dos
+  // destinos anteriores para o ativo. `attempts: 3` é seguro: a migração é
+  // retomável e recomeça pelo que ainda falta (ver `createStorageMigrationQueue`
+  // no worker).
+  const storageMigrationQueue = new Queue('storage-migration', {
+    connection: { url: config.REDIS_URL },
+    defaultJobOptions: {
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 5000 },
+    },
+  });
+
+  const app = await buildApp({
+    config,
+    queue,
+    tenantDeletionQueue,
+    aiReprocessQueue,
+    storageMigrationQueue,
+  });
 
   try {
     await app.listen({ port: config.APP_PORT, host: '0.0.0.0' });

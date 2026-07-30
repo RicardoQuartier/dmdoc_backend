@@ -2,8 +2,8 @@ import crypto from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
-import type { S3Service } from '../services/s3.js';
+import { startTestDb, seedUser, testConfig, type TestDb, staticStorage } from '../test/helpers.js';
+import type { StorageDriver } from '@dmdoc/storage';
 import { newId } from '@dmdoc/db-pg';
 
 /**
@@ -18,12 +18,13 @@ import { newId } from '@dmdoc/db-pg';
  * isso é suficiente para exercitar toda a rota HTTP.
  */
 
-function createMockS3(): S3Service {
+function createMockS3(): StorageDriver {
   return {
-    uploadFile: vi.fn().mockResolvedValue(undefined),
-    getSignedDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
-    deleteFile: vi.fn().mockResolvedValue(undefined),
-  } as unknown as S3Service;
+    provider: 's3',
+    put: vi.fn().mockResolvedValue(undefined),
+    getDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
+    delete: vi.fn().mockResolvedValue(undefined),
+  } as unknown as StorageDriver;
 }
 
 const TENANT_A = crypto.randomUUID();
@@ -63,7 +64,7 @@ async function seedDocument(tenantId: string, departmentId: string, uploadedById
   await testDb.db`
     INSERT INTO documents (
       id, tenant_id, department_id, document_type_id, filename, original_filename,
-      content_hash, size_bytes, mime_type, s3_key, status, uploaded_by_id, uploaded_at,
+      content_hash, size_bytes, mime_type, storage_key, status, uploaded_by_id, uploaded_at,
       index_values, tags, deleted
     ) VALUES (
       ${id}, ${tenantId}, ${departmentId}, NULL, ${'f-' + id + '.pdf'}, 'doc.pdf',
@@ -81,7 +82,7 @@ beforeAll(async () => {
     db: testDb.db,
     queue: null,
     aiReprocessQueue: null, // sem Redis — lote é criado, jobs não enfileirados
-    s3: createMockS3(),
+    storage: staticStorage(createMockS3()),
   });
 });
 

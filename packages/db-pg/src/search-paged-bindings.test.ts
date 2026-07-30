@@ -100,7 +100,7 @@ beforeAll(async () => {
   // Documento que casa pelo CONTEÚDO.
   await sql`INSERT INTO documents (
       id, tenant_id, department_id, document_type_id, filename, original_filename,
-      content_hash, size_bytes, mime_type, s3_key, status, tags, index_values, uploaded_by_id
+      content_hash, size_bytes, mime_type, storage_key, status, tags, index_values, uploaded_by_id
     ) VALUES (
       ${DOC_CONTENT_ID}, ${TENANT_ID}, ${DEPT_ID}, ${TYPE_ID}, 'conteudo.pdf', 'conteudo.pdf',
       ${'c'.repeat(64)}, ${100}, 'application/pdf', ${`tenants/${TENANT_ID}/conteudo.pdf`},
@@ -118,7 +118,7 @@ beforeAll(async () => {
   // Documento que casa só por METADADO (tag + filename + index value).
   await sql`INSERT INTO documents (
       id, tenant_id, department_id, document_type_id, filename, original_filename,
-      content_hash, size_bytes, mime_type, s3_key, status, tags, index_values, uploaded_by_id
+      content_hash, size_bytes, mime_type, storage_key, status, tags, index_values, uploaded_by_id
     ) VALUES (
       ${DOC_META_ID}, ${TENANT_ID}, ${OTHER_DEPT_ID}, ${TYPE_ID}, 'zorblax-meta.pdf', 'zorblax-meta.pdf',
       ${'d'.repeat(64)}, ${100}, 'application/pdf', ${`tenants/${TENANT_ID}/meta.pdf`},

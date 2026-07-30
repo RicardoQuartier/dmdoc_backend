@@ -13,12 +13,11 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1064.0",
-    "@aws-sdk/s3-request-presigner": "^3.1064.0",
     "@dmdoc/db-pg": "workspace:*",
     "@dmdoc/llm-provider": "workspace:*",
     "@dmdoc/logger": "workspace:*",
     "@dmdoc/shared-types": "workspace:*",
+    "@dmdoc/storage": "workspace:*",
     "@fastify/cors": "^11.2.0",
     "@fastify/multipart": "^10.0.0",
     "@fastify/rate-limit": "^11.0.0",

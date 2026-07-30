@@ -13,7 +13,11 @@ import { purgeTenantData, type PurgeTenantDeps } from './tenant-deletion.js';
  *   anuladas, mantendo `tenant_id`.
  * - Tenant alvo: deleted=true, active=false, deleted_at preenchido, name renomeado.
  * - Isolamento: o tenant de controle permanece 100% intacto.
- * - Storage: `deleteS3Prefix` chamado 1x com `tenants/{id}/`.
+ * - Storage: `deleteStoragePrefix` chamado 1x com `{ tenantId, prefix }`.
+ * - Storage por empresa (E-11 / T-142): quando o callback roda, o inventário de
+ *   destinos ainda está inteiro no banco — TODAS as linhas de
+ *   `tenant_storage_configs` (com credenciais) e os documentos que revelam o
+ *   destino da plataforma. Depois, nenhuma dessas linhas sobrevive.
  * - Idempotência: re-executar não lança.
  */
 
@@ -40,6 +44,28 @@ interface SeedIds {
   eventId: string;
   auditId: string;
   globalLinkId: string;
+}
+
+interface StorageIds {
+  cfgS3Old: string;
+  cfgS3New: string;
+  cfgSp: string;
+  migrationId: string;
+  docS3Old: string;
+  docS3New: string;
+  docSp: string;
+}
+
+/**
+ * Fotografia do inventário de destinos NO INSTANTE em que o callback de storage
+ * roda — é o que a implementação do worker (fatia da yukino) vai consultar.
+ */
+interface StorageInventory {
+  configs: Array<{ id: string; provider: string; bucket: string | null; hasSecret: boolean }>;
+  /** `EXISTS` de documento com `storage_config_id IS NULL`, SEM filtro de `deleted`. */
+  hasPlatformDocs: boolean;
+  /** Documentos do tenant ainda presentes (a purga do banco não pode ter rodado). */
+  documentCount: number;
 }
 
 /**
@@ -82,7 +108,7 @@ async function seedTenant(tenantId: string, suffix: string, globalTypeId: string
 
   await sql`INSERT INTO documents (
       id, tenant_id, department_id, document_type_id, filename, original_filename,
-      content_hash, size_bytes, mime_type, s3_key, status, uploaded_by_id
+      content_hash, size_bytes, mime_type, storage_key, status, uploaded_by_id
     ) VALUES (
       ${ids.docId}, ${tenantId}, ${ids.deptId}, ${ids.docTypeId}, 'f.pdf', 'f.pdf',
       ${`hash${suffix}`}, ${1234}, 'application/pdf', ${`tenants/${tenantId}/f.pdf`}, 'READY', ${ids.userId}
@@ -114,6 +140,92 @@ async function seedTenant(tenantId: string, suffix: string, globalTypeId: string
   return ids;
 }
 
+/**
+ * Semeia os DESTINOS DE ARMAZENAMENTO do tenant (E-11) e um documento em cada
+ * um, reproduzindo a empresa que já morou em mais de um lugar:
+ *
+ * - `cfgS3Old`  — bucket S3 do cliente no MinIO, APOSENTADA (migração antiga);
+ * - `cfgS3New`  — OUTRO bucket S3, também aposentada;
+ * - `cfgSp`     — SharePoint, ATIVA (destino corrente).
+ *
+ * ⚠️ As duas primeiras existem para travar o furo que a ADR-1 corrigiu: ambas
+ * têm `provider = 's3'`, então uma varredura por `DISTINCT storage_provider`
+ * enxergaria UM destino e deixaria metade do acervo do cliente para trás.
+ *
+ * O documento da plataforma (`storage_config_id IS NULL`) já vem do `seedTenant`
+ * — é o quarto destino, e o único que não tem linha em `tenant_storage_configs`.
+ *
+ * Todas as três configurações carregam `encrypted_secret` (secret key da AWS /
+ * client secret do Azure, do CLIENTE): é o que a purga precisa levar embora.
+ */
+async function seedStorageDestinations(
+  tenantId: string,
+  suffix: string,
+  ids: SeedIds,
+): Promise<StorageIds> {
+  const storage: StorageIds = {
+    cfgS3Old: `c1c10000-0000-0000-0000-0000000000${suffix}`,
+    cfgS3New: `c2c20000-0000-0000-0000-0000000000${suffix}`,
+    cfgSp: `c3c30000-0000-0000-0000-0000000000${suffix}`,
+    migrationId: `d1d10000-0000-0000-0000-0000000000${suffix}`,
+    docS3Old: `e1e10000-0000-0000-0000-0000000000${suffix}`,
+    docS3New: `e2e20000-0000-0000-0000-0000000000${suffix}`,
+    docSp: `e3e30000-0000-0000-0000-0000000000${suffix}`,
+  };
+
+  // jsonb SEMPRE com sql.json — JSON.stringify grava string double-encoded.
+  await sql`INSERT INTO tenant_storage_configs
+      (id, tenant_id, provider, credentials_source, config, encrypted_secret, active, retired_at)
+    VALUES (
+      ${storage.cfgS3Old}, ${tenantId}, 's3', 'tenant',
+      ${sql.json({ endpoint: 'https://minio.cliente.local', bucket: `acervo-antigo-${suffix}` })},
+      ${secretOf(suffix, 's3-old')}, false, now()
+    )`;
+  await sql`INSERT INTO tenant_storage_configs
+      (id, tenant_id, provider, credentials_source, config, encrypted_secret, active, retired_at)
+    VALUES (
+      ${storage.cfgS3New}, ${tenantId}, 's3', 'tenant',
+      ${sql.json({ bucket: `acervo-novo-${suffix}`, region: 'us-east-1' })},
+      ${secretOf(suffix, 's3-new')}, false, now()
+    )`;
+  await sql`INSERT INTO tenant_storage_configs
+      (id, tenant_id, provider, credentials_source, config, encrypted_secret, active)
+    VALUES (
+      ${storage.cfgSp}, ${tenantId}, 'sharepoint', 'tenant',
+      ${sql.json({ siteId: `site-${suffix}`, driveId: `drive-${suffix}`, rootFolder: 'DMDoc' })},
+      ${secretOf(suffix, 'sharepoint')}, true
+    )`;
+
+  const seedDoc = async (docId: string, configId: string, provider: string, tag: string) =>
+    sql`INSERT INTO documents (
+        id, tenant_id, department_id, document_type_id, filename, original_filename,
+        content_hash, size_bytes, mime_type, storage_key, status, uploaded_by_id,
+        storage_config_id, storage_provider
+      ) VALUES (
+        ${docId}, ${tenantId}, ${ids.deptId}, ${ids.docTypeId}, ${`${tag}.pdf`}, ${`${tag}.pdf`},
+        ${`hash-${tag}-${suffix}`}, ${999}, 'application/pdf',
+        ${`tenants/${tenantId}/${tag}.pdf`}, 'READY', ${ids.userId},
+        ${configId}, ${provider}
+      )`;
+
+  await seedDoc(storage.docS3Old, storage.cfgS3Old, 's3', 'antigo');
+  await seedDoc(storage.docS3New, storage.cfgS3New, 's3', 'novo');
+  await seedDoc(storage.docSp, storage.cfgSp, 'sharepoint', 'sharepoint');
+
+  // Histórico da migração que produziu esse estado (metadado; NÃO é fonte de
+  // destinos para a varredura — as configurações aposentadas são).
+  await sql`INSERT INTO storage_migrations
+      (id, tenant_id, from_provider, to_provider, status, total_docs, migrated_docs, finished_at)
+    VALUES (${storage.migrationId}, ${tenantId}, 's3', 'sharepoint', 'DONE', ${2}, ${2}, now())`;
+
+  return storage;
+}
+
+/** Segredo cifrado sintético, previsível o bastante para ser caçado no banco. */
+function secretOf(suffix: string, kind: string): string {
+  return `SECRET-${suffix}-${kind}`;
+}
+
 async function countRows(table: string, tenantId: string): Promise<number> {
   const rows = await sql.unsafe<Array<{ c: number }>>(
     `SELECT COUNT(*)::int AS c FROM ${table} WHERE tenant_id = $1`,
@@ -122,18 +234,78 @@ async function countRows(table: string, tenantId: string): Promise<number> {
   return rows[0]?.c ?? 0;
 }
 
-function makeDeps(): { deps: PurgeTenantDeps; deleteS3Prefix: ReturnType<typeof vi.fn> } {
-  const deleteS3Prefix = vi.fn(async () => undefined);
+function makeDeps(): { deps: PurgeTenantDeps; deleteStoragePrefix: ReturnType<typeof vi.fn> } {
+  const deleteStoragePrefix = vi.fn(async () => undefined);
   const deps: PurgeTenantDeps = {
-    deleteS3Prefix,
+    deleteStoragePrefix,
     logger: { info: () => undefined, error: () => undefined },
   };
-  return { deps, deleteS3Prefix };
+  return { deps, deleteStoragePrefix };
+}
+
+/**
+ * Deps cujo callback de storage FOTOGRAFA, do lado de fora da transação e pela
+ * mesma pool que o worker usaria, o inventário de destinos disponível naquele
+ * instante.
+ *
+ * É assim que se testa a ORDEM sem simular o worker: se a purga do banco rodar
+ * antes do storage, a fotografia sai vazia — sem configuração (logo, sem
+ * credencial para alcançar o bucket do cliente) e sem documento (logo, sem como
+ * saber que parte do acervo está no bucket da plataforma).
+ */
+function makeInventoryDeps(): {
+  deps: PurgeTenantDeps;
+  calls: Array<{ tenantId: string; prefix: string }>;
+  snapshots: StorageInventory[];
+} {
+  const calls: Array<{ tenantId: string; prefix: string }> = [];
+  const snapshots: StorageInventory[] = [];
+
+  const deps: PurgeTenantDeps = {
+    deleteStoragePrefix: async ({ tenantId, prefix }) => {
+      calls.push({ tenantId, prefix });
+
+      const configs = await sql<
+        Array<{ id: string; provider: string; config: Record<string, unknown>; encrypted_secret: string | null }>
+      >`
+        SELECT id, provider, config, encrypted_secret
+          FROM tenant_storage_configs
+         WHERE tenant_id = ${tenantId}
+         ORDER BY created_at, id
+      `;
+      // Sem filtro de `deleted`: a purga é física, soft delete não vale aqui.
+      const platform = await sql<Array<{ e: boolean }>>`
+        SELECT EXISTS (
+          SELECT 1 FROM documents WHERE tenant_id = ${tenantId} AND storage_config_id IS NULL
+        ) AS e
+      `;
+      const docs = await sql<Array<{ c: number }>>`
+        SELECT COUNT(*)::int AS c FROM documents WHERE tenant_id = ${tenantId}
+      `;
+
+      snapshots.push({
+        configs: configs.map((c) => ({
+          id: c.id,
+          provider: c.provider,
+          bucket: typeof c.config['bucket'] === 'string' ? (c.config['bucket'] as string) : null,
+          hasSecret: c.encrypted_secret !== null,
+        })),
+        hasPlatformDocs: platform[0]?.e ?? false,
+        documentCount: docs[0]?.c ?? 0,
+      });
+    },
+    logger: { info: () => undefined, error: () => undefined },
+  };
+
+  return { deps, calls, snapshots };
 }
 
 const GLOBAL_TYPE_ID = '99999999-9999-9999-9999-999999999999';
 // Ator global (SUPER_ADMIN, tenant_id NULL) que executa a exclusão — NÃO é removido.
 const GLOBAL_ACTOR_ID = '88888888-8888-8888-8888-888888888888';
+
+/** Destinos de armazenamento do tenant alvo, resemeados a cada teste. */
+let storageA: StorageIds;
 
 beforeEach(async () => {
   // Limpeza total (ordem filhos → pais) antes de cada teste.
@@ -142,6 +314,10 @@ beforeEach(async () => {
   await sql`DELETE FROM document_events`;
   await sql`DELETE FROM audit_logs`;
   await sql`DELETE FROM documents`;
+  // Depois de `documents`: a FK COMPOSTA documents_storage_config_fk é
+  // ON DELETE NO ACTION e recusaria o delete com documento apontando para cá.
+  await sql`DELETE FROM tenant_storage_configs`;
+  await sql`DELETE FROM storage_migrations`;
   await sql`DELETE FROM department_permissions`;
   await sql`DELETE FROM document_type_index_fields`;
   await sql`DELETE FROM global_type_tenant_depts`;
@@ -154,8 +330,13 @@ beforeEach(async () => {
   await sql`INSERT INTO document_types (id, tenant_id, name, is_global)
     VALUES (${GLOBAL_TYPE_ID}, NULL, 'Tipo Global', true)`;
 
-  await seedTenant(TENANT_A, '0a', GLOBAL_TYPE_ID);
-  await seedTenant(TENANT_B, '0b', GLOBAL_TYPE_ID);
+  const idsA = await seedTenant(TENANT_A, '0a', GLOBAL_TYPE_ID);
+  const idsB = await seedTenant(TENANT_B, '0b', GLOBAL_TYPE_ID);
+
+  // Destinos de armazenamento (E-11): três configurações + um documento em cada,
+  // nos dois tenants — o de controle serve para provar o isolamento também aqui.
+  storageA = await seedStorageDestinations(TENANT_A, '0a', idsA);
+  await seedStorageDestinations(TENANT_B, '0b', idsB);
 
   // Ator global (SUPER_ADMIN, sem tenant) e o audit `tenant.delete.requested`
   // que ele gera no tenant A — o user_id deve sobreviver à purga.
@@ -167,6 +348,17 @@ beforeEach(async () => {
 });
 
 afterAll(async () => {
+  // ⚠️ Limpar os DESTINOS antes de sair. `tenant_storage_configs` tem invariante
+  // GLOBAL (`uniq_tenant_storage_active`) e `tenant-storage-schema.test.ts` conta
+  // `WHERE active` sem filtro de tenant — deixar as configurações do tenant de
+  // controle para trás quebra o arquivo seguinte, já que os testes de db-pg
+  // rodam serializados sobre o MESMO banco (`fileParallelism: false`).
+  await sql`DELETE FROM chunks`;
+  await sql`DELETE FROM document_content`;
+  await sql`DELETE FROM document_events`;
+  await sql`DELETE FROM documents`;
+  await sql`DELETE FROM tenant_storage_configs`;
+  await sql`DELETE FROM storage_migrations`;
   await sql`DELETE FROM global_type_tenant_depts`;
   await sql`DELETE FROM document_types WHERE id = ${GLOBAL_TYPE_ID}`;
   await sql.end();
@@ -185,6 +377,8 @@ describe('purgeTenantData', () => {
     expect(await countRows('document_types', TENANT_A)).toBe(0);
     expect(await countRows('departments', TENANT_A)).toBe(0);
     expect(await countRows('users', TENANT_A)).toBe(0);
+    expect(await countRows('tenant_storage_configs', TENANT_A)).toBe(0);
+    expect(await countRows('storage_migrations', TENANT_A)).toBe(0);
 
     // Index fields do tenant A (sem tenant_id próprio) também removidos.
     const idxFields = await sql`
@@ -260,16 +454,24 @@ describe('purgeTenantData', () => {
     expect(rows[0]?.['user_id']).toBeNull();
     expect(rows[0]?.['resource']).toBe(`tenants/${TENANT_A}`);
     const metadata = rows[0]?.['metadata'] as { counts?: Record<string, number> };
-    expect(metadata.counts?.['documents']).toBe(1);
+    // 1 documento na plataforma (seed) + 3 nos destinos próprios da empresa.
+    expect(metadata.counts?.['documents']).toBe(4);
     expect(metadata.counts?.['users']).toBe(1);
+    expect(metadata.counts?.['tenantStorageConfigs']).toBe(3);
+    expect(metadata.counts?.['storageMigrations']).toBe(1);
   });
 
-  it('chama deleteS3Prefix uma vez com o prefixo do tenant', async () => {
-    const { deps, deleteS3Prefix } = makeDeps();
+  it('chama deleteStoragePrefix uma vez com o tenant e o prefixo', async () => {
+    const { deps, deleteStoragePrefix } = makeDeps();
     await purgeTenantData(sql, TENANT_A, deps);
 
-    expect(deleteS3Prefix).toHaveBeenCalledTimes(1);
-    expect(deleteS3Prefix).toHaveBeenCalledWith(`tenants/${TENANT_A}/`);
+    expect(deleteStoragePrefix).toHaveBeenCalledTimes(1);
+    // O contrato passa o TENANT junto com o prefixo: é com ele que quem
+    // implementa levanta TODOS os destinos da empresa, não só o corrente.
+    expect(deleteStoragePrefix).toHaveBeenCalledWith({
+      tenantId: TENANT_A,
+      prefix: `tenants/${TENANT_A}/`,
+    });
   });
 
   it('mantém o tenant de controle 100% intacto (isolamento)', async () => {
@@ -278,7 +480,9 @@ describe('purgeTenantData', () => {
 
     expect(await countRows('chunks', TENANT_B)).toBe(1);
     expect(await countRows('document_content', TENANT_B)).toBe(1);
-    expect(await countRows('documents', TENANT_B)).toBe(1);
+    expect(await countRows('documents', TENANT_B)).toBe(4);
+    expect(await countRows('tenant_storage_configs', TENANT_B)).toBe(3);
+    expect(await countRows('storage_migrations', TENANT_B)).toBe(1);
     expect(await countRows('department_permissions', TENANT_B)).toBe(1);
     expect(await countRows('global_type_tenant_depts', TENANT_B)).toBe(1);
     expect(await countRows('document_types', TENANT_B)).toBe(1);
@@ -303,6 +507,13 @@ describe('purgeTenantData', () => {
     const tenantB = await sql`SELECT active, deleted FROM tenants WHERE id = ${TENANT_B}`;
     expect(tenantB[0]?.['active']).toBe(true);
     expect(tenantB[0]?.['deleted']).toBe(false);
+
+    // E as credenciais de B continuam de pé — a purga não varre a tabela toda.
+    const secretsB = await sql<Array<{ c: number }>>`
+      SELECT COUNT(*)::int AS c FROM tenant_storage_configs
+       WHERE encrypted_secret LIKE 'SECRET-0b-%'
+    `;
+    expect(secretsB[0]?.c).toBe(3);
   });
 
   it('não remove o tipo de documento GLOBAL compartilhado', async () => {
@@ -322,5 +533,128 @@ describe('purgeTenantData', () => {
     const rows = await sql`SELECT name, deleted FROM tenants WHERE id = ${TENANT_A}`;
     expect(rows[0]?.['deleted']).toBe(true);
     expect(String(rows[0]?.['name'])).toMatch(/^\[EXCLUÍDA-\d+\] Empresa 0a$/);
+  });
+});
+
+/**
+ * Empresa com arquivos em MAIS DE UM destino (E-11 / T-142).
+ *
+ * O `@dmdoc/db-pg` não conhece storage: ele não abre bucket nem SharePoint, e
+ * por isso não há como testar aqui que o arquivo sumiu. O que ESTE pacote
+ * garante — e é o que estes testes travam — é que, no instante em que o callback
+ * roda, o inventário completo de destinos ainda está no banco e alcançável; e
+ * que, depois, nada dele sobrevive.
+ */
+describe('purgeTenantData — destinos de armazenamento por empresa', () => {
+  it('expõe ao callback TODOS os destinos do tenant, inclusive dois buckets S3 distintos', async () => {
+    const { deps, calls, snapshots } = makeInventoryDeps();
+    await purgeTenantData(sql, TENANT_A, deps);
+
+    expect(calls).toEqual([{ tenantId: TENANT_A, prefix: `tenants/${TENANT_A}/` }]);
+    const snap = snapshots[0];
+    expect(snap).toBeDefined();
+
+    // As TRÊS configurações — as duas aposentadas e a ativa. Uma varredura
+    // baseada só no destino corrente enxergaria uma.
+    expect(snap?.configs.map((c) => c.id).sort()).toEqual(
+      [storageA.cfgS3Old, storageA.cfgS3New, storageA.cfgSp].sort(),
+    );
+
+    // ⚠️ O caso que a versão anterior da tarefa deixava passar: dois destinos
+    // DIFERENTES com o mesmo `provider`. `DISTINCT storage_provider` devolveria
+    // um único 's3' e metade do acervo do cliente ficaria para trás.
+    const s3 = snap?.configs.filter((c) => c.provider === 's3') ?? [];
+    expect(s3).toHaveLength(2);
+    expect(new Set(s3.map((c) => c.bucket)).size).toBe(2);
+
+    // O quarto destino não tem linha nenhuma: é a plataforma, e ela só se revela
+    // por documento com `storage_config_id IS NULL`.
+    expect(snap?.hasPlatformDocs).toBe(true);
+  });
+
+  it('entrega as credenciais vivas ao callback — o storage roda ANTES do banco', async () => {
+    const { deps, snapshots } = makeInventoryDeps();
+    await purgeTenantData(sql, TENANT_A, deps);
+
+    // Sem `encrypted_secret` não se alcança o bucket nem o SharePoint do
+    // cliente: apagar essas linhas antes do storage deixaria os arquivos
+    // inalcançáveis para sempre.
+    expect(snapshots[0]?.configs.every((c) => c.hasSecret)).toBe(true);
+    // E os documentos ainda estavam lá — é deles que sai o destino de plataforma.
+    expect(snapshots[0]?.documentCount).toBe(4);
+  });
+
+  it('não deixa o soft delete esconder o destino de plataforma', async () => {
+    // Único documento na plataforma, e soft-deletado: a purga é FÍSICA, então a
+    // varredura não pode filtrar `deleted = false` — o arquivo continua no
+    // bucket da plataforma independentemente do estado lógico da linha.
+    await sql`
+      UPDATE documents SET deleted = true
+       WHERE tenant_id = ${TENANT_A} AND storage_config_id IS NULL
+    `;
+
+    const { deps, snapshots } = makeInventoryDeps();
+    await purgeTenantData(sql, TENANT_A, deps);
+
+    expect(snapshots[0]?.hasPlatformDocs).toBe(true);
+    expect(await countRows('documents', TENANT_A)).toBe(0);
+  });
+
+  it('não deixa nenhuma credencial do tenant sobreviver à exclusão da empresa', async () => {
+    const { deps } = makeDeps();
+    await purgeTenantData(sql, TENANT_A, deps);
+
+    // Sem filtro de tenant, de propósito: o segredo não pode ter sobrado em
+    // lugar nenhum da tabela. O tenant sofre SOFT delete, então nenhuma FK
+    // obrigaria essas linhas a cair — a purga tem de derrubá-las explicitamente.
+    const leftovers = await sql<Array<{ id: string }>>`
+      SELECT id FROM tenant_storage_configs WHERE encrypted_secret LIKE 'SECRET-0a-%'
+    `;
+    expect(leftovers).toHaveLength(0);
+
+    const anyConfig = await sql<Array<{ c: number }>>`
+      SELECT COUNT(*)::int AS c FROM tenant_storage_configs WHERE tenant_id = ${TENANT_A}
+    `;
+    expect(anyConfig[0]?.c).toBe(0);
+
+    const migrations = await sql<Array<{ c: number }>>`
+      SELECT COUNT(*)::int AS c FROM storage_migrations WHERE tenant_id = ${TENANT_A}
+    `;
+    expect(migrations[0]?.c).toBe(0);
+  });
+
+  it('purga o banco mesmo quando o storage falha (falha logada, não abortiva)', async () => {
+    const errors: unknown[] = [];
+    const deps: PurgeTenantDeps = {
+      // Credencial de SharePoint revogada, bucket fora do ar: o callback estoura.
+      deleteStoragePrefix: async () => {
+        throw new Error('destino inacessível');
+      },
+      logger: { info: () => undefined, error: (...a: unknown[]) => errors.push(a) },
+    };
+
+    await expect(purgeTenantData(sql, TENANT_A, deps)).resolves.toBeUndefined();
+
+    expect(errors).toHaveLength(1);
+    // O conteúdo lógico sai de qualquer jeito — inclusive as credenciais.
+    expect(await countRows('documents', TENANT_A)).toBe(0);
+    expect(await countRows('tenant_storage_configs', TENANT_A)).toBe(0);
+    const tenant = await sql`SELECT deleted FROM tenants WHERE id = ${TENANT_A}`;
+    expect(tenant[0]?.['deleted']).toBe(true);
+  });
+
+  it('é idempotente com destinos múltiplos: a segunda passada não acha mais nada', async () => {
+    const { deps } = makeDeps();
+    await purgeTenantData(sql, TENANT_A, deps);
+
+    const { deps: deps2, snapshots } = makeInventoryDeps();
+    await expect(purgeTenantData(sql, TENANT_A, deps2)).resolves.toBeUndefined();
+
+    // Inventário vazio na re-execução: nenhuma configuração, nenhum documento.
+    // Apagar prefixo inexistente é no-op nos dois drivers, então o retry do
+    // BullMQ é seguro.
+    expect(snapshots[0]?.configs).toEqual([]);
+    expect(snapshots[0]?.hasPlatformDocs).toBe(false);
+    expect(snapshots[0]?.documentCount).toBe(0);
   });
 });

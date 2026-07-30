@@ -200,7 +200,7 @@ async function insertDocument(input: InsertDocInput): Promise<void> {
     INSERT INTO documents (
       id, tenant_id, department_id, document_type_id,
       filename, original_filename, title, suggested_title,
-      content_hash, size_bytes, mime_type, s3_key, status, tags, index_values,
+      content_hash, size_bytes, mime_type, storage_key, status, tags, index_values,
       uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
     ) VALUES (
       ${input.id}, ${input.tenantId}, ${input.departmentId}, NULL,

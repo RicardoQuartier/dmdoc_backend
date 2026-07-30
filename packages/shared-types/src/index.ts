@@ -92,6 +92,8 @@ export {
   type AiReprocessStep,
   AiReprocessJobDataSchema,
   type AiReprocessJobData,
+  StorageMigrationJobDataSchema,
+  type StorageMigrationJobData,
 } from './job.js';
 export {
   TemplateNodeSchema,

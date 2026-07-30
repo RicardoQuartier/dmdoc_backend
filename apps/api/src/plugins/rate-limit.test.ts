@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, testConfig, type TestDb } from '../test/helpers.js';
-import type { S3Service } from '../services/s3.js';
+import { startTestDb, testConfig, type TestDb, staticStorage } from '../test/helpers.js';
+import type { StorageDriver } from '@dmdoc/storage';
 
 // ---------------------------------------------------------------------------
 // Regressão do bug 7dbe2438 (QUOTA-7): ao exceder o limite de requisições por
@@ -16,12 +16,13 @@ import type { S3Service } from '../services/s3.js';
 // o mesmo IP, logo o mesmo bucket.
 // ---------------------------------------------------------------------------
 
-function createMockS3(): S3Service {
+function createMockS3(): StorageDriver {
   return {
-    uploadFile: vi.fn().mockResolvedValue(undefined),
-    getSignedDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
-    deleteFile: vi.fn().mockResolvedValue(undefined),
-  } as unknown as S3Service;
+    provider: 's3',
+    put: vi.fn().mockResolvedValue(undefined),
+    getDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
+    delete: vi.fn().mockResolvedValue(undefined),
+  } as unknown as StorageDriver;
 }
 
 let app: FastifyInstance;
@@ -33,7 +34,7 @@ beforeAll(async () => {
     config: testConfig({ RATE_LIMIT_MAX: '3', RATE_LIMIT_WINDOW_MS: '60000' }),
     db: testDb.db,
     queue: null,
-    s3: createMockS3(),
+    storage: staticStorage(createMockS3()),
   });
 });
 

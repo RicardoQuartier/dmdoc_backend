@@ -94,7 +94,7 @@ const QUERY_EMBEDDING = embeddingAtAngle(0);
 async function insertDocument(id: string, suffix: string, departmentId: string): Promise<void> {
   await sql`INSERT INTO documents (
       id, tenant_id, department_id, filename, original_filename,
-      content_hash, size_bytes, mime_type, s3_key, status, uploaded_by_id, deleted
+      content_hash, size_bytes, mime_type, storage_key, status, uploaded_by_id, deleted
     ) VALUES (
       ${id}, ${TENANT_ID}, ${departmentId}, ${`${suffix}.pdf`}, ${`${suffix}.pdf`},
       ${`hash-moved-${suffix}`}, ${100}, 'application/pdf',

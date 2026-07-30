@@ -89,7 +89,7 @@ async function insertChunk(
 async function insertDocument(id: string, suffix: string): Promise<void> {
   await sql`INSERT INTO documents (
       id, tenant_id, department_id, filename, original_filename,
-      content_hash, size_bytes, mime_type, s3_key, status, uploaded_by_id
+      content_hash, size_bytes, mime_type, storage_key, status, uploaded_by_id
     ) VALUES (
       ${id}, ${TENANT_ID}, ${DEPT_ID}, ${`${suffix}.pdf`}, ${`${suffix}.pdf`},
       ${`hash-${suffix}`}, ${100}, 'application/pdf', ${`tenants/${TENANT_ID}/${suffix}.pdf`},

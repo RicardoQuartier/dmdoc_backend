@@ -1,11 +1,13 @@
 /**
  * Schema Drizzle para o DMDoc — PostgreSQL + pgvector.
  *
- * Tabelas (13 no total):
- *   tenants, users, departments, department_permissions,
+ * Tabelas (18 no total):
+ *   tenants, platform_settings, users, departments, department_permissions,
  *   document_types, document_type_index_fields,
  *   global_type_tenant_depts, documents, document_content,
- *   chunks, document_events, department_templates, audit_logs
+ *   chunks, document_events, department_templates,
+ *   ai_reprocess_batch, document_reprocess_batch,
+ *   tenant_storage_configs, storage_migrations, audit_logs
  *
  * Regras gerais de mapeamento MongoDB → PostgreSQL:
  *   - string (UUID)          → uuid  (default pgCrypto.gen_random_uuid())
@@ -31,6 +33,8 @@ import {
   unique,
   uniqueIndex,
   index,
+  check,
+  foreignKey,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { customType } from 'drizzle-orm/pg-core';
@@ -363,7 +367,35 @@ export const documents = pgTable(
     contentHash: text('content_hash').notNull(), // SHA-256 hex, 64 chars
     sizeBytes: bigint('size_bytes', { mode: 'bigint' }).notNull(),
     mimeType: text('mime_type').notNull(),
-    s3Key: text('s3_key').notNull(),
+    // Chave/identificador do arquivo binário no destino de armazenamento
+    // (épico E-11 — migration 0017). O nome antigo era específico de S3 e
+    // passava a mentir assim que existisse um documento no SharePoint.
+    // O formato da chave depende do provider.
+    storageKey: text('storage_key').notNull(),
+    // TIPO do destino onde o arquivo DESTA linha está: 's3' | 'sharepoint'. É
+    // por documento, não por empresa, porque durante (e depois de) uma migração
+    // de acervo a empresa tem documentos em destinos diferentes — o download
+    // escolhe o driver por documento. Default 's3' cobre todo o acervo anterior
+    // ao E-11. DENORMALIZAÇÃO de `storageConfigId`, mantida por ser barata em
+    // `SELECT DISTINCT` e em tela; NUNCA é o critério de "precisa migrar":
+    // dois destinos distintos do mesmo provider têm o mesmo valor aqui.
+    storageProvider: text('storage_provider').notNull().default('s3'),
+    // De QUAL configuração de armazenamento este arquivo depende para ser lido
+    // (épico E-11 / ADR-1). É a AUTORIDADE; `storageProvider` é o rótulo.
+    //
+    // NULL ≡ S3 da plataforma, credenciais do .env — todo o acervo anterior ao
+    // E-11 fica assim, sem backfill nenhum.
+    //
+    // ⚠️ Comparar esta coluna com uma configuração de destino é sempre
+    // `IS DISTINCT FROM`, nunca `<>`: com NULL de um dos lados o `<>` devolve
+    // NULL, o WHERE descarta a linha e a seleção da migração volta vazia.
+    //
+    // A FK real é COMPOSTA — (storage_config_id, tenant_id) →
+    // tenant_storage_configs (id, tenant_id), criada na migration 0017 — para
+    // que nenhum documento consiga apontar para a configuração de outra
+    // empresa. Drizzle a declara em `foreignKey(...)` logo abaixo; não trocar
+    // por `.references()` simples, que perderia a amarra de tenant.
+    storageConfigId: uuid('storage_config_id'),
     status: text('status').notNull().default('PENDING'), // 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED'
     failureReason: text('failure_reason'),
     tags: text('tags').array().notNull().default(sql`'{}'::text[]`),
@@ -388,6 +420,26 @@ export const documents = pgTable(
     // Ordenação default da listagem (`uploaded_at DESC`) e filtro por período
     // de upload (T-74) — ver migration 0015.
     index('docs_by_tenant_uploaded_at').on(t.tenantId, t.uploadedAt.desc()),
+    // FK COMPOSTA (E-11 / ADR-1, migration 0017): o documento só pode apontar
+    // para uma configuração de armazenamento DA PRÓPRIA empresa. Com FK simples
+    // em `id`, um documento do tenant A poderia referenciar a config do tenant
+    // B — e resolver esse driver seria ler o bucket de outra empresa com as
+    // credenciais dela. MATCH SIMPLE (default): linha com `storageConfigId`
+    // nulo (acervo na plataforma) não é verificada.
+    foreignKey({
+      name: 'documents_storage_config_fk',
+      columns: [t.storageConfigId, t.tenantId],
+      foreignColumns: [tenantStorageConfigs.id, tenantStorageConfigs.tenantId],
+    }),
+    // Coerência entre autoridade e denormalização: destino de plataforma
+    // (`storageConfigId` nulo) é sempre S3.
+    check(
+      'documents_platform_storage_is_s3',
+      sql`${t.storageConfigId} IS NOT NULL OR ${t.storageProvider} = 's3'`,
+    ),
+    // Seleção da migração de acervo (T-141) e varredura de destinos da purga
+    // (T-142). `tenantId` na frente: toda consulta do sistema filtra tenant.
+    index('docs_by_storage_config').on(t.tenantId, t.storageConfigId),
   ],
 );
 
@@ -609,6 +661,130 @@ export const documentReprocessBatches = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// tenant_storage_configs
+// ---------------------------------------------------------------------------
+
+/**
+ * Histórico VERSIONADO dos destinos de armazenamento de cada empresa
+ * (épico E-11 / ADR-1, migration 0017).
+ *
+ * UMA LINHA POR CONFIGURAÇÃO, não por empresa. No máximo uma `active` por
+ * tenant (índice único parcial `uniq_tenant_storage_active`); as demais são o
+ * histórico e continuam sendo usadas para LER os documentos que ainda apontam
+ * para elas. Sobrescrever a linha na troca de destino tornaria o acervo antigo
+ * inalcançável no instante da troca — foi o que a ADR-1 corrigiu.
+ *
+ * `documents.storageConfigId IS NULL` ≡ ('s3', 'platform') — é essa
+ * equivalência que faz todas as empresas existentes continuarem no bucket da
+ * plataforma sem backfill nenhum. Nunca escreva uma linha aqui só para
+ * "materializar o default".
+ *
+ * ⚠️ ESCRITA (T-140): linhas são IMUTÁVEIS nos campos de configuração. Trocar
+ * o destino é INSERT da linha nova + `UPDATE ... SET active = false,
+ * retiredAt = now()` na anterior — nunca UPDATE de `provider`/`config`/
+ * `encryptedSecret`. `active` e `retiredAt` são as únicas colunas que mudam
+ * depois do INSERT.
+ *
+ * `config` guarda a parte NÃO sensível (bucket, região, endpoint, siteId,
+ * driveId...); o segredo vai cifrado em `encryptedSecret`. Ao gravar `config`
+ * use `sql.json(...)` — `JSON.stringify` grava string double-encoded no
+ * postgres.js e a leitura volta string.
+ *
+ * O CHECK `storage_platform_creds_only_s3` proíbe ('sharepoint', 'platform'):
+ * não existe SharePoint da plataforma, o DMDoc não tem tenant Azure global.
+ * Vale para toda linha, ativa ou aposentada.
+ */
+export const tenantStorageConfigs = pgTable(
+  'tenant_storage_configs',
+  {
+    id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    provider: text('provider').notNull(), // 's3' | 'sharepoint'
+    // 'platform' = credenciais do .env da plataforma; 'tenant' = credenciais
+    // da própria empresa. Default 'tenant' porque quem insere aqui está
+    // justamente saindo do padrão — o caso 'platform' é o de documento sem
+    // `storageConfigId`, que não tem linha nenhuma.
+    credentialsSource: text('credentials_source').notNull().default('tenant'),
+    config: jsonb('config').notNull().default(sql`'{}'::jsonb`),
+    encryptedSecret: text('encrypted_secret'),
+    // Destino CORRENTE da empresa (para onde vão os uploads novos).
+    active: boolean('active').notNull().default(true),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .default(sql`now()`),
+    // Quando esta configuração deixou de receber uploads. NULL na ativa.
+    // Informativo (alimenta a lista de destinos anteriores da tela): nenhuma
+    // decisão de leitura ou de purga depende dele.
+    retiredAt: timestamp('retired_at', { withTimezone: true, mode: 'date' }),
+  },
+  (t) => [
+    check(
+      'storage_platform_creds_only_s3',
+      sql`${t.credentialsSource} = 'tenant' OR ${t.provider} = 's3'`,
+    ),
+    // Alvo da FK COMPOSTA de `documents`: redundante como unicidade (`id` já é
+    // PK), indispensável como referência — é o que permite amarrar o tenant
+    // dentro da própria FK.
+    unique('uniq_storage_config_id_tenant').on(t.id, t.tenantId),
+    // No máximo UMA configuração ativa por empresa; as aposentadas ficam fora
+    // do índice e convivem sem limite (mesmo padrão parcial de
+    // `uniq_doc_tenant_content_hash` e `uniq_storage_migration_running`).
+    uniqueIndex('uniq_tenant_storage_active').on(t.tenantId).where(sql`active`),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// storage_migrations
+// ---------------------------------------------------------------------------
+
+/**
+ * Estado de uma migração de acervo entre destinos de armazenamento (E-11).
+ *
+ * Contadores PERSISTIDOS (modelo push, como `aiReprocessBatches`), ao
+ * contrário de `documentReprocessBatches`, cujo progresso é derivado de
+ * `documents.status`: aqui não há coluna em `documents` que distinga "já
+ * copiado por ESTA migração" de "já nasceu no destino".
+ *
+ * `uniq_storage_migration_running` — índice único PARCIAL em `tenantId` sobre
+ * PENDING/RUNNING: uma migração ativa por empresa. Migrações encerradas saem
+ * do índice, então o histórico acumula sem bloquear a próxima.
+ *
+ * `fromProvider`/`toProvider` são DESCRITIVOS (rótulo em tela e no histórico).
+ * O que determina quais documentos migrar é `documents.storageConfigId`
+ * (`IS DISTINCT FROM` a config de destino), nunca estas duas colunas: numa
+ * troca S3 → S3 elas são iguais e a seleção por provider devolveria zero.
+ */
+export const storageMigrations = pgTable(
+  'storage_migrations',
+  {
+    id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    fromProvider: text('from_provider').notNull(),
+    toProvider: text('to_provider').notNull(),
+    // 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED' | 'CANCELLED'
+    status: text('status').notNull().default('PENDING'),
+    totalDocs: integer('total_docs').notNull().default(0),
+    migratedDocs: integer('migrated_docs').notNull().default(0),
+    failedDocs: integer('failed_docs').notNull().default(0),
+    lastError: text('last_error'),
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'date' }),
+    finishedAt: timestamp('finished_at', { withTimezone: true, mode: 'date' }),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .default(sql`now()`),
+  },
+  (t) => [
+    uniqueIndex('uniq_storage_migration_running')
+      .on(t.tenantId)
+      .where(sql`status IN ('PENDING', 'RUNNING')`),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // audit_logs
 // ---------------------------------------------------------------------------
 
@@ -680,3 +856,9 @@ export type NewAuditLog = typeof auditLogs.$inferInsert;
 
 export type AiReprocessBatch = typeof aiReprocessBatches.$inferSelect;
 export type NewAiReprocessBatch = typeof aiReprocessBatches.$inferInsert;
+
+export type TenantStorageConfig = typeof tenantStorageConfigs.$inferSelect;
+export type NewTenantStorageConfig = typeof tenantStorageConfigs.$inferInsert;
+
+export type StorageMigration = typeof storageMigrations.$inferSelect;
+export type NewStorageMigration = typeof storageMigrations.$inferInsert;

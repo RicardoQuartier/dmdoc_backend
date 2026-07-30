@@ -113,6 +113,13 @@
       "when": 1785613600000,
       "tag": "0016_document_reprocess_batch",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1785700000000,
+      "tag": "0017_tenant_storage",
+      "breakpoints": true
     }
   ]
 }

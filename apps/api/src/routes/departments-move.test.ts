@@ -202,7 +202,7 @@ async function seedDocument(id: string, departmentId: string, filename: string):
     INSERT INTO documents (
       id, tenant_id, department_id, document_type_id,
       filename, original_filename, content_hash, size_bytes, mime_type,
-      s3_key, status, tags, index_values, uploaded_by_id, uploaded_at, deleted
+      storage_key, status, tags, index_values, uploaded_by_id, uploaded_at, deleted
     ) VALUES (
       ${id}, ${TENANT_A}, ${departmentId}, NULL,
       ${filename}, ${filename}, ${newId()}, 1024, 'application/pdf',

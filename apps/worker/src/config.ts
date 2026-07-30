@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parseSecretKey } from '@dmdoc/storage';
 
 /**
  * Schema de variáveis de ambiente do worker.
@@ -33,15 +34,51 @@ const EnvSchema = z.object({
     .transform((v) => v === 'true')
     .default('false'),
 
+  /**
+   * Chave mestra (AES-256-GCM, 32 bytes em hexadecimal) que decifra o segredo
+   * de armazenamento de cada empresa (`tenant_storage_configs.encrypted_secret`,
+   * épico E-11). Precisa ser EXATAMENTE a mesma da API: as duas apps decifram
+   * os mesmos segredos.
+   *
+   * Obrigatória e validada aqui, no boot. Uma chave de tamanho errado só se
+   * revelaria no primeiro job de uma empresa com destino próprio — horas depois
+   * do deploy, e no meio de um processamento.
+   */
+  STORAGE_SECRET_KEY: z
+    .string()
+    .min(1, 'STORAGE_SECRET_KEY é obrigatória')
+    .superRefine((value, ctx) => {
+      try {
+        parseSecretKey(value);
+      } catch (error) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: error instanceof Error ? error.message : 'chave inválida',
+        });
+      }
+    }),
+
   // Extração de texto — comunicação assíncrona via Redis (fila extract:requests).
-  // O extractor Python baixa o arquivo do S3 diretamente e publica o resultado em
-  // extract:result:{requestId}. O worker aguarda via BLPOP sem timeout HTTP.
+  // O worker resolve o destino de armazenamento da empresa, gera uma URL de
+  // download temporária e a publica na fila; o extractor Python baixa por HTTP e
+  // publica o resultado em extract:result:{requestId}. O worker aguarda via
+  // BLPOP sem timeout HTTP.
   /**
    * Timeout do BLPOP aguardando resultado de extração (segundos).
    * Default 15min — job falha se o extractor não responder nesse prazo.
    * 0 bloqueia indefinidamente (não recomendado em produção).
    */
   EXTRACT_BLPOP_TIMEOUT_SECS: z.coerce.number().int().nonnegative().default(900),
+  /**
+   * Validade (segundos) da URL de download entregue ao extractor. Default 30min.
+   *
+   * Precisa cobrir FILA + PROCESSAMENTO, não só o download: o consumer Python
+   * processa um pedido por vez, então uma extração pesada segura as seguintes na
+   * fila. Manter com folga sobre `EXTRACT_BLPOP_TIMEOUT_SECS` — uma URL que
+   * expira antes do BLPOP desistir vira uma falha de download difícil de ler,
+   * em vez de um timeout claro.
+   */
+  EXTRACT_URL_TTL_SECS: z.coerce.number().int().positive().default(1800),
 
   // Embeddings (sempre OpenAI, nunca OpenRouter)
   OPENAI_API_KEY: z.string().min(1).optional(),

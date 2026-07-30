@@ -5,6 +5,7 @@ import OpenAI from 'openai';
 import type { ExtractorProvider } from '@dmdoc/extractor';
 import type { LLMProvider } from '@dmdoc/llm-provider';
 import type { DocumentProcessingJobData } from '@dmdoc/shared-types';
+import type { StorageForTenant } from '../storage.js';
 import { extractDocument } from './extract.js';
 import { chunkText, type ChunkDocumentMeta } from './chunk.js';
 import { embedChunks } from './embed.js';
@@ -14,7 +15,12 @@ import { suggestIndexesStep } from './suggest-indexes.js';
 import { generateTagsStep } from './generate-tags.js';
 
 export interface PipelineDeps {
-  s3Bucket: string;
+  /**
+   * Resolvedor do destino de armazenamento por empresa. A extração gera a URL
+   * temporária do arquivo a partir do driver resolvido aqui — o pipeline não
+   * conhece bucket nem provedor.
+   */
+  storage: StorageForTenant;
   extractor: ExtractorProvider;
   openai: OpenAI;
   embeddingModel: string;
@@ -26,6 +32,8 @@ export interface PipelineDeps {
   logger: Logger;
   chunkTargetTokens?: number;
   chunkOverlapTokens?: number;
+  /** Validade (segundos) da URL de download entregue ao extractor. */
+  downloadUrlTtlSecs?: number;
   /**
    * Confiança MÍNIMA da classificação (Fase 8) para disparar a sugestão
    * automática de índices (Fase 7) sobre o tipo sugerido. Default 0.5.
@@ -58,7 +66,7 @@ export async function runPipeline(
 ): Promise<void> {
   const { tenantId, documentId } = job.data;
   const {
-    s3Bucket,
+    storage,
     extractor,
     openai,
     embeddingModel,
@@ -68,6 +76,7 @@ export async function runPipeline(
     logger: baseLogger,
     chunkTargetTokens,
     chunkOverlapTokens,
+    downloadUrlTtlSecs,
     indexSuggestionMinConfidence = DEFAULT_INDEX_SUGGESTION_MIN_CONFIDENCE,
   } = deps;
 
@@ -80,10 +89,11 @@ export async function runPipeline(
   try {
     // Etapa 1: Extração de texto
     const extractResult = await extractDocument(job.data, {
-      s3Bucket,
+      storage,
       extractor,
       sql,
       logger: log,
+      ...(downloadUrlTtlSecs !== undefined ? { downloadUrlTtlSecs } : {}),
     });
 
     // Buscar metadados do documento para montar ChunkDocumentMeta

@@ -10,7 +10,7 @@ import { AppError, RateLimitError } from './errors/index.js';
 import { authPlugin } from './plugins/auth.js';
 import { rateLimitPlugin } from './plugins/rate-limit.js';
 import { authRoutes } from './routes/auth.js';
-import { adminTenantsRoutes } from './routes/admin/tenants.js';
+import { adminTenantsRoutes, type AdminTenantsRoutesOptions } from './routes/admin/tenants.js';
 import { multiTenantAdminsRoutes } from './routes/admin/multi-tenant-admins.js';
 import { adminDepartmentTemplatesRoutes } from './routes/admin/department-templates.js';
 import { adminPlatformSettingsRoutes } from './routes/admin/platform-settings.js';
@@ -23,17 +23,26 @@ import { searchRoutes, type SearchRoutesOptions } from './routes/search.js';
 import { auditLogsRoutes } from './routes/audit-logs.js';
 import { usageRoutes } from './routes/usage.js';
 import { reportsRoutes } from './routes/reports.js';
-import { createS3Service, type S3Service, type S3Config } from './services/s3.js';
+import { createStorageResolver, parseSecretKey, type StorageResolver } from '@dmdoc/storage';
+import { buildPlatformS3Config, type StorageDriverFactory } from './lib/storage-admin.js';
 import type { LLMProvider } from '@dmdoc/llm-provider';
 
 declare module 'fastify' {
   interface FastifyInstance {
     db: Sql;
     /**
-     * Serviço S3. Null em testes que injetam um mock ou desabilitam o S3.
-     * As rotas que usam S3 verificam a presença antes de operar.
+     * Destino de armazenamento dos documentos (épico E-11). Não existe mais um
+     * cliente global: cada empresa pode estar no bucket da plataforma, em bucket
+     * próprio ou no SharePoint dela — e, depois de trocar de destino, em mais de
+     * um lugar ao mesmo tempo.
+     *
+     * ESCREVER arquivo novo: `activeDestination(tenantId)` (devolve o driver e o
+     * `storage_config_id` a gravar no documento).
+     * LER/APAGAR arquivo existente: `forStorageConfig(doc.tenant_id,
+     * doc.storage_config_id)` — o destino DAQUELE documento, nunca o corrente da
+     * empresa (ADR-1).
      */
-    s3: S3Service;
+    storage: StorageResolver;
     /**
      * Fila BullMQ de processamento de documentos.
      * Null em testes — jobs não são enfileirados.
@@ -49,6 +58,12 @@ declare module 'fastify' {
      * Null em testes — jobs não são enfileirados (o lote é criado, mas nada roda).
      */
     aiReprocessQueue: Queue | null;
+    /**
+     * Fila BullMQ de migração de acervo entre destinos (storage-migration,
+     * épico E-11). Null em testes — a linha de `storage_migrations` é criada,
+     * mas nenhum job roda.
+     */
+    storageMigrationQueue: Queue | null;
     /**
      * Tamanho máximo permitido para upload de arquivo (em bytes).
      * Derivado de `config.MAX_UPLOAD_MB`.
@@ -85,10 +100,26 @@ export interface BuildAppOptions {
    */
   aiReprocessQueue?: Queue | null;
   /**
-   * Instância de S3Service a injetar.
-   * Em testes, passe um mock. Em produção é criado a partir da config.
+   * Fila BullMQ de migração de acervo entre destinos (storage-migration, E-11).
+   * Em testes, passe `null` (ou omita) para desabilitar o enfileiramento — os
+   * testes que exercitam o job chamam `runStorageMigration` direto.
+   * Em produção, `server.ts` cria a fila e a injeta aqui.
    */
-  s3?: S3Service;
+  storageMigrationQueue?: Queue | null;
+  /**
+   * Resolvedor de destino de armazenamento a injetar.
+   * Em testes, passe `staticStorage(mockDriver)` (ou um resolvedor de verdade,
+   * para exercitar a resolução por empresa). Em produção é criado a partir da
+   * config e do banco.
+   */
+  storage?: StorageResolver;
+  /**
+   * Fábrica de driver a partir de um alvo já resolvido, usada apenas pelo
+   * "Testar conexão" (`POST /admin/tenants/:id/storage/test`) — o único lugar
+   * que constrói um driver a partir de uma configuração ainda não gravada.
+   * Em testes, injete uma fábrica falsa para exercitar a rota sem rede.
+   */
+  buildStorageDriver?: StorageDriverFactory;
   /**
    * Provider de LLM a injetar nas rotas de IA (documentos, busca).
    * Em testes, passe um fake para exercitar as rotas sem chamar o provedor real.
@@ -145,9 +176,20 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   // Fila BullMQ de reprocessamento de IA em massa — null quando não injetada (testes)
   app.decorate('aiReprocessQueue', options.aiReprocessQueue ?? null);
 
-  // Serviço S3
-  const s3 = options.s3 ?? createS3Service(buildS3Config(config));
-  app.decorate('s3', s3);
+  // Fila BullMQ de migração de acervo entre destinos — null quando não injetada (testes)
+  app.decorate('storageMigrationQueue', options.storageMigrationQueue ?? null);
+
+  // Destino de armazenamento por empresa. A config do `.env` deixa de ser "o
+  // storage" e passa a ser o FALLBACK de plataforma: vale para toda empresa sem
+  // linha em `tenant_storage_configs` — hoje, todas.
+  const storage =
+    options.storage ??
+    createStorageResolver({
+      sql: db,
+      platformS3Config: buildPlatformS3Config(config),
+      secretKey: parseSecretKey(config.STORAGE_SECRET_KEY),
+    });
+  app.decorate('storage', storage);
 
   // Plugin @fastify/multipart — necessário para POST /documents
   await app.register(multipart, {
@@ -170,7 +212,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   });
 
   await app.register(authRoutes);
-  await app.register(adminTenantsRoutes);
+  await app.register(adminTenantsRoutes, {
+    config,
+    ...(options.buildStorageDriver ? { buildStorageDriver: options.buildStorageDriver } : {}),
+  } satisfies AdminTenantsRoutesOptions);
   await app.register(multiTenantAdminsRoutes);
   await app.register(adminDepartmentTemplatesRoutes);
   await app.register(adminPlatformSettingsRoutes);
@@ -211,6 +256,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     });
   }
 
+  // Fecha a fila de migração de acervo no shutdown
+  if (options.storageMigrationQueue) {
+    const storageMigrationQueue = options.storageMigrationQueue;
+    app.addHook('onClose', async () => {
+      await storageMigrationQueue.close();
+    });
+  }
+
   await app.ready();
   return app;
 }
@@ -234,23 +287,6 @@ async function resolveDb(
     await sql.end();
   });
   return sql;
-}
-
-/**
- * Monta a S3Config a partir do Config da aplicação.
- */
-function buildS3Config(config: Config): S3Config {
-  return {
-    region: config.AWS_REGION,
-    bucket: config.AWS_S3_BUCKET,
-    accessKeyId: config.AWS_ACCESS_KEY_ID,
-    secretAccessKey: config.AWS_SECRET_ACCESS_KEY,
-    ...(config.S3_ENDPOINT !== undefined ? { endpoint: config.S3_ENDPOINT } : {}),
-    ...(config.S3_PUBLIC_ENDPOINT !== undefined
-      ? { publicEndpoint: config.S3_PUBLIC_ENDPOINT }
-      : {}),
-    forcePathStyle: config.S3_FORCE_PATH_STYLE,
-  };
 }
 
 /**

@@ -2,8 +2,8 @@ import crypto from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb } from '../test/helpers.js';
-import type { S3Service } from '../services/s3.js';
+import { startTestDb, seedUser, testConfig, resetDomainTables, type TestDb, staticStorage } from '../test/helpers.js';
+import type { StorageDriver } from '@dmdoc/storage';
 import { newId } from '@dmdoc/db-pg';
 
 /**
@@ -23,12 +23,13 @@ import { newId } from '@dmdoc/db-pg';
  *   - S3 best-effort: falha ao remover o objeto NÃO desfaz nem derruba nada.
  */
 
-function createMockS3(): S3Service {
+function createMockS3(): StorageDriver {
   return {
-    uploadFile: vi.fn().mockResolvedValue(undefined),
-    getSignedDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
-    deleteFile: vi.fn().mockResolvedValue(undefined),
-  } as unknown as S3Service;
+    provider: 's3',
+    put: vi.fn().mockResolvedValue(undefined),
+    getDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
+    delete: vi.fn().mockResolvedValue(undefined),
+  } as unknown as StorageDriver;
 }
 
 const TENANT_A = crypto.randomUUID();
@@ -47,7 +48,7 @@ const DISK_QUOTA = 10 * 1024 * 1024;
 const ZERO_EMBEDDING = `[${new Array(1536).fill(0).join(',')}]`;
 
 let app: FastifyInstance;
-let s3Mock: S3Service;
+let s3Mock: StorageDriver;
 let testDb: TestDb;
 let tokenAdminA: string;
 let tokenUploaderA: string;
@@ -88,7 +89,7 @@ async function seedDocument(
   await testDb.db`
     INSERT INTO documents (
       id, tenant_id, department_id, document_type_id, filename, original_filename,
-      content_hash, size_bytes, mime_type, s3_key, status, failure_reason,
+      content_hash, size_bytes, mime_type, storage_key, status, failure_reason,
       uploaded_by_id, uploaded_at, index_values, tags, deleted
     ) VALUES (
       ${id}, ${tenantId}, ${departmentId}, NULL, ${'f-' + id + '.pdf'}, 'doc.pdf',
@@ -155,7 +156,7 @@ beforeAll(async () => {
     db: testDb.db,
     queue: null,
     aiReprocessQueue: null,
-    s3: s3Mock,
+    storage: staticStorage(s3Mock),
   });
 });
 
@@ -267,7 +268,7 @@ describe('POST /documents/bulk-delete — exclusão e escopo cirúrgico', () => 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).deleted).toBe(2);
     // Uma única remoção de objeto por documento, não uma por id repetido.
-    expect(s3Mock.deleteFile).toHaveBeenCalledTimes(2);
+    expect(s3Mock.delete).toHaveBeenCalledTimes(2);
   });
 
   it('documento JÁ excluído na lista → 404, e nada mais é excluído', async () => {
@@ -279,14 +280,14 @@ describe('POST /documents/bulk-delete — exclusão e escopo cirúrgico', () => 
     // seleção inteira é recusada e a contagem nunca é inflada por ele.
     expect(res.statusCode).toBe(404);
     expect(await snapshot(DOC_1)).toEqual({ deleted: false, content: 1, chunks: 1 });
-    expect(s3Mock.deleteFile).not.toHaveBeenCalled();
+    expect(s3Mock.delete).not.toHaveBeenCalled();
   });
 
   it('remove no S3 exatamente as chaves dos documentos excluídos', async () => {
     const res = await post(tokenAdminA, [DOC_1, DOC_2]);
     expect(res.statusCode).toBe(200);
 
-    const keys = (s3Mock.deleteFile as unknown as { mock: { calls: string[][] } }).mock.calls
+    const keys = (s3Mock.delete as unknown as { mock: { calls: string[][] } }).mock.calls
       .map((c) => c[0]!)
       .sort();
     expect(keys).toEqual([`s3/${DOC_1}`, `s3/${DOC_2}`].sort());
@@ -338,7 +339,7 @@ describe('POST /documents/bulk-delete — permissão e isolamento', () => {
 
     expect(res.statusCode).toBe(403);
     expect(await snapshot(DOC_1)).toEqual({ deleted: false, content: 1, chunks: 1 });
-    expect(s3Mock.deleteFile).not.toHaveBeenCalled();
+    expect(s3Mock.delete).not.toHaveBeenCalled();
   });
 
   it('ASSIMETRIA: o mesmo UPLOADER continua excluindo pelo DELETE /documents/:id', async () => {
@@ -360,7 +361,7 @@ describe('POST /documents/bulk-delete — permissão e isolamento', () => {
     expect(await snapshot(DOC_B)).toEqual({ deleted: false, content: 1, chunks: 1 });
     // ...e o documento válido de A também não foi tocado.
     expect(await snapshot(DOC_1)).toEqual({ deleted: false, content: 1, chunks: 1 });
-    expect(s3Mock.deleteFile).not.toHaveBeenCalled();
+    expect(s3Mock.delete).not.toHaveBeenCalled();
     expect(await countAudit('document.bulk_delete')).toBe(0);
   });
 
@@ -389,7 +390,7 @@ describe('POST /documents/bulk-delete — permissão e isolamento', () => {
     expect(res.statusCode).toBe(422);
     expect(await snapshot(DOC_1)).toEqual({ deleted: false, content: 1, chunks: 1 });
     expect(await snapshot(DOC_B)).toEqual({ deleted: false, content: 1, chunks: 1 });
-    expect(s3Mock.deleteFile).not.toHaveBeenCalled();
+    expect(s3Mock.delete).not.toHaveBeenCalled();
   });
 });
 
@@ -415,17 +416,18 @@ describe('POST /documents/bulk-delete — auditoria', () => {
 describe('POST /documents/bulk-delete — S3 best-effort', () => {
   it('falha ao remover no S3 não derruba a requisição nem desfaz a exclusão', async () => {
     const failingS3 = {
-      uploadFile: vi.fn().mockResolvedValue(undefined),
-      getSignedDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
-      deleteFile: vi.fn().mockRejectedValue(new Error('S3 fora do ar')),
-    } as unknown as S3Service;
+      provider: 's3',
+      put: vi.fn().mockResolvedValue(undefined),
+      getDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
+      delete: vi.fn().mockRejectedValue(new Error('S3 fora do ar')),
+    } as unknown as StorageDriver;
 
     const appWithFailingS3 = await buildApp({
       config: testConfig(),
       db: testDb.db,
       queue: null,
       aiReprocessQueue: null,
-      s3: failingS3,
+      storage: staticStorage(failingS3),
     });
 
     try {
@@ -441,7 +443,7 @@ describe('POST /documents/bulk-delete — S3 best-effort', () => {
       // Sem compensação: o documento excluído continua excluído.
       expect(await snapshot(DOC_1)).toEqual({ deleted: true, content: 0, chunks: 0 });
       expect(await snapshot(DOC_2)).toEqual({ deleted: true, content: 0, chunks: 0 });
-      expect(failingS3.deleteFile).toHaveBeenCalledTimes(2);
+      expect(failingS3.delete).toHaveBeenCalledTimes(2);
       // A auditoria continua registrada mesmo com o S3 falhando.
       expect(await countAudit('document.bulk_delete')).toBe(1);
     } finally {
