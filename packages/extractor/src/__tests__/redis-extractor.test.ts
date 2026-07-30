@@ -12,9 +12,9 @@ const { ExtractionError } = await import('../types.js');
 const { Redis: MockRedis } = await import('ioredis') as { Redis: ReturnType<typeof vi.fn> };
 
 const INPUT = {
-  s3Key: 'tenants/abc/doc.pdf',
-  s3Bucket: 'dmdoc-documents',
+  fileUrl: 'http://minio:9000/dmdoc-documents/tenants/abc/doc.pdf?X-Amz-Signature=deadbeef',
   mimeType: 'application/pdf',
+  filename: 'doc.pdf',
 };
 
 function makeExtractor(blpopTimeoutSecs = 30) {
@@ -52,6 +52,34 @@ describe('RedisExtractor', () => {
     expect(result.engineVersion).toBe('python-extractor-redis');
     expect(vi.mocked(pushConnection.rpush)).toHaveBeenCalledOnce();
     expect(disconnect).toHaveBeenCalledOnce();
+  });
+
+  it('publica { fileUrl, mimeType, filename } — sem nenhum vestígio de chave/bucket S3', async () => {
+    // O contrato com o Python é este payload: URL temporária + MIME + nome do
+    // arquivo. O `filename` viaja separado porque a URL termina em query string
+    // e o extractor escolhe o parser pela extensão quando o MIME é genérico.
+    const { extractor, pushConnection } = makeExtractor();
+    MockRedis.mockImplementationOnce(() => ({
+      blpop: vi.fn().mockResolvedValueOnce([
+        'extract:result:xxx',
+        JSON.stringify({ text: 'ok', pageCount: 1, ocrPages: [] }),
+      ]),
+      disconnect: vi.fn(),
+    }));
+
+    await extractor.extract(INPUT);
+
+    const [queue, raw] = vi.mocked(pushConnection.rpush).mock.calls[0] as [string, string];
+    expect(queue).toBe('extract:requests');
+
+    const payload = JSON.parse(raw) as Record<string, unknown>;
+    expect(payload['fileUrl']).toBe(INPUT.fileUrl);
+    expect(payload['mimeType']).toBe(INPUT.mimeType);
+    expect(payload['filename']).toBe('doc.pdf');
+    expect(typeof payload['requestId']).toBe('string');
+    expect(Object.keys(payload).sort()).toEqual(
+      ['fileUrl', 'filename', 'mimeType', 'requestId'].sort()
+    );
   });
 
   it('lança ExtractionError quando BLPOP faz timeout (retorna null)', async () => {

@@ -48,6 +48,7 @@ import {
   type AiReprocessStep,
 } from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
+import type { StorageDriver } from '@dmdoc/storage';
 import {
   createLLMProvider,
   LLMError,
@@ -91,7 +92,18 @@ interface DocumentRow extends TenantDocument {
   content_hash: string;
   size_bytes: bigint;
   mime_type: string;
-  s3_key: string;
+  storage_key: string;
+  /**
+   * Rótulo do destino onde o arquivo DESTA linha está: `s3` | `sharepoint`
+   * (migration 0017). DENORMALIZAÇÃO — nunca é o critério de "de onde ler":
+   * dois destinos diferentes do mesmo provider têm o mesmo valor aqui.
+   */
+  storage_provider: string;
+  /**
+   * A configuração de armazenamento de que ESTE arquivo depende para ser lido
+   * (E-11 / ADR-1). É a AUTORIDADE do destino. `null` = S3 da plataforma.
+   */
+  storage_config_id: string | null;
   status: 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED';
   failure_reason: string | null;
   tags: string[];
@@ -343,7 +355,7 @@ const BulkReprocessBodySchema = z.object({
  * Mesmo teto das demais operações em lote (500) e do `pageSize` máximo de
  * `GET /documents` — o front resolve "selecionar todos do filtro" enviando os
  * ids da página. Aqui o teto é uma trava de segurança, não de custo: a operação
- * é IRREVERSÍVEL (apaga chunks, texto extraído e o objeto no S3).
+ * é IRREVERSÍVEL (apaga chunks, texto extraído e o objeto no armazenamento).
  */
 const BULK_DELETE_MAX = 500;
 
@@ -384,7 +396,7 @@ const CLASSIFY_SCOPE_ALL: readonly ClassifyScope[] = ['type', 'title'];
 
 /**
  * Lê todos os bytes de um Readable em um único Buffer.
- * Necessário para calcular o sha256 e enviar ao S3.
+ * Necessário para calcular o sha256 e enviar ao armazenamento.
  */
 async function streamToBuffer(readable: NodeJS.ReadableStream): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -402,7 +414,7 @@ function sha256hex(buf: Buffer): string {
 }
 
 /**
- * Sanitiza o nome original do arquivo para uso seguro como chave S3.
+ * Sanitiza o nome original do arquivo para uso seguro como chave de armazenamento.
  * Remove caracteres especiais e preserva a extensão.
  */
 function sanitizeFilename(name: string): string {
@@ -579,7 +591,7 @@ function rowToDocument(r: DocumentRow): Record<string, unknown> {
     contentHash: r.content_hash,
     sizeBytes: Number(r.size_bytes),
     mimeType: r.mime_type,
-    s3Key: r.s3_key,
+    storageKey: r.storage_key,
     status: r.status,
     failureReason: r.failure_reason,
     tags: r.tags,
@@ -897,10 +909,16 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     }
 
     // ------------------------------------------------------------------
-    // 7. Upload para S3
+    // 7. Upload para o armazenamento
     // ------------------------------------------------------------------
-    const s3Key = `tenants/${tenantId}/documents/${contentHash}/${filename}`;
-    await app.s3.uploadFile({ key: s3Key, buffer: fileBuffer, mimeType });
+    const storageKey = `tenants/${tenantId}/documents/${contentHash}/${filename}`;
+    // Destino ATIVO da EMPRESA (bucket da plataforma, bucket próprio ou
+    // SharePoint). É o único ponto do arquivo em que resolver pela empresa está
+    // certo: arquivo NOVO vai para onde a empresa grava HOJE. Toda leitura
+    // posterior usa o `storage_config_id` gravado logo abaixo.
+    const { driver: storageDriver, storageConfigId } =
+      await app.storage.activeDestination(tenantId);
+    await storageDriver.put({ key: storageKey, buffer: fileBuffer, mimeType });
 
     // ------------------------------------------------------------------
     // 8. Persistir documento no PostgreSQL com status PENDING
@@ -930,7 +948,19 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       content_hash: contentHash,
       size_bytes: BigInt(fileSize),
       mime_type: mimeType,
-      s3_key: s3Key,
+      storage_key: storageKey,
+      // ONDE o arquivo ficou, por documento. Durante (e depois de) uma migração
+      // de acervo a empresa tem arquivos em destinos diferentes ao mesmo tempo,
+      // então quem lê precisa saber o destino DESTE arquivo — não o destino
+      // corrente da empresa (ver migration 0017).
+      //
+      // As duas colunas juntas, sempre: `storage_config_id` é a AUTORIDADE (a
+      // configuração cujas credenciais abrem este arquivo, `null` = plataforma)
+      // e `storage_provider` é o rótulo denormalizado dela. Gravar só o provider
+      // deixaria um documento em bucket próprio registrado como plataforma — o
+      // ponteiro errado que a ADR-1 corrigiu.
+      storage_provider: storageDriver.provider,
+      storage_config_id: storageConfigId,
       status: 'PENDING',
       failure_reason: null,
       tags: [],
@@ -968,10 +998,10 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       // concorrente do mesmo arquivo"): o perdedor é tratado como 409 Conflict
       // (nunca 500). A integridade é preservada — apenas um documento persiste.
       if ((insertError as { code?: string }).code === '23505') {
-        // NÃO remover o objeto do S3 aqui: a chave é derivada de
+        // NÃO remover o objeto do armazenamento aqui: a chave é derivada de
         // (contentHash, filename) e, quando o vencedor subiu o mesmo arquivo
         // com o mesmo nome, é a MESMA chave — apagá-la corromperia o documento
-        // vencedor. O conteúdo já está no S3 (upload idempotente). Um eventual
+        // vencedor. O conteúdo já está armazenado (upload idempotente). Um eventual
         // objeto órfão (nomes de arquivo diferentes) é custo aceitável nesta
         // corrida rara, preferível a arriscar apagar o arquivo do vencedor.
         request.log.info(
@@ -981,13 +1011,13 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         throw new ConflictError('Conteúdo já existe nesta empresa (conflito de deduplicação por corrida)');
       }
 
-      // Rollback: remove arquivo do S3 (erro de insert não relacionado à corrida).
+      // Rollback: remove arquivo do armazenamento (erro de insert não relacionado à corrida).
       try {
-        await app.s3.deleteFile(s3Key);
+        await storageDriver.delete(storageKey);
       } catch (deleteError) {
         request.log.error(
-          { err: deleteError, s3Key, tenantId, userId },
-          'falha ao remover arquivo do S3 no rollback'
+          { err: deleteError, storageKey, tenantId, userId },
+          'falha ao remover arquivo do armazenamento no rollback'
         );
       }
       throw insertError;
@@ -999,7 +1029,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const jobData: DocumentProcessingJobData = DocumentProcessingJobDataSchema.parse({
       tenantId,
       documentId: document.id,
-      s3Key,
+      storageKey,
       mimeType,
     });
 
@@ -1382,7 +1412,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
   });
 
   // =========================================================================
-  // GET /documents/:id/download — URL assinada S3
+  // GET /documents/:id/download — URL assinada do armazenamento
   // =========================================================================
   app.get('/documents/:id/download', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
@@ -1415,7 +1445,17 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       open === true
         ? `attachment; filename="${encodeURIComponent(doc.original_filename)}"`
         : undefined;
-    const url = await app.s3.getSignedDownloadUrl(doc.s3_key, expiresInSeconds, contentDisposition);
+    // Destino DESTE documento, não o corrente da empresa: um arquivo que ficou
+    // numa configuração aposentada continua sendo baixado de lá (E-11 / ADR-1).
+    const storageDriver = await app.storage.forStorageConfig(
+      doc.tenant_id,
+      doc.storage_config_id
+    );
+    const url = await storageDriver.getDownloadUrl(doc.storage_key, {
+      expiresInSeconds,
+      audience: 'browser',
+      ...(contentDisposition !== undefined && { contentDisposition }),
+    });
     const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
 
     const auditLogger = new AuditLogger(sql);
@@ -1425,7 +1465,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         userId,
         action: 'document.download',
         resource: `documents/${doc.id}`,
-        metadata: { filename: doc.original_filename, s3Key: doc.s3_key },
+        metadata: { filename: doc.original_filename, storageKey: doc.storage_key },
       });
     } catch (auditError) {
       request.log.error(
@@ -1439,7 +1479,120 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       'URL de download gerada'
     );
 
-    return reply.status(200).send({ url, expiresAt });
+    return reply.status(200).send({
+      url,
+      expiresAt,
+      // Destino DESTE arquivo, para o front saber com o que está lidando.
+      provider: storageDriver.provider,
+      /**
+       * A URL acima pode ser embutida em `<iframe>`/`<embed>`?
+       *
+       * Só no S3. A URL pré-autenticada do Microsoft Graph NÃO funciona em
+       * iframe — e não é CORS (o `Access-Control-Allow-Origin: *` está lá).
+       * Apurado por rede na T-139: o handler `download.aspx` que serve o
+       * conteúdo responde com `Content-Disposition: attachment` e
+       * `X-Frame-Options: SAMEORIGIN`. O `fetch` e a `<img>` passam; o visor de
+       * PDF quebra.
+       *
+       * Quando `false`, o front deve carregar `rawUrl` — o stream autenticado
+       * pelo backend, mesma origem, sem esses headers.
+       */
+      urlEmbeddable: storageDriver.provider === 's3',
+      /** Rota de stream pelo próprio backend. Exige o header Authorization. */
+      rawUrl: `/documents/${doc.id}/raw`,
+    });
+  });
+
+  // =========================================================================
+  // GET /documents/:id/raw — stream do arquivo pelo próprio backend
+  // =========================================================================
+  /**
+   * Serve o binário do documento a partir do backend, em vez de mandar o
+   * navegador para a URL do provedor.
+   *
+   * Existe por causa do SharePoint: a URL do Graph não pode ser embutida em
+   * `<iframe>` (ver `urlEmbeddable` no `/download` acima), então o visor de PDF
+   * precisa de uma URL de mesma origem. Vale para qualquer provedor — o S3
+   * também é servido por aqui se o front pedir.
+   *
+   * ⚠️ **Mesma ACL do `/download`**, byte a byte: mesma resolução por papel
+   * (`findDocumentGlobally` / `findDocumentInTenants` / `TenantRepository`) e o
+   * mesmo `assertCanReadDepartment`. Documento de outra empresa é 404 — nunca
+   * 403 e, principalmente, nunca o binário. Esta rota entrega o CONTEÚDO, não
+   * uma URL: um relaxamento de ACL aqui não vaza um link, vaza o arquivo.
+   *
+   * O arquivo vem inteiro em memória porque é o que a interface `StorageDriver`
+   * oferece (`get` devolve `Buffer`) — o mesmo que o `/preview` já faz. Um
+   * streaming de verdade exigiria um método novo no contrato dos dois drivers,
+   * que não é escopo desta tarefa.
+   */
+  app.get('/documents/:id/raw', { preHandler: app.authenticate }, async (request, reply) => {
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const sql = app.db;
+
+    const { id } = request.params as { id: string };
+
+    let doc: DocumentRow | null;
+
+    if (role === 'SUPER_ADMIN') {
+      doc = await findDocumentGlobally(sql, id);
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      doc = await findDocumentInTenants(sql, id, request.user?.allowedTenantIds ?? []);
+    } else {
+      const tenantId = request.tenantId as string;
+      const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
+      doc = await repo.findById(id);
+    }
+
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    await assertCanReadDepartment(sql, userId, doc.tenant_id, doc.department_id, role);
+
+    const { open } = DownloadQuerySchema.parse(request.query);
+
+    // Destino DESTE documento (E-11 / ADR-1) — um arquivo que ficou numa
+    // configuração aposentada continua sendo lido de lá.
+    const storageDriver = await app.storage.forStorageConfig(doc.tenant_id, doc.storage_config_id);
+    const fileBuffer = await storageDriver.get(doc.storage_key);
+
+    const auditLogger = new AuditLogger(sql);
+    try {
+      await auditLogger.record({
+        tenantId: doc.tenant_id,
+        userId,
+        action: 'document.raw',
+        resource: `documents/${doc.id}`,
+        metadata: { filename: doc.original_filename, storageKey: doc.storage_key },
+      });
+    } catch (auditError) {
+      request.log.error(
+        { err: auditError, tenantId: doc.tenant_id, userId, documentId: doc.id },
+        'falha ao registrar audit log de leitura do arquivo'
+      );
+    }
+
+    request.log.info(
+      { tenantId: doc.tenant_id, userId, documentId: doc.id, provider: storageDriver.provider },
+      'arquivo servido pelo backend'
+    );
+
+    // `inline` por padrão: o uso é o visor embutido. `?open=true` mantém a
+    // mesma semântica do `/download` (forçar o "salvar como" do navegador).
+    const disposition = open === true ? 'attachment' : 'inline';
+    return reply
+      .status(200)
+      .header('Content-Type', doc.mime_type)
+      .header(
+        'Content-Disposition',
+        `${disposition}; filename="${encodeURIComponent(doc.original_filename)}"`
+      )
+      .header('Content-Length', String(fileBuffer.byteLength))
+      // Conteúdo de uma empresa não pode ficar em cache compartilhado.
+      .header('Cache-Control', 'private, no-store')
+      .send(fileBuffer);
   });
 
   // =========================================================================
@@ -1485,7 +1638,12 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       return reply.status(422).send({ error: `mime type não suportado para preview: ${doc.mime_type}` });
     }
 
-    const fileBuffer = await app.s3.downloadFile(doc.s3_key);
+    // Mesma regra do download: o arquivo vem da configuração DELE.
+    const storageDriver = await app.storage.forStorageConfig(
+      doc.tenant_id,
+      doc.storage_config_id
+    );
+    const fileBuffer = await storageDriver.get(doc.storage_key);
 
     const { EXTRACTOR_URL } = getConfig();
     const extractorBaseUrl = EXTRACTOR_URL.replace(/\/extract$/, '');
@@ -2423,14 +2581,14 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         tenant_id: string;
         department_id: string;
         status: DocumentRow['status'];
-        s3_key: string;
+        storage_key: string;
         mime_type: string;
       }
       let foundDocs: ScopedDocRow[];
 
       if (role === 'SUPER_ADMIN') {
         foundDocs = await sql<ScopedDocRow[]>`
-          SELECT id, tenant_id, department_id, status, s3_key, mime_type
+          SELECT id, tenant_id, department_id, status, storage_key, mime_type
           FROM documents
           WHERE id = ANY(${dedupedIds}::uuid[])
             AND deleted = false
@@ -2440,7 +2598,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         foundDocs = allowed.length === 0
           ? []
           : await sql<ScopedDocRow[]>`
-              SELECT id, tenant_id, department_id, status, s3_key, mime_type
+              SELECT id, tenant_id, department_id, status, storage_key, mime_type
               FROM documents
               WHERE id = ANY(${dedupedIds}::uuid[])
                 AND tenant_id = ANY(${allowed}::uuid[])
@@ -2449,7 +2607,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       } else {
         const scopedTenantId = request.tenantId as string;
         foundDocs = await sql<ScopedDocRow[]>`
-          SELECT id, tenant_id, department_id, status, s3_key, mime_type
+          SELECT id, tenant_id, department_id, status, storage_key, mime_type
           FROM documents
           WHERE id = ANY(${dedupedIds}::uuid[])
             AND tenant_id = ${scopedTenantId}
@@ -2535,14 +2693,14 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         // documento já não está FAILED, não é tocado, não vira job duplicado e
         // não entra no `document_ids` do lote. O RETURNING — e não
         // `eligible.length` — é a fonte de verdade do `total`.
-        const requeuedRows = await tx<Array<{ id: string; s3_key: string; mime_type: string }>>`
+        const requeuedRows = await tx<Array<{ id: string; storage_key: string; mime_type: string }>>`
           UPDATE documents
           SET status = 'PENDING',
               failure_reason = NULL
           WHERE tenant_id = ${tenantId}
             AND id = ANY(${eligibleIds}::uuid[])
             AND status = 'FAILED'
-          RETURNING id, s3_key, mime_type
+          RETURNING id, storage_key, mime_type
         `;
 
         if (requeuedRows.length === 0) {
@@ -2565,7 +2723,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
           batch: created,
           requeued: requeuedRows.map((row) => ({
             id: row.id,
-            s3Key: row.s3_key,
+            storageKey: row.storage_key,
             mimeType: row.mime_type,
           })),
         };
@@ -2591,7 +2749,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
               data: DocumentProcessingJobDataSchema.parse({
                 tenantId,
                 documentId: doc.id,
-                s3Key: doc.s3Key,
+                storageKey: doc.storageKey,
                 mimeType: doc.mimeType,
               }),
               // Mesmas opts do reprocess individual. SEM `priority`: FIFO por
@@ -2746,7 +2904,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
   /**
    * Aplica a MESMA exclusão do `DELETE /documents/:id` a até 500 documentos numa
    * chamada: soft delete do documento (`deleted = true`), remoção FÍSICA de
-   * `chunks` e `document_content` e remoção do objeto no S3.
+   * `chunks` e `document_content` e remoção do objeto no armazenamento.
    *
    * SÍNCRONA, sem lote/fila/polling — ao contrário dos reprocessamentos em massa
    * (E-4/E-7), aqui não há trabalho a acompanhar: são 3 statements por `= ANY`
@@ -2781,7 +2939,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const { documentIds } = BulkDeleteBodySchema.parse(request.body);
 
     // Ids repetidos contariam duas vezes em `requested` e gerariam uma segunda
-    // tentativa de remoção do mesmo objeto no S3 — deduplica antes de tudo.
+    // tentativa de remoção do mesmo objeto no armazenamento — deduplica antes de tudo.
     const dedupedIds = [...new Set(documentIds)];
 
     // ------------------------------------------------------------------
@@ -2792,13 +2950,13 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       id: string;
       tenant_id: string;
       department_id: string;
-      s3_key: string;
+      storage_key: string;
     }
     let foundDocs: ScopedDocRow[];
 
     if (role === 'SUPER_ADMIN') {
       foundDocs = await sql<ScopedDocRow[]>`
-        SELECT id, tenant_id, department_id, s3_key
+        SELECT id, tenant_id, department_id, storage_key
         FROM documents
         WHERE id = ANY(${dedupedIds}::uuid[])
           AND deleted = false
@@ -2808,7 +2966,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       foundDocs = allowed.length === 0
         ? []
         : await sql<ScopedDocRow[]>`
-            SELECT id, tenant_id, department_id, s3_key
+            SELECT id, tenant_id, department_id, storage_key
             FROM documents
             WHERE id = ANY(${dedupedIds}::uuid[])
               AND tenant_id = ANY(${allowed}::uuid[])
@@ -2817,7 +2975,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     } else {
       const scopedTenantId = request.tenantId as string;
       foundDocs = await sql<ScopedDocRow[]>`
-        SELECT id, tenant_id, department_id, s3_key
+        SELECT id, tenant_id, department_id, storage_key
         FROM documents
         WHERE id = ANY(${dedupedIds}::uuid[])
           AND tenant_id = ${scopedTenantId}
@@ -2861,7 +3019,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     //    `AND deleted = false` no UPDATE + `RETURNING` é o guarda de corrida:
     //    se outra sessão excluiu um documento entre o passo 1 e este UPDATE,
     //    ele não é recontado. O RETURNING — e NUNCA `foundDocs.length` — é a
-    //    fonte de verdade da contagem e da lista de chaves S3 a remover.
+    //    fonte de verdade da contagem e da lista de chaves de armazenamento a remover.
     //
     //    Os DELETEs valem sobre `targetIds` (e não sobre as linhas do
     //    RETURNING) de propósito: um documento que perdeu a corrida já foi
@@ -2870,13 +3028,20 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const targetIds = foundDocs.map((doc) => doc.id);
 
     const deletedDocs = await sql.begin(async (tx) => {
-      const rows = await tx<Array<{ id: string; s3_key: string }>>`
+      const rows = await tx<
+        Array<{
+          id: string;
+          tenant_id: string;
+          storage_key: string;
+          storage_config_id: string | null;
+        }>
+      >`
         UPDATE documents
         SET deleted = true
         WHERE tenant_id = ${tenantId}
           AND id = ANY(${targetIds}::uuid[])
           AND deleted = false
-        RETURNING id, s3_key
+        RETURNING id, tenant_id, storage_key, storage_config_id
       `;
 
       await tx`
@@ -2892,35 +3057,70 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
 
       // Materializa em objetos simples: o resultado de postgres.js carrega
       // metadados que não sobrevivem ao unwrap do `begin`.
-      return rows.map((row) => ({ id: row.id, s3Key: row.s3_key }));
+      return rows.map((row) => ({
+        id: row.id,
+        tenantId: row.tenant_id,
+        storageKey: row.storage_key,
+        storageConfigId: row.storage_config_id,
+      }));
     });
 
     const deletedCount = deletedDocs.length;
 
     // ------------------------------------------------------------------
-    // 5. S3 DEPOIS do commit, nunca dentro: apagar antes arriscaria destruir o
+    // 5. Armazenamento DEPOIS do commit, nunca dentro: apagar antes arriscaria destruir o
     //    arquivo de uma transação que não commitou.
     //
     //    Best-effort com `Promise.allSettled` — 500 deleções não podem virar
     //    500 rejeições não tratadas. Falha só loga e NÃO desfaz a exclusão,
     //    exatamente como no delete individual: o documento excluído continua
-    //    excluído (o pior caso é um objeto órfão no bucket).
+    //    excluído (o pior caso é um objeto órfão no bucket). Resolver o driver
+    //    também entra no `allSettled`: uma credencial de storage quebrada não
+    //    pode transformar em 500 uma exclusão que já commitou.
+    //
+    //    ⚠️ O destino sai do `storage_config_id` de CADA documento, nunca do
+    //    destino corrente da empresa. Depois de uma migração parcial, dois
+    //    documentos do MESMO tenant estão em configurações diferentes: agrupar
+    //    por tenant apagaria um deles no lugar errado — no melhor caso um no-op
+    //    silencioso (o arquivo continua no destino antigo, órfão para sempre),
+    //    no pior um objeto homônimo de outro destino. Um driver por
+    //    CONFIGURAÇÃO, memoizado: sem isso, 500 documentos resolveriam o mesmo
+    //    destino 500 vezes — 500 consultas e, no SharePoint, 500 pedidos de
+    //    token. O `tenant_id` continua no par porque a resolução por
+    //    configuração exige os dois (defesa em profundidade da FK composta).
     // ------------------------------------------------------------------
-    const s3Results = await Promise.allSettled(
-      deletedDocs.map((doc) => app.s3.deleteFile(doc.s3Key))
+    const driverByConfig = new Map<string, Promise<StorageDriver>>();
+    const driverFor = (
+      docTenantId: string,
+      storageConfigId: string | null
+    ): Promise<StorageDriver> => {
+      const key = `${docTenantId}:${storageConfigId ?? 'platform'}`;
+      let pending = driverByConfig.get(key);
+      if (pending === undefined) {
+        pending = app.storage.forStorageConfig(docTenantId, storageConfigId);
+        driverByConfig.set(key, pending);
+      }
+      return pending;
+    };
+
+    const storageResults = await Promise.allSettled(
+      deletedDocs.map(async (doc) => {
+        const driver = await driverFor(doc.tenantId, doc.storageConfigId);
+        await driver.delete(doc.storageKey);
+      })
     );
-    s3Results.forEach((result, i) => {
+    storageResults.forEach((result, i) => {
       if (result.status === 'rejected') {
         request.log.error(
           {
             err: result.reason,
-            tenantId,
+            tenantId: deletedDocs[i]!.tenantId,
             userId,
             documentId: deletedDocs[i]!.id,
-            s3Key: deletedDocs[i]!.s3Key,
+            storageKey: deletedDocs[i]!.storageKey,
             traceId: request.id,
           },
-          'falha ao remover arquivo do S3 em exclusão em massa'
+          'falha ao remover arquivo do armazenamento em exclusão em massa'
         );
       }
     });
@@ -3058,7 +3258,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
   });
 
   // =========================================================================
-  // DELETE /documents/:id — exclusão lógica + limpeza de chunks/S3
+  // DELETE /documents/:id — exclusão lógica + limpeza de chunks e do armazenamento
   // =========================================================================
   app.delete('/documents/:id', { preHandler: app.authenticate }, async (request, reply) => {
     const userId = request.user!.sub;
@@ -3096,9 +3296,12 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       sql`DELETE FROM document_content WHERE document_id = ${id} AND tenant_id = ${tenantId}`,
     ]);
 
-    // Remove o arquivo do S3
-    await app.s3.deleteFile(doc.s3_key).catch((s3Err: unknown) => {
-      request.log.error({ err: s3Err, s3Key: doc.s3_key }, 'falha ao remover arquivo do S3');
+    // Remove o arquivo do armazenamento — na configuração DESTE documento (que,
+    // para SUPER_ADMIN/MTA, nem é da empresa do token, e que depois de uma
+    // migração pode não ser o destino corrente da empresa).
+    const storageDriver = await app.storage.forStorageConfig(tenantId, doc.storage_config_id);
+    await storageDriver.delete(doc.storage_key).catch((storageErr: unknown) => {
+      request.log.error({ err: storageErr, storageKey: doc.storage_key }, 'falha ao remover arquivo do armazenamento');
     });
 
     const auditLogger = new AuditLogger(sql);
@@ -3108,7 +3311,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         userId,
         action: 'document.delete',
         resource: `documents/${doc.id}`,
-        metadata: { filename: doc.filename, s3Key: doc.s3_key },
+        metadata: { filename: doc.filename, storageKey: doc.storage_key },
       });
     } catch (auditError) {
       request.log.error(
@@ -3176,7 +3379,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const jobData: DocumentProcessingJobData = DocumentProcessingJobDataSchema.parse({
       tenantId,
       documentId: doc.id,
-      s3Key: doc.s3_key,
+      storageKey: doc.storage_key,
       mimeType: doc.mime_type,
     });
 

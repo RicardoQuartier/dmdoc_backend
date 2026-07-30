@@ -97,7 +97,7 @@ async function seedReadyDoc(): Promise<string> {
     INSERT INTO documents (
       id, tenant_id, department_id, document_type_id,
       filename, original_filename, content_hash, size_bytes, mime_type,
-      s3_key, status, failure_reason, tags, index_values,
+      storage_key, status, failure_reason, tags, index_values,
       uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
     ) VALUES (
       ${docId}, ${TENANT}, ${DEPT_ID}, ${DOC_TYPE_ID},
@@ -185,7 +185,7 @@ describe('suggestDocumentIndexes — documentTypeId explícito (caminho do worke
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${TENANT}, ${DEPT_ID}, ${null},

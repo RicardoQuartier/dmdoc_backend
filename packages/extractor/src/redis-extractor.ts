@@ -25,15 +25,18 @@ export class RedisExtractor implements ExtractorProvider {
   constructor(private readonly cfg: RedisExtractorConfig) {}
 
   async extract(input: ExtractInput): Promise<ExtractionResult> {
-    const { s3Key, s3Bucket, mimeType } = input;
+    const { fileUrl, mimeType, filename } = input;
     const requestId = randomUUID();
     const resultKey = `${RESULT_PREFIX}${requestId}`;
     const timeoutSecs = this.cfg.blpopTimeoutSecs ?? DEFAULT_BLPOP_TIMEOUT_SECS;
     const startMs = Date.now();
 
+    // O payload carrega a URL assinada — que é credencial de leitura do arquivo
+    // enquanto valer. Fica só no Redis interno e no `extract:result:{id}` de
+    // vida curta; nunca é logado inteiro (o worker loga host + caminho).
     await this.cfg.pushConnection.rpush(
       REQUEST_QUEUE,
-      JSON.stringify({ requestId, s3Key, s3Bucket, mimeType })
+      JSON.stringify({ requestId, fileUrl, mimeType, filename })
     );
 
     // Conexão dedicada por chamada: ioredis não permite múltiplos BLPOP concorrentes

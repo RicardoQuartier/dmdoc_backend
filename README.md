@@ -68,41 +68,10 @@ Batem em PostgreSQL real. Cada execução cria e dropa um banco próprio
 (`dmdoc_test_<chave>`), então duas suítes concorrentes não se atrapalham e
 **não é preciso passar `TEST_DATABASE_URL`** — ver `packages/db-pg/README.md`.
 
----
-
-### MongoDB (`@dmdoc/db-mongo`)
-
-#### Índices
-
-Os índices MongoDB **não estão nas migrations** — precisam ser criados separadamente após o primeiro deploy ou migrate:fresh.
-
-```bash
-# Cria todos os índices (regulares + Atlas Search + Vector Search) — recomendado
-pnpm --filter @dmdoc/db-mongo setup-indexes
-
-# Apenas índices regulares (compound, unique, etc.)
-pnpm --filter @dmdoc/db-mongo create-indexes
-
-# Apenas Atlas Search (lexical) e Vector Search (embeddings)
-pnpm --filter @dmdoc/db-mongo create-atlas-indexes
-```
-
-> Todos os comandos são idempotentes — podem ser rodados múltiplas vezes sem efeito colateral.
-
-> Em produção passe `MONGO_URI` explicitamente:
-> ```bash
-> MONGO_URI="mongodb+srv://..." pnpm --filter @dmdoc/db-mongo setup-indexes
-> ```
-
-#### Seed e reset
-
-```bash
-# Popula o banco com dados iniciais de desenvolvimento
-pnpm --filter @dmdoc/db-mongo seed
-
-# Apaga todas as coleções e recria (equivalente ao db:fresh da raiz)
-pnpm --filter @dmdoc/db-mongo db:fresh
-```
+> **Não existe mais `@dmdoc/db-mongo`.** O projeto migrou de MongoDB Atlas para
+> PostgreSQL 16 + pgvector: os índices lexical (GIN sobre `tsvector`) e vetorial
+> (HNSW do `pgvector`) são criados **pelas migrations**, e não por um passo
+> separado como no Atlas. Tudo de banco está em `@dmdoc/db-pg`.
 
 ## Apps
 
@@ -136,13 +105,32 @@ pnpm --filter @dmdoc/worker test       # testes (Vitest)
 
 ## Pacotes
 
-### `@dmdoc/db-mongo`
+Os apps resolvem os pacotes pelo `dist/`. Depois de editar o `src/` de qualquer
+`packages/*`, rode o `build` do pacote e reinicie api/worker — sem isso o runtime
+continua executando a versão anterior. A ordem de build é
+`shared-types` → `extractor` → `logger` → `llm-provider` → `db-pg` (serviço
+`backend-install` do `docker-compose.yml` da raiz).
+
+### `@dmdoc/db-pg`
 
 ```bash
-pnpm --filter @dmdoc/db-mongo build      # compila para dist/
-pnpm --filter @dmdoc/db-mongo typecheck  # verificação de tipos
-pnpm --filter @dmdoc/db-mongo lint       # ESLint
-pnpm --filter @dmdoc/db-mongo test       # testes (Vitest)
+pnpm --filter @dmdoc/db-pg build      # compila para dist/
+pnpm --filter @dmdoc/db-pg typecheck  # verificação de tipos
+pnpm --filter @dmdoc/db-pg lint       # ESLint
+pnpm --filter @dmdoc/db-pg test       # testes (Vitest, PostgreSQL real)
+```
+
+### `@dmdoc/storage`
+
+Armazenamento de arquivos por empresa: interface `StorageDriver`, driver S3
+(AWS/R2/MinIO), driver SharePoint (Microsoft Graph, app-only), cripto
+AES-256-GCM do segredo e resolução do destino por documento. Ver spec §6.3.
+
+```bash
+pnpm --filter @dmdoc/storage build      # compila para dist/
+pnpm --filter @dmdoc/storage typecheck  # verificação de tipos
+pnpm --filter @dmdoc/storage lint       # ESLint
+pnpm --filter @dmdoc/storage test       # testes (Vitest, com mocks de HTTP/SDK)
 ```
 
 ### `@dmdoc/extractor`
@@ -186,11 +174,13 @@ Principais variáveis:
 
 | Variável | Padrão dev | Descrição |
 |---|---|---|
-| `MONGO_URI` | `mongodb://localhost:27017` | Connection string MongoDB |
-| `MONGO_DB` | `dmdoc` | Nome do banco |
+| `DATABASE_URL` | `postgresql://dmdoc:dmdoc@localhost:5432/dmdoc` | Connection string PostgreSQL |
 | `REDIS_URL` | `redis://localhost:5052` | URL do Redis (BullMQ) |
-| `AWS_S3_BUCKET` | `dmdoc-documents` | Bucket S3/MinIO |
-| `S3_ENDPOINT` | `http://localhost:5054` | Endpoint MinIO local |
+| `AWS_S3_BUCKET` | `dmdoc-documents` | Bucket S3/MinIO **da plataforma** (destino default) |
+| `S3_ENDPOINT` | `http://minio:9000` | Endpoint interno do MinIO |
+| `S3_PUBLIC_ENDPOINT` | `http://localhost:5054` | Endpoint publicado, usado só ao assinar URL para o navegador |
+| `STORAGE_SECRET_KEY` | — | **Obrigatória** (api e worker). 32 bytes hex (`openssl rand -hex 32`) que cifram o segredo de storage de cada empresa. Trocá-la torna ilegível todo segredo já cifrado |
+| `EXTRACT_URL_TTL_SECS` | `1800` | Validade da URL temporária entregue ao extractor |
 | `EXTRACTOR` | `python` | Motor de extração (`python`) |
 | `EXTRACTOR_URL` | `http://localhost:5056/extract` | URL do microserviço extractor |
 | `LLM_PROVIDER` | `openrouter` | Provedor LLM (`openai` ou `openrouter`) |

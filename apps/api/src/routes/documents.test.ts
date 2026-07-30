@@ -3,20 +3,21 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { FastifyInstance } from 'fastify';
 import FormData from 'form-data';
 import { buildApp } from '../app.js';
-import { startTestDb, seedUser, testConfig, type TestDb } from '../test/helpers.js';
-import type { S3Service } from '../services/s3.js';
+import { startTestDb, seedUser, testConfig, type TestDb, staticStorage } from '../test/helpers.js';
+import type { StorageDriver } from '@dmdoc/storage';
 import { newId } from '@dmdoc/db-pg';
 import type { LLMProvider, ChatResult } from '@dmdoc/llm-provider';
 
 // ---------------------------------------------------------------------------
-// Mock de S3Service — nunca chama AWS real nos testes
+// Mock de StorageDriver — nunca chama AWS real nos testes
 // ---------------------------------------------------------------------------
-function createMockS3(): S3Service {
+function createMockS3(): StorageDriver {
   return {
-    uploadFile: vi.fn().mockResolvedValue(undefined),
-    getSignedDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
-    deleteFile: vi.fn().mockResolvedValue(undefined),
-  } as unknown as S3Service;
+    provider: 's3',
+    put: vi.fn().mockResolvedValue(undefined),
+    getDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
+    delete: vi.fn().mockResolvedValue(undefined),
+  } as unknown as StorageDriver;
 }
 
 // ---------------------------------------------------------------------------
@@ -42,7 +43,7 @@ const DISK_QUOTA = 10 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 let app: FastifyInstance;
 let testDb: TestDb;
-let mockS3: S3Service;
+let mockS3: StorageDriver;
 let tokenAdminA: string;
 let tokenUploaderA: string;
 let tokenAdminB: string;
@@ -63,7 +64,7 @@ beforeAll(async () => {
     config: testConfig(),
     db: testDb.db,
     queue: null, // sem Redis nos testes
-    s3: mockS3,
+    storage: staticStorage(mockS3),
     llmProvider: fakeLlm,
   });
 });
@@ -220,7 +221,7 @@ describe('POST /documents — upload básico', () => {
     expect(body.deleted).toBe(false);
 
     // Verificar que o S3 foi chamado
-    expect(mockS3.uploadFile).toHaveBeenCalledOnce();
+    expect(mockS3.put).toHaveBeenCalledOnce();
   });
 
   it('UPLOADER com permissão de escrita consegue fazer upload', async () => {
@@ -285,7 +286,7 @@ describe('POST /documents — upload básico', () => {
     expect(logs[0]?.['user_id']).toBe(ADMIN_A_ID);
   });
 
-  it('retorna s3Key com formato correto', async () => {
+  it('retorna storageKey com formato correto', async () => {
     const { payload, headers } = buildUploadForm({
       departmentId: DEPT_A_ID,
       filename: 'meu documento.pdf',
@@ -300,8 +301,8 @@ describe('POST /documents — upload básico', () => {
 
     expect(res.statusCode).toBe(201);
     const body = res.json() as Record<string, unknown>;
-    const s3Key = body.s3Key as string;
-    expect(s3Key).toMatch(new RegExp(`^tenants/${TENANT_A}/documents/[a-f0-9]{64}/`));
+    const storageKey = body.storageKey as string;
+    expect(storageKey).toMatch(new RegExp(`^tenants/${TENANT_A}/documents/[a-f0-9]{64}/`));
   });
 });
 
@@ -410,7 +411,7 @@ describe('POST /documents — deduplicação por SHA-256', () => {
     expect(res2.json().id).toBe(firstDocId);
 
     // S3 só deve ter sido chamado uma vez (não faz upload duplicado)
-    expect(mockS3.uploadFile).toHaveBeenCalledOnce();
+    expect(mockS3.put).toHaveBeenCalledOnce();
   });
 
   it('documentos com conteúdo diferente não sofrem dedup', async () => {
@@ -439,7 +440,7 @@ describe('POST /documents — deduplicação por SHA-256', () => {
     expect(res1.statusCode).toBe(201);
     expect(res2.statusCode).toBe(201);
     expect(res1.json().id).not.toBe(res2.json().id);
-    expect(mockS3.uploadFile).toHaveBeenCalledTimes(2);
+    expect(mockS3.put).toHaveBeenCalledTimes(2);
   });
 
   it('tenants diferentes com mesmo arquivo NÃO são deduplicados entre si', async () => {
@@ -465,7 +466,7 @@ describe('POST /documents — deduplicação por SHA-256', () => {
     // Ids diferentes — tenants isolados
     expect(resA.json().id).not.toBe(resB.json().id);
     // S3 foi chamado duas vezes (um por tenant)
-    expect(mockS3.uploadFile).toHaveBeenCalledTimes(2);
+    expect(mockS3.put).toHaveBeenCalledTimes(2);
   });
 
   it('reenvio de conteúdo cujo doc está FAILED cria um NOVO documento (exceção FAILED), nunca 500/dedup', async () => {
@@ -482,7 +483,7 @@ describe('POST /documents — deduplicação por SHA-256', () => {
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${failedDocId}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
@@ -535,7 +536,7 @@ describe('POST /documents — deduplicação por SHA-256', () => {
     // Ao segurar TODOS os handlers no upload S3 por um instante, garantimos que
     // todos passem pela checagem de dedup (achando nada) antes de qualquer
     // insert — forçando a corrida no índice único de forma reproduzível.
-    vi.mocked(mockS3.uploadFile).mockImplementation(async () => {
+    vi.mocked(mockS3.put).mockImplementation(async () => {
       await new Promise((resolve) => setTimeout(resolve, 60));
     });
 
@@ -568,7 +569,7 @@ describe('POST /documents — deduplicação por SHA-256', () => {
       expect((loser.json() as { error: { code: string } }).error.code).toBe('CONFLICT');
     } finally {
       // Restaura o mock (clearAllMocks do beforeEach zera chamadas, não a impl).
-      vi.mocked(mockS3.uploadFile).mockImplementation(async () => undefined);
+      vi.mocked(mockS3.put).mockImplementation(async () => undefined);
     }
 
     // Integridade preservada: exatamente um documento não-deletado com o hash.
@@ -606,7 +607,7 @@ describe('POST /documents — verificação de cota', () => {
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${newId()}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
@@ -831,7 +832,7 @@ describe('ACL por raiz — herança dinâmica de acesso à subárvore', () => {
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${TENANT_A}, ${childId}, NULL,
@@ -866,7 +867,7 @@ describe('ACL — concessão revogada (department_permissions.deleted=true) não
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${tenantId}, ${departmentId}, NULL,
@@ -1062,7 +1063,7 @@ describe('Papel USER é somente leitura — gate de escrita de documentos por pa
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${tenantId}, ${departmentId}, NULL,
@@ -1247,7 +1248,7 @@ describe('documentos órfãos — departamento soft-deletado preserva acesso', (
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${tenantId}, ${departmentId}, NULL,
@@ -1395,7 +1396,7 @@ describe('GET /documents/:id — typeSuggestion (Fase 8)', () => {
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
@@ -1531,7 +1532,7 @@ describe('GET /documents/:id — fullText (T-23)', () => {
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
@@ -1628,7 +1629,7 @@ describe('GET /documents/:id — indexSuggestion (T-16)', () => {
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
@@ -1751,7 +1752,7 @@ describe('GET /documents/:id — documentTypeName', () => {
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${TENANT_A}, ${DEPT_A_ID}, ${documentTypeId},
@@ -1832,7 +1833,7 @@ describe('GET /documents/:id — titleSuggestionEnabled (T-18)', () => {
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${TENANT_A}, ${DEPT_A_ID}, NULL,
@@ -2120,7 +2121,7 @@ describe('GET /documents — ordenação, filtros, busca textual e paginação p
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${opts.id}, ${TENANT_A}, ${opts.departmentId}, ${opts.documentTypeId},
@@ -2296,7 +2297,7 @@ describe('GET /documents — ordenação, filtros, busca textual e paginação p
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docBId}, ${TENANT_B}, ${DEPT_B_ID}, NULL,
@@ -2489,7 +2490,7 @@ describe('GET /documents — ordenação, filtros, busca textual e paginação p
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docBId}, ${TENANT_B}, ${DEPT_B_ID}, NULL,
@@ -2622,7 +2623,7 @@ describe('GET /documents — ordenação, filtros, busca textual e paginação p
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docBId}, ${TENANT_B}, ${DEPT_B_ID}, NULL,
@@ -2666,7 +2667,7 @@ describe('POST /documents/bulk-reassign-uploader', () => {
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${opts.id}, ${opts.tenantId}, ${opts.departmentId}, NULL,
@@ -3169,7 +3170,7 @@ describe('POST /documents/:id/classify (Fase 8)', () => {
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${tenantId}, ${departmentId}, ${documentTypeId},
@@ -3758,7 +3759,7 @@ describe('PATCH /documents/:id — sugestão automática de índices ao definir 
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${TENANT_A}, ${DEPT_A_ID}, ${null},
@@ -4019,7 +4020,7 @@ describe('POST /documents/:id/generate-tags (Fase 9 / E-3)', () => {
       INSERT INTO documents (
         id, tenant_id, department_id, document_type_id,
         filename, original_filename, content_hash, size_bytes, mime_type,
-        s3_key, status, failure_reason, tags, index_values,
+        storage_key, status, failure_reason, tags, index_values,
         uploaded_by_id, uploaded_at, processed_at, cost_usd_cents, deleted
       ) VALUES (
         ${docId}, ${tenantId}, ${departmentId}, NULL,

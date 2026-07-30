@@ -8,8 +8,9 @@ import {
   testConfig,
   resetDomainTables,
   type TestDb,
+  staticStorage,
 } from '../test/helpers.js';
-import type { S3Service } from '../services/s3.js';
+import type { StorageDriver } from '@dmdoc/storage';
 import { newId } from '@dmdoc/db-pg';
 
 /**
@@ -49,12 +50,13 @@ import { newId } from '@dmdoc/db-pg';
  * TENANT_B: DEPT_B e DEPT_B2 — nunca alcançáveis a partir de A.
  */
 
-function createMockS3(): S3Service {
+function createMockS3(): StorageDriver {
   return {
-    uploadFile: vi.fn().mockResolvedValue(undefined),
-    getSignedDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
-    deleteFile: vi.fn().mockResolvedValue(undefined),
-  } as unknown as S3Service;
+    provider: 's3',
+    put: vi.fn().mockResolvedValue(undefined),
+    getDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
+    delete: vi.fn().mockResolvedValue(undefined),
+  } as unknown as StorageDriver;
 }
 
 // UUIDs de tenant por arquivo — evita colisão no `dmdoc_test` compartilhado.
@@ -83,7 +85,7 @@ const ZERO_EMBEDDING = `[${new Array(1536).fill(0).join(',')}]`;
 
 let app: FastifyInstance;
 let testDb: TestDb;
-let s3Mock: S3Service;
+let s3Mock: StorageDriver;
 
 let tokenAdminA: string;
 let tokenUploaderAmbos: string;
@@ -137,7 +139,7 @@ async function seedDocument(params: {
   await testDb.db`
     INSERT INTO documents (
       id, tenant_id, department_id, document_type_id, filename, original_filename,
-      content_hash, size_bytes, mime_type, s3_key, status, failure_reason,
+      content_hash, size_bytes, mime_type, storage_key, status, failure_reason,
       uploaded_by_id, uploaded_at, index_values, tags, deleted
     ) VALUES (
       ${id}, ${tenantId}, ${departmentId}, NULL, ${'f-' + id + '.pdf'}, 'doc.pdf',
@@ -241,7 +243,7 @@ beforeAll(async () => {
     db: testDb.db,
     queue: null,
     aiReprocessQueue: null,
-    s3: s3Mock,
+    storage: staticStorage(s3Mock),
   });
 });
 

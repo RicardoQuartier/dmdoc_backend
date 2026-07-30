@@ -30,7 +30,7 @@ const DOC_TYPE_ID = 'cccc0000-0000-0000-0000-000000000001';
 async function insertDocument(id: string, opts: { deleted?: boolean } = {}): Promise<void> {
   await sql`INSERT INTO documents (
       id, tenant_id, department_id, document_type_id, filename, original_filename,
-      content_hash, size_bytes, mime_type, s3_key, status, uploaded_by_id, deleted
+      content_hash, size_bytes, mime_type, storage_key, status, uploaded_by_id, deleted
     ) VALUES (
       ${id}, ${TENANT_ID}, ${DEPT_ID}, ${DOC_TYPE_ID}, 'f.pdf', 'f.pdf',
       ${`hash-${id}`}, ${1234}, 'application/pdf', ${`tenants/${TENANT_ID}/${id}`}, 'READY',

@@ -67,7 +67,7 @@ function makeJob(tenantId: string): DocumentProcessingJobData {
   return {
     tenantId,
     documentId: DOCUMENT_ID,
-    s3Key: `tenants/${tenantId}/documents/${DOCUMENT_ID}/file.pdf`,
+    storageKey: `tenants/${tenantId}/documents/${DOCUMENT_ID}/file.pdf`,
     mimeType: 'application/pdf',
   };
 }

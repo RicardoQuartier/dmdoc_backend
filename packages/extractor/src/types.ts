@@ -20,13 +20,33 @@ export interface ExtractionResult {
 }
 
 /**
- * Entrada para extração de documento — endereça o arquivo via S3.
- * O extractor é responsável por buscar o conteúdo diretamente do storage.
+ * Entrada para extração de documento — endereça o arquivo por URL temporária.
+ *
+ * O extractor NÃO conhece o destino de armazenamento: quem chama resolve o
+ * driver da empresa e entrega uma URL já autenticada, que o extractor apenas
+ * baixa por HTTP. É o que permite extrair de S3, MinIO ou SharePoint sem que o
+ * microserviço Python saiba de qual dos três se trata.
  */
 export interface ExtractInput {
-  s3Key: string;
-  s3Bucket: string;
+  /**
+   * URL de download temporária, JÁ AUTENTICADA (presign do S3, link do Graph).
+   * Precisa ser alcançável de dentro da rede do extractor — quem gera usa
+   * `audience: 'internal'`, nunca `'browser'`.
+   *
+   * A validade tem de cobrir fila + processamento, não só o download: o pedido
+   * pode esperar atrás de outra extração pesada antes de sair da fila.
+   */
+  fileUrl: string;
   mimeType: string;
+  /**
+   * Nome original do arquivo (`relatorio.docx`), com extensão.
+   *
+   * Campo PRÓPRIO, e não derivado da URL, de propósito: o extractor escolhe o
+   * parser pelo MIME **ou** pela extensão, e uma URL assinada termina em query
+   * string (`?X-Amz-Signature=...`) — derivar o nome dela faria a escolha de
+   * parser falhar em silêncio nos formatos que dependem da extensão.
+   */
+  filename: string;
 }
 
 /**
