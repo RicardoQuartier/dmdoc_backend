@@ -233,6 +233,247 @@ describe('POST /auth/logout', () => {
   });
 });
 
+describe('PATCH /auth/me', () => {
+  it('sem token → 401', async () => {
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/auth/me',
+      payload: { name: 'Novo Nome' },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('trocar só o nome não exige senha atual → 200 com o usuário atualizado', async () => {
+    await seedDefaultUser();
+    const accessToken = await loginAndGetAccess();
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/auth/me',
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { name: 'Nome Alterado' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.name).toBe('Nome Alterado');
+    expect(body.email).toBe('admin@empresa.com');
+    expect(body.passwordHash).toBeUndefined();
+
+    const rows = await testDb.db<Array<{ name: string }>>`
+      SELECT name FROM users WHERE id = ${USER_ID}
+    `;
+    expect(rows[0]!.name).toBe('Nome Alterado');
+  });
+
+  it('trocar e-mail sem currentPassword → 422 (Zod refine)', async () => {
+    await seedDefaultUser();
+    const accessToken = await loginAndGetAccess();
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/auth/me',
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { email: 'novo@empresa.com' },
+    });
+
+    expect(res.statusCode).toBe(422);
+  });
+
+  it('trocar e-mail com currentPassword errada → 422 (senha atual incorreta)', async () => {
+    await seedDefaultUser();
+    const accessToken = await loginAndGetAccess();
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/auth/me',
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { email: 'novo@empresa.com', currentPassword: 'senha-errada' },
+    });
+
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
+
+    const rows = await testDb.db<Array<{ email: string }>>`
+      SELECT email FROM users WHERE id = ${USER_ID}
+    `;
+    expect(rows[0]!.email).toBe('admin@empresa.com');
+  });
+
+  it('trocar e-mail com currentPassword correta → 200 e e-mail atualizado', async () => {
+    await seedDefaultUser();
+    const accessToken = await loginAndGetAccess();
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/auth/me',
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { email: 'novo@empresa.com', currentPassword: PASSWORD },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().email).toBe('novo@empresa.com');
+
+    const rows = await testDb.db<Array<{ email: string }>>`
+      SELECT email FROM users WHERE id = ${USER_ID}
+    `;
+    expect(rows[0]!.email).toBe('novo@empresa.com');
+  });
+
+  it('e-mail já usado por outro usuário do mesmo tenant → 409', async () => {
+    await seedDefaultUser();
+    await seedUser(testDb.db, {
+      id: 'cccccccc-cccc-cccc-cccc-cccccccccccc',
+      tenantId: TENANT_A,
+      email: 'outro@empresa.com',
+      password: PASSWORD,
+    });
+    const accessToken = await loginAndGetAccess();
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/auth/me',
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { email: 'outro@empresa.com', currentPassword: PASSWORD },
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('CONFLICT');
+  });
+
+  it('registra audit log user.update_profile só com os nomes dos campos alterados', async () => {
+    await seedDefaultUser();
+    const accessToken = await loginAndGetAccess();
+
+    await app.inject({
+      method: 'PATCH',
+      url: '/auth/me',
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { name: 'Fulano', email: 'fulano@empresa.com', currentPassword: PASSWORD },
+    });
+
+    const logs = await testDb.db<Array<{
+      tenant_id: string;
+      user_id: string;
+      action: string;
+      resource: string;
+      metadata: unknown;
+    }>>`SELECT * FROM audit_logs WHERE action = 'user.update_profile'`;
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0]!.tenant_id).toBe(TENANT_A);
+    expect(logs[0]!.user_id).toBe(USER_ID);
+    expect(logs[0]!.resource).toBe(`users/${USER_ID}`);
+    const metadata = (
+      typeof logs[0]!.metadata === 'string' ? JSON.parse(logs[0]!.metadata as string) : logs[0]!.metadata
+    ) as { fields?: string[] };
+    expect(metadata.fields).toEqual(expect.arrayContaining(['name', 'email']));
+  });
+
+  it('body com chave desconhecida → 422 (.strict())', async () => {
+    await seedDefaultUser();
+    const accessToken = await loginAndGetAccess();
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/auth/me',
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { role: 'SUPER_ADMIN' },
+    });
+
+    expect(res.statusCode).toBe(422);
+  });
+});
+
+describe('POST /auth/me/password', () => {
+  it('sem token → 401', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/auth/me/password',
+      payload: { currentPassword: PASSWORD, newPassword: 'nova-senha-bem-grande' },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('currentPassword errada → 422', async () => {
+    await seedDefaultUser();
+    const accessToken = await loginAndGetAccess();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/auth/me/password',
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { currentPassword: 'senha-errada', newPassword: 'nova-senha-bem-grande' },
+    });
+
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('newPassword com menos de 8 caracteres → 422 (Zod)', async () => {
+    await seedDefaultUser();
+    const accessToken = await loginAndGetAccess();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/auth/me/password',
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { currentPassword: PASSWORD, newPassword: 'curta' },
+    });
+
+    expect(res.statusCode).toBe(422);
+  });
+
+  it('troca bem-sucedida → 204, hash regravado, e login com a senha antiga passa a falhar', async () => {
+    await seedDefaultUser();
+    const accessToken = await loginAndGetAccess();
+    const newPassword = 'nova-senha-bem-grande-99';
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/auth/me/password',
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { currentPassword: PASSWORD, newPassword },
+    });
+
+    expect(res.statusCode).toBe(204);
+
+    const loginOld = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: { email: 'admin@empresa.com', password: PASSWORD },
+    });
+    expect(loginOld.statusCode).toBe(401);
+
+    const loginNew = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: { email: 'admin@empresa.com', password: newPassword },
+    });
+    expect(loginNew.statusCode).toBe(200);
+  });
+
+  it('registra audit log user.change_password (ação distinta de user.reset_password) sem senha no metadata', async () => {
+    await seedDefaultUser();
+    const accessToken = await loginAndGetAccess();
+    const newPassword = 'nova-senha-bem-grande-99';
+
+    await app.inject({
+      method: 'POST',
+      url: '/auth/me/password',
+      headers: { authorization: `Bearer ${accessToken}` },
+      payload: { currentPassword: PASSWORD, newPassword },
+    });
+
+    const logs = await testDb.db`SELECT * FROM audit_logs WHERE action = 'user.change_password'`;
+    expect(logs).toHaveLength(1);
+    expect(logs[0]!['user_id']).toBe(USER_ID);
+    expect(logs[0]!['tenant_id']).toBe(TENANT_A);
+    expect(JSON.stringify(logs)).not.toContain(newPassword);
+    expect(JSON.stringify(logs)).not.toContain(PASSWORD);
+  });
+});
+
 async function loginAndGetAccess(): Promise<string> {
   const res = await app.inject({
     method: 'POST',
