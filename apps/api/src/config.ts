@@ -19,6 +19,15 @@ const EnvSchema = z.object({
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
     .default('info'),
 
+  // CORS em produção — lista explícita de origens permitidas, separadas por
+  // vírgula (ex.: "https://boavi.app.br" ou "https://a.com,https://b.com").
+  // Opcional e SEM default: homolog e qualquer outro deploy same-origin não
+  // definem essa env, e o registro do @fastify/cors em app.ts trata a
+  // ausência como `origin: false` (nega todo cross-origin) — comportamento
+  // idêntico ao de antes desta variável existir. Só produção com front e API
+  // em domínios separados (épico E-12) precisa setá-la.
+  CORS_ORIGIN: z.string().optional(),
+
   // PostgreSQL — conexão da API no boot (spec §12).
   DATABASE_URL: z.string().min(1, 'DATABASE_URL é obrigatória'),
 

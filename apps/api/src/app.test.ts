@@ -97,3 +97,105 @@ describe('Error handler central — corpo JSON inválido', () => {
     expect(res.json().error.code).toBe('BAD_REQUEST');
   });
 });
+
+describe('CORS — comportamento por ambiente (épico E-12, T-152)', () => {
+  // Em produção sem front e API na mesma origem, a API precisa aceitar
+  // requisições cross-origin do domínio do front — mas só das origens
+  // listadas explicitamente em CORS_ORIGIN. Sem essa env, o comportamento
+  // deve continuar EXATAMENTE o de hoje: `origin: false`, negando qualquer
+  // cross-origin (é o que preserva homolog, que serve tudo pela mesma origem
+  // via proxy path-based).
+  let testDb: TestDb;
+
+  beforeAll(async () => {
+    testDb = await startTestDb();
+  });
+
+  afterAll(async () => {
+    await testDb.stop();
+  });
+
+  it('produção sem CORS_ORIGIN: origem cross-origin não recebe Access-Control-Allow-Origin', async () => {
+    const app = await buildApp({
+      config: testConfig({ NODE_ENV: 'production' }),
+      db: testDb.db,
+    });
+
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/healthz',
+        headers: { origin: 'https://boavi.app.br' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['access-control-allow-origin']).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('produção com CORS_ORIGIN: origem LISTADA recebe o header correto e credentials habilitado', async () => {
+    const app = await buildApp({
+      config: testConfig({ NODE_ENV: 'production', CORS_ORIGIN: 'https://boavi.app.br' }),
+      db: testDb.db,
+    });
+
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/healthz',
+        headers: { origin: 'https://boavi.app.br' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['access-control-allow-origin']).toBe('https://boavi.app.br');
+      expect(res.headers['access-control-allow-credentials']).toBe('true');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('produção com CORS_ORIGIN: origem NÃO listada continua sem Access-Control-Allow-Origin', async () => {
+    const app = await buildApp({
+      config: testConfig({ NODE_ENV: 'production', CORS_ORIGIN: 'https://boavi.app.br' }),
+      db: testDb.db,
+    });
+
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/healthz',
+        headers: { origin: 'https://outro-site.com' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['access-control-allow-origin']).toBeUndefined();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('produção com múltiplas CORS_ORIGIN separadas por vírgula: cada uma listada recebe o header', async () => {
+    const app = await buildApp({
+      config: testConfig({
+        NODE_ENV: 'production',
+        CORS_ORIGIN: 'https://boavi.app.br, https://outro-front.com.br',
+      }),
+      db: testDb.db,
+    });
+
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/healthz',
+        headers: { origin: 'https://outro-front.com.br' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['access-control-allow-origin']).toBe('https://outro-front.com.br');
+    } finally {
+      await app.close();
+    }
+  });
+});

@@ -153,8 +153,19 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   registerErrorHandler(app);
 
+  // Em produção, CORS fica fechado por padrão (`origin: false`) — funciona
+  // porque homolog serve front e API na mesma origem via proxy path-based.
+  // Produção com domínios separados (front em boavi.app.br, API em
+  // api.boavi.app.br) precisa de uma lista explícita de origens permitidas
+  // via CORS_ORIGIN — nunca `true`/`*`, que é incompatível com
+  // `credentials: true` e abriria a API para qualquer site.
   await app.register(cors, {
-    origin: config.NODE_ENV === 'production' ? false : true,
+    origin:
+      config.NODE_ENV === 'production'
+        ? config.CORS_ORIGIN
+          ? config.CORS_ORIGIN.split(',').map((o) => o.trim())
+          : false
+        : true,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   });
