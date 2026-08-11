@@ -47,6 +47,11 @@ export const DocumentSchema = z.object({
   documentTypeId: z.string().uuid().nullable(),
   filename: z.string().min(1).max(500),
   originalFilename: z.string().min(1).max(500),
+  // Path relativo do arquivo dentro da pasta enviada (`webkitRelativePath` do
+  // browser) — só preenchido quando o upload veio de seleção/arrasto de
+  // PASTA. Nulo em upload de arquivo avulso; nunca inventado. Ver
+  // `packages/db-pg/src/schema.ts` (coluna `original_path`).
+  originalPath: z.string().nullable(),
   title: z.string().nullable(),
   suggestedTitle: z.string().nullable(),
   contentHash: z.string().length(64), // SHA-256 hex

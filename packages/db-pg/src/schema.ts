@@ -358,6 +358,13 @@ export const documents = pgTable(
     documentTypeId: uuid('document_type_id').references(() => documentTypes.id),
     filename: text('filename').notNull(),
     originalFilename: text('original_filename').notNull(),
+    // Path relativo do arquivo dentro da pasta enviada, capturado do
+    // `webkitRelativePath` do browser no front (só existe quando o upload
+    // veio de uma seleção/arrasto de PASTA, nunca em upload de arquivo
+    // avulso). Nullable: upload avulso permanece null, nunca inventamos
+    // valor. Consultivo/informativo — não participa de dedupe nem de
+    // storageKey.
+    originalPath: text('original_path'),
     // Título de exibição confirmado/editado pelo usuário (Fase 8.1). Nulo até a
     // confirmação; enquanto nulo, o fallback de exibição é `originalFilename`.
     title: text('title'),

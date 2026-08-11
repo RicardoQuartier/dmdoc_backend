@@ -87,6 +87,7 @@ interface DocumentRow extends TenantDocument {
   document_type_id: string | null;
   filename: string;
   original_filename: string;
+  original_path: string | null;
   title: string | null;
   suggested_title: string | null;
   content_hash: string;
@@ -586,6 +587,7 @@ function rowToDocument(r: DocumentRow): Record<string, unknown> {
     documentTypeId: r.document_type_id,
     filename: r.filename,
     originalFilename: r.original_filename,
+    originalPath: r.original_path,
     title: r.title,
     suggestedTitle: r.suggested_title,
     contentHash: r.content_hash,
@@ -765,6 +767,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const departmentIdRaw = textFields['departmentId'];
     const documentTypeIdRaw = textFields['documentTypeId'];
     const indexValuesRaw = textFields['indexValues'];
+    const originalPathRaw = textFields['originalPath'];
 
     const FieldsSchema = z.object({
       departmentId: z.string().uuid('departmentId inválido'),
@@ -780,12 +783,18 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
             throw new Error('indexValues deve ser um JSON válido');
           }
         }),
+      // Path relativo do arquivo dentro da pasta enviada (`webkitRelativePath`
+      // do browser) — campo de texto extra do multipart, só presente quando o
+      // front captura upload de PASTA (nunca em arquivo avulso). Opcional:
+      // ausência não é erro, vira `null` no insert — nunca inventado aqui.
+      originalPath: z.string().optional(),
     });
 
     const fields_ = FieldsSchema.parse({
       departmentId: departmentIdRaw,
       documentTypeId: documentTypeIdRaw,
       indexValues: indexValuesRaw,
+      originalPath: originalPathRaw,
     });
 
     const { departmentId, documentTypeId, indexValues } = fields_;
@@ -943,6 +952,9 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       document_type_id: documentTypeId ?? null,
       filename,
       original_filename: originalFilename,
+      // Nunca inventado: só vem preenchido quando o front captura
+      // `webkitRelativePath` de upload de pasta; ausência vira `null`.
+      original_path: fields_.originalPath ?? null,
       title: null,
       suggested_title: null,
       content_hash: contentHash,
