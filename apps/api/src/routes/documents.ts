@@ -48,7 +48,7 @@ import {
   type AiReprocessStep,
 } from '@dmdoc/shared-types';
 import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
-import type { StorageDriver } from '@dmdoc/storage';
+import { buildDeletedStorageKey, moveWithinDriver, type StorageDriver } from '@dmdoc/storage';
 import {
   createLLMProvider,
   LLMError,
@@ -212,8 +212,12 @@ function splitCsv(value: string): string[] {
  * escapar `%`/`_` seriam escapados de novo. Usado em conjunto com
  * `ESCAPE '\'` na cláusula SQL (padrão de escape do `LIKE`/`ILIKE` do
  * PostgreSQL).
+ *
+ * Exportada para reaproveitamento por outras rotas com o MESMO padrão de
+ * busca livre (ex.: `GET /reports/deletions`) — evita duas implementações
+ * divergentes de uma lógica sensível a segurança (escape de SQL).
  */
-function escapeLikePattern(term: string): string {
+export function escapeLikePattern(term: string): string {
   return term.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 }
 
@@ -3046,6 +3050,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
           tenant_id: string;
           storage_key: string;
           storage_config_id: string | null;
+          mime_type: string;
         }>
       >`
         UPDATE documents
@@ -3053,7 +3058,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         WHERE tenant_id = ${tenantId}
           AND id = ANY(${targetIds}::uuid[])
           AND deleted = false
-        RETURNING id, tenant_id, storage_key, storage_config_id
+        RETURNING id, tenant_id, storage_key, storage_config_id, mime_type
       `;
 
       await tx`
@@ -3067,13 +3072,37 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
           AND document_id = ANY(${targetIds}::uuid[])
       `;
 
+      // Chave física do soft-delete de cada documento — mesma função do delete
+      // individual, calculada ANTES de sobrescrever `storage_key`.
+      const originalKeys = rows.map((row) => row.storage_key);
+      const newKeys = rows.map((row) => buildDeletedStorageKey(row.storage_key, row.id));
+
+      // Um único UPDATE via `unnest` pareado (id, chave nova) em vez de um
+      // UPDATE por linha: a rota já lida com até centenas de ids num único
+      // request, e um round-trip por documento não escalaria bem. O join com
+      // `unnest(uuid[], text[])` faz o Postgres casar cada id com sua chave
+      // nova numa única instrução, preservando a ordem de `rows`/`newKeys`.
+      if (rows.length > 0) {
+        await tx`
+          UPDATE documents AS d
+          SET storage_key = v.new_key
+          FROM (
+            SELECT * FROM unnest(${rows.map((row) => row.id)}::uuid[], ${newKeys}::text[]) AS t(id, new_key)
+          ) AS v
+          WHERE d.id = v.id
+            AND d.tenant_id = ${tenantId}
+        `;
+      }
+
       // Materializa em objetos simples: o resultado de postgres.js carrega
       // metadados que não sobrevivem ao unwrap do `begin`.
-      return rows.map((row) => ({
+      return rows.map((row, i) => ({
         id: row.id,
         tenantId: row.tenant_id,
-        storageKey: row.storage_key,
+        storageKey: originalKeys[i]!,
+        newStorageKey: newKeys[i]!,
         storageConfigId: row.storage_config_id,
+        mimeType: row.mime_type,
       }));
     });
 
@@ -3118,7 +3147,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const storageResults = await Promise.allSettled(
       deletedDocs.map(async (doc) => {
         const driver = await driverFor(doc.tenantId, doc.storageConfigId);
-        await driver.delete(doc.storageKey);
+        await moveWithinDriver(driver, doc.storageKey, doc.newStorageKey, doc.mimeType, request.log);
       })
     );
     storageResults.forEach((result, i) => {
@@ -3130,9 +3159,10 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
             userId,
             documentId: deletedDocs[i]!.id,
             storageKey: deletedDocs[i]!.storageKey,
+            newStorageKey: deletedDocs[i]!.newStorageKey,
             traceId: request.id,
           },
-          'falha ao remover arquivo do armazenamento em exclusão em massa'
+          'falha ao mover arquivo no armazenamento em exclusão em massa (soft-delete físico)'
         );
       }
     });
@@ -3300,7 +3330,19 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
 
     await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
 
+    // Chave física do soft-delete: mesma pasta, basename prefixado com o
+    // documentId (unicidade garantida, ver `buildDeletedStorageKey`). Calculada
+    // ANTES do soft-delete para preservar a chave original intacta para o
+    // audit log e para `moveWithinDriver`.
+    const originalKey = doc.storage_key;
+    const newKey = buildDeletedStorageKey(originalKey, doc.id);
+
     await repo.softDelete(id);
+
+    // `documents.storage_key` passa a refletir a chave física nova — fonte de
+    // verdade única, sem tabela de histórico nova (a chave original vai só
+    // para o audit log, para rastreabilidade/recuperação manual).
+    await sql`UPDATE documents SET storage_key = ${newKey} WHERE id = ${id} AND tenant_id = ${tenantId}`;
 
     // Remove chunks e document_content
     await Promise.all([
@@ -3308,13 +3350,18 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
       sql`DELETE FROM document_content WHERE document_id = ${id} AND tenant_id = ${tenantId}`,
     ]);
 
-    // Remove o arquivo do armazenamento — na configuração DESTE documento (que,
+    // Soft-delete FÍSICO do arquivo — na configuração DESTE documento (que,
     // para SUPER_ADMIN/MTA, nem é da empresa do token, e que depois de uma
-    // migração pode não ser o destino corrente da empresa).
+    // migração pode não ser o destino corrente da empresa). Renomeia em vez de
+    // apagar: `get`+`put`+`delete` dentro do MESMO driver, sem operação nativa
+    // de cópia/rename do provedor (nenhuma é usada hoje em nenhum código).
+    // Best-effort: falha aqui não desfaz a exclusão nem derruba a resposta.
     const storageDriver = await app.storage.forStorageConfig(tenantId, doc.storage_config_id);
-    await storageDriver.delete(doc.storage_key).catch((storageErr: unknown) => {
-      request.log.error({ err: storageErr, storageKey: doc.storage_key }, 'falha ao remover arquivo do armazenamento');
-    });
+    await moveWithinDriver(storageDriver, originalKey, newKey, doc.mime_type, request.log).catch(
+      (storageErr: unknown) => {
+        request.log.error({ err: storageErr, storageKey: originalKey, newStorageKey: newKey }, 'falha ao mover arquivo no armazenamento (soft-delete físico)');
+      }
+    );
 
     const auditLogger = new AuditLogger(sql);
     try {
@@ -3323,7 +3370,7 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
         userId,
         action: 'document.delete',
         resource: `documents/${doc.id}`,
-        metadata: { filename: doc.filename, storageKey: doc.storage_key },
+        metadata: { filename: doc.filename, storageKey: originalKey, newStorageKey: newKey },
       });
     } catch (auditError) {
       request.log.error(
@@ -3335,6 +3382,166 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     request.log.info({ tenantId, userId, documentId: doc.id }, 'documento excluído');
 
     return reply.status(204).send();
+  });
+
+  // =========================================================================
+  // POST /documents/:id/restore — desfaz o soft-delete de um documento
+  // =========================================================================
+  /**
+   * Restaura um documento excluído (soft-delete) a partir do relatório de
+   * auditoria (`GET /reports/deletions`).
+   *
+   * Decisões de design (não óbvias — não redescobrir):
+   *   1. AUDITORIA IMUTÁVEL: o registro original `document.delete`/
+   *      `document.bulk_delete` NUNCA é apagado ou reescrito. A restauração
+   *      grava um evento NOVO `document.restore`, preservando o histórico
+   *      completo (excluído por X em T1, restaurado por Y em T2).
+   *   2. STORAGE NÃO É MOVIDO DE VOLTA: o arquivo permanece na chave física
+   *      `deleted__{documentId}__{basename}` (mesma pasta) desde a exclusão.
+   *      Mover de volta para a chave original arriscaria colidir com um
+   *      re-upload do mesmo conteúdo+nome ocorrido nesse meio-tempo (a chave
+   *      original é derivada de `(tenantId, contentHash, filename)` e é
+   *      reutilizável). `storage_key` continua apontando para a chave
+   *      `deleted__...` mesmo depois de restaurado — cosmético, sem efeito
+   *      funcional (download/preview já leem por `storage_key` dinamicamente).
+   *   3. REPROCESSAMENTO OBRIGATÓRIO: `chunks` e `document_content` foram
+   *      HARD-deletados na exclusão (não recuperáveis). Restaurar sem
+   *      reprocessar deixaria o documento "fantasma" — aparece na listagem
+   *      mas sem texto/busca/chunks. Por isso reaproveita EXATAMENTE o mesmo
+   *      bloco de `POST /documents/:id/reprocess` logo abaixo.
+   */
+  app.post('/documents/:id/restore', { preHandler: app.authenticate }, async (request, reply) => {
+    requireRole(request, 'TENANT_ADMIN', 'MULTI_TENANT_ADMIN');
+
+    const userId = request.user!.sub;
+    const role = request.user!.role;
+    const sql = app.db;
+
+    const { id } = DocumentIdParamsSchema.parse(request.params);
+
+    // Busca o documento no escopo do papel — DELIBERADAMENTE sem filtrar por
+    // `deleted` (ao contrário de `findDocumentGlobally`/`findDocumentInTenants`,
+    // que só enxergam documentos vivos): aqui precisamos diferenciar "fora do
+    // escopo/nunca existiu" (404) de "existe no escopo mas não está excluído"
+    // (409) — as funções que filtram `deleted = false` colapsariam os dois
+    // casos no mesmo 404.
+    let doc: DocumentRow | null;
+
+    if (role === 'SUPER_ADMIN') {
+      const rows = await sql<DocumentRow[]>`
+        SELECT * FROM documents WHERE id = ${id} LIMIT 1
+      `;
+      doc = rows[0] ?? null;
+    } else if (role === 'MULTI_TENANT_ADMIN') {
+      const allowedTenantIds = request.user?.allowedTenantIds ?? [];
+      if (allowedTenantIds.length === 0) {
+        doc = null;
+      } else {
+        const rows = await sql<DocumentRow[]>`
+          SELECT * FROM documents
+          WHERE id = ${id}
+            AND tenant_id = ANY(${allowedTenantIds}::uuid[])
+          LIMIT 1
+        `;
+        doc = rows[0] ?? null;
+      }
+    } else {
+      const scopedTenantId = request.tenantId as string;
+      const rows = await sql<DocumentRow[]>`
+        SELECT * FROM documents
+        WHERE id = ${id}
+          AND tenant_id = ${scopedTenantId}
+        LIMIT 1
+      `;
+      doc = rows[0] ?? null;
+    }
+
+    if (!doc) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    const tenantId = doc.tenant_id;
+
+    // Mesmo choke point de PATCH/DELETE/reprocess — departamento soft-deletado
+    // continua acessível/gravável (documento "órfão").
+    await assertCanWriteDepartment(sql, userId, tenantId, doc.department_id, role);
+
+    // `deleted = true` explícito no WHERE: se 0 linhas afetadas, o documento já
+    // estava restaurado (ou uma restauração concorrente venceu a corrida) — 409,
+    // nunca 500. O `doc` encontrado acima só garante que o id existe no escopo;
+    // esta é a checagem autoritativa de estado.
+    const restoredRows = await sql<DocumentRow[]>`
+      UPDATE documents
+      SET deleted = false
+      WHERE id = ${id}
+        AND tenant_id = ${tenantId}
+        AND deleted = true
+      RETURNING *
+    `;
+    const restoredDoc = restoredRows[0];
+    if (!restoredDoc) {
+      throw new ConflictError('Documento não está excluído');
+    }
+
+    // Reenfileira reprocessamento — bloco idêntico ao de
+    // `POST /documents/:id/reprocess` (ver decisão de design 3 acima):
+    // `chunks`/`document_content` já estão vazios (hard-deletados na exclusão),
+    // então os DELETEs abaixo são no-op, mas mantêm o mesmo caminho testado.
+    const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
+
+    await sql`DELETE FROM document_content WHERE document_id = ${id} AND tenant_id = ${tenantId}`;
+    await sql`DELETE FROM chunks WHERE document_id = ${id} AND tenant_id = ${tenantId}`;
+
+    const updated = await repo.updateById(id, {
+      status: 'PENDING',
+      failure_reason: null,
+    } as Partial<Omit<DocumentRow, 'id' | 'tenantId' | 'deleted'>>);
+
+    if (!updated) {
+      throw new NotFoundError('Documento não encontrado');
+    }
+
+    const jobData: DocumentProcessingJobData = DocumentProcessingJobDataSchema.parse({
+      tenantId,
+      documentId: updated.id,
+      storageKey: updated.storage_key,
+      mimeType: updated.mime_type,
+    });
+
+    if (app.queue !== null) {
+      await app.queue.add('process-document', jobData, {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2000 },
+      });
+    } else {
+      request.log.warn(
+        { tenantId, documentId: updated.id },
+        'queue não configurada — job de reprocessamento (pós-restauração) não enfileirado'
+      );
+    }
+
+    const auditLogger = new AuditLogger(sql);
+    try {
+      await auditLogger.record({
+        tenantId,
+        userId,
+        action: 'document.restore',
+        resource: `documents/${doc.id}`,
+        metadata: { filename: doc.filename, storageKey: doc.storage_key },
+      });
+    } catch (auditError) {
+      request.log.error(
+        { err: auditError, tenantId, userId, documentId: doc.id },
+        'falha ao registrar audit log de restauração'
+      );
+    }
+
+    request.log.info(
+      { tenantId, userId, documentId: doc.id, traceId: request.id },
+      'documento restaurado e reenfileirado para reprocessamento'
+    );
+
+    return reply.status(200).send(rowToDocument(updated as DocumentRow));
   });
 
   // =========================================================================

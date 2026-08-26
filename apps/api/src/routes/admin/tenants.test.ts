@@ -387,16 +387,18 @@ describe('PATCH /admin/tenants/:id — flags de IA (plus comercial, exclusivo do
     });
     expect(res.statusCode).toBe(200);
 
-    // `metadata` é jsonb, mas o cliente postgres.js usado aqui não registra um
-    // parser automático para json/jsonb — a coluna volta como string bruta e
-    // precisa de JSON.parse manual (mesmo comportamento de outras rotas).
+    // `metadata` é jsonb gravado com `sql.json()` (ver auth/audit.ts) — o
+    // postgres.js já devolve o valor como objeto, sem JSON.parse manual.
     const rows = await testDb.db<
       Array<{
         tenant_id: string | null;
         user_id: string | null;
         action: string;
         resource: string | null;
-        metadata: string;
+        metadata: {
+          actorRole?: string;
+          changes?: Record<string, { before: boolean; after: boolean }>;
+        };
       }>
     >`
       SELECT tenant_id, user_id, action, resource, metadata
@@ -408,10 +410,7 @@ describe('PATCH /admin/tenants/:id — flags de IA (plus comercial, exclusivo do
 
     expect(rows).toHaveLength(1);
     const log = rows[0]!;
-    const metadata = JSON.parse(log.metadata) as {
-      actorRole?: string;
-      changes?: Record<string, { before: boolean; after: boolean }>;
-    };
+    const metadata = log.metadata;
     expect(log.tenant_id).toBe(tenantId);
     expect(log.user_id).toBe(SUPER_ADMIN_ID);
     expect(log.resource).toBe(`tenants/${tenantId}`);
@@ -460,7 +459,12 @@ describe('PATCH /admin/tenants/:id — AuditLog de dados administrativos', () =>
     user_id: string | null;
     action: string;
     resource: string | null;
-    metadata: string;
+    // `metadata` é jsonb gravado com `sql.json()` (ver auth/audit.ts) — o
+    // postgres.js já devolve o valor como objeto, sem JSON.parse manual.
+    metadata: {
+      actorRole?: string;
+      changes?: Record<string, { before: unknown; after: unknown }>;
+    };
   }
 
   async function createTenant(name: string): Promise<string> {
@@ -499,10 +503,7 @@ describe('PATCH /admin/tenants/:id — AuditLog de dados administrativos', () =>
     expect(log!.tenant_id).toBe(tenantId);
     expect(log!.user_id).toBe(SUPER_ADMIN_ID);
     expect(log!.resource).toBe(`tenants/${tenantId}`);
-    const metadata = JSON.parse(log!.metadata) as {
-      actorRole?: string;
-      changes?: Record<string, { before: unknown; after: unknown }>;
-    };
+    const metadata = log!.metadata;
     expect(metadata.actorRole).toBe('SUPER_ADMIN');
     expect(metadata.changes).toMatchObject({
       name: { before: 'Empresa Nome Antigo', after: 'Empresa Nome Novo' },
@@ -525,9 +526,7 @@ describe('PATCH /admin/tenants/:id — AuditLog de dados administrativos', () =>
 
     const log = await fetchSettingsAudit(tenantId);
     expect(log).toBeDefined();
-    const metadata = JSON.parse(log!.metadata) as {
-      changes?: Record<string, { before: unknown; after: unknown }>;
-    };
+    const metadata = log!.metadata;
     expect(metadata.changes).toMatchObject({
       diskQuotaBytes: { before: 1_000_000, after: 5_000_000 },
       userQuota: { before: 10, after: 42 },
@@ -546,9 +545,7 @@ describe('PATCH /admin/tenants/:id — AuditLog de dados administrativos', () =>
 
     const log = await fetchSettingsAudit(tenantId);
     expect(log).toBeDefined();
-    const metadata = JSON.parse(log!.metadata) as {
-      changes?: Record<string, { before: unknown; after: unknown }>;
-    };
+    const metadata = log!.metadata;
     expect(metadata.changes).toMatchObject({ active: { before: true, after: false } });
   });
 

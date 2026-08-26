@@ -1,4 +1,4 @@
-import type { Sql } from '@dmdoc/db-pg';
+import type { JSONValue, Sql } from '@dmdoc/db-pg';
 import { newId } from '@dmdoc/db-pg';
 
 /**
@@ -35,12 +35,16 @@ export class AuditLogger {
    */
   async record(entry: Omit<AuditLogDocument, 'createdAt'>): Promise<void> {
     const id = newId();
-    // `metadata` é jsonb. Gravamos com JSON.stringify (texto → jsonb, armazenado
-    // como objeto single-encoded). Com esse cliente postgres.js, ler a coluna
-    // devolve a STRING JSON crua (não um objeto) — todos os consumidores tratam
-    // isso: o SELECT da rota GET /audit-logs faz parse (parseMetadata) e os
-    // testes usam JSON.parse. Trocar por `sql.json()` mudaria a forma de leitura
-    // para objeto e quebraria esses consumidores.
+    // `metadata` é jsonb — `sql.json()`, NUNCA `JSON.stringify()`. Este cliente
+    // postgres.js infere o tipo do parâmetro pelo destino (coluna jsonb) e
+    // aplica seu PRÓPRIO serializador (JSON.stringify) sobre o valor recebido.
+    // Passar uma string já serializada fazia esse serializador rodar de novo
+    // em cima do texto, gravando uma string double-encoded (jsonb_typeof
+    // retornava 'string', não 'object') — defeito que já mordeu em
+    // `routes/admin/department-templates.ts`. `sql.json()` entrega o valor
+    // já marcado para o driver serializar uma ÚNICA vez, gravando o objeto de
+    // verdade — o que os consumidores (`GET /audit-logs`, `GET
+    // /reports/deletions`) esperam ao ler `metadata` como jsonb OBJECT.
     await this.sql`
       INSERT INTO audit_logs (id, tenant_id, user_id, action, resource, metadata, created_at)
       VALUES (
@@ -49,7 +53,7 @@ export class AuditLogger {
         ${entry.userId},
         ${entry.action},
         ${entry.resource},
-        ${JSON.stringify(entry.metadata)},
+        ${this.sql.json(entry.metadata as unknown as JSONValue)},
         NOW()
       )
     `;

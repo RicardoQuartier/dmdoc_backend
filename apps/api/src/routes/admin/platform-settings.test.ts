@@ -230,16 +230,19 @@ describe('PATCH /admin/platform-settings', () => {
     });
     expect(res.statusCode).toBe(200);
 
-    // `metadata` é jsonb, mas o cliente postgres.js usado aqui não registra um
-    // parser automático para json/jsonb (ver `createPgClient`) — a coluna
-    // sempre volta como string bruta e precisa de JSON.parse manual.
+    // `metadata` é jsonb gravado com `sql.json()` (ver auth/audit.ts) — o
+    // postgres.js já devolve o valor como objeto quando a coluna carrega um
+    // jsonb OBJECT (parser nativo de jsonb do driver), sem JSON.parse manual.
     const rows = await testDb.db<
       Array<{
         tenant_id: string | null;
         user_id: string | null;
         action: string;
         resource: string | null;
-        metadata: string;
+        metadata: {
+          actorRole?: string;
+          changes?: Record<string, { before: boolean; after: boolean }>;
+        };
       }>
     >`
       SELECT tenant_id, user_id, action, resource, metadata
@@ -251,10 +254,7 @@ describe('PATCH /admin/platform-settings', () => {
 
     expect(rows).toHaveLength(1);
     const log = rows[0]!;
-    const metadata = JSON.parse(log.metadata) as {
-      actorRole?: string;
-      changes?: Record<string, { before: boolean; after: boolean }>;
-    };
+    const metadata = log.metadata;
     expect(log.tenant_id).toBeNull();
     expect(log.user_id).toBe(SUPER_ADMIN_ID);
     expect(log.resource).toBe('platform_settings');

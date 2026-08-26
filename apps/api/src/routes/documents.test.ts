@@ -15,6 +15,10 @@ function createMockS3(): StorageDriver {
   return {
     provider: 's3',
     put: vi.fn().mockResolvedValue(undefined),
+    // Soft-delete físico (`moveWithinDriver`) faz get+put+delete — o `get`
+    // precisa resolver com algum buffer para o fluxo de exclusão não cair no
+    // ramo `StorageNotFoundError` (idempotência) em todo teste.
+    get: vi.fn().mockResolvedValue(Buffer.from('conteudo de teste')),
     getDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
     delete: vi.fn().mockResolvedValue(undefined),
   } as unknown as StorageDriver;
@@ -1213,6 +1217,49 @@ describe('Papel USER é somente leitura — gate de escrita de documentos por pa
       SELECT deleted FROM documents WHERE id = ${docId}
     `;
     expect(rows[0]?.deleted).toBe(true);
+  });
+
+  it('DELETE /documents/:id: soft-delete FÍSICO — get+put+delete no storage e storage_key renomeado', async () => {
+    const docId = await seedReadyDoc(DEPT_A_ID, TENANT_A);
+    const token = await seedUserWithGrant('uploader-physical-delete@empresa.com', 'UPLOADER');
+
+    const before = await testDb.db<Array<{ storage_key: string }>>`
+      SELECT storage_key FROM documents WHERE id = ${docId}
+    `;
+    const originalKey = before[0]!.storage_key;
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/documents/${docId}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.statusCode).toBe(204);
+
+    // `moveWithinDriver`: get(origem) → put(destino) → delete(origem) — nunca
+    // um `driver.delete` direto na chave original sem antes ter copiado.
+    expect(mockS3.get).toHaveBeenCalledWith(originalKey);
+    expect(mockS3.delete).toHaveBeenCalledWith(originalKey);
+
+    const after = await testDb.db<Array<{ storage_key: string; deleted: boolean }>>`
+      SELECT storage_key, deleted FROM documents WHERE id = ${docId}
+    `;
+    expect(after[0]?.deleted).toBe(true);
+    // Mesma pasta, basename prefixado com `deleted__{documentId}__`.
+    const expectedNewKey = originalKey.replace(/([^/]+)$/, `deleted__${docId}__$1`);
+    expect(after[0]?.storage_key).toBe(expectedNewKey);
+    expect(mockS3.put).toHaveBeenCalledWith(
+      expect.objectContaining({ key: expectedNewKey, mimeType: 'application/pdf' })
+    );
+
+    const auditRows = await testDb.db<Array<{ metadata: Record<string, unknown> | string }>>`
+      SELECT metadata FROM audit_logs WHERE action = 'document.delete' AND resource = ${`documents/${docId}`}
+    `;
+    const metadata =
+      typeof auditRows[0]!.metadata === 'string'
+        ? (JSON.parse(auditRows[0]!.metadata) as Record<string, unknown>)
+        : auditRows[0]!.metadata;
+    expect(metadata['storageKey']).toBe(originalKey);
+    expect(metadata['newStorageKey']).toBe(expectedNewKey);
   });
 
   it('ADMIN (TENANT_ADMIN): PATCH /documents/:id → 200 (escrita sem restrição, inalterada)', async () => {

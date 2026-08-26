@@ -27,6 +27,10 @@ function createMockS3(): StorageDriver {
   return {
     provider: 's3',
     put: vi.fn().mockResolvedValue(undefined),
+    // Soft-delete físico (`moveWithinDriver`) faz get+put+delete — o `get`
+    // precisa resolver com algum buffer, senão todo teste cairia no ramo de
+    // "origem não encontrada" (best-effort, mas mascararia o fluxo normal).
+    get: vi.fn().mockResolvedValue(Buffer.from('conteudo de teste')),
     getDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
     delete: vi.fn().mockResolvedValue(undefined),
   } as unknown as StorageDriver;
@@ -293,6 +297,28 @@ describe('POST /documents/bulk-delete — exclusão e escopo cirúrgico', () => 
     expect(keys).toEqual([`s3/${DOC_1}`, `s3/${DOC_2}`].sort());
   });
 
+  it('soft-delete FÍSICO: get+put na chave nova antes do delete na chave original, storage_key renomeado', async () => {
+    const res = await post(tokenAdminA, [DOC_1, DOC_2]);
+    expect(res.statusCode).toBe(200);
+
+    // `moveWithinDriver` por documento: get(origem) → put(destino) → delete(origem).
+    expect(s3Mock.get).toHaveBeenCalledWith(`s3/${DOC_1}`);
+    expect(s3Mock.get).toHaveBeenCalledWith(`s3/${DOC_2}`);
+
+    const putKeys = (s3Mock.put as unknown as { mock: { calls: Array<[{ key: string }]> } }).mock.calls
+      .map((c) => c[0].key)
+      .sort();
+    // `s3/{id}`: pasta "s3/", basename "{id}" — só o basename é prefixado.
+    expect(putKeys).toEqual([`s3/deleted__${DOC_1}__${DOC_1}`, `s3/deleted__${DOC_2}__${DOC_2}`].sort());
+
+    const rows = await testDb.db<Array<{ id: string; storage_key: string }>>`
+      SELECT id, storage_key FROM documents WHERE id = ANY(${[DOC_1, DOC_2]}::uuid[])
+    `;
+    const byId = new Map(rows.map((r) => [r.id, r.storage_key]));
+    expect(byId.get(DOC_1)).toBe(`s3/deleted__${DOC_1}__${DOC_1}`);
+    expect(byId.get(DOC_2)).toBe(`s3/deleted__${DOC_2}__${DOC_2}`);
+  });
+
   it('MTA com a empresa na lista permitida exclui normalmente', async () => {
     const res = await post(tokenMta, [DOC_1]);
     expect(res.statusCode).toBe(200);
@@ -399,15 +425,22 @@ describe('POST /documents/bulk-delete — auditoria', () => {
     const res = await post(tokenAdminA, [DOC_1, DOC_2, DOC_3]);
     const { deleted } = JSON.parse(res.body);
 
-    const logs = await testDb.db<{ action: string; resource: string; metadata: string; tenant_id: string }[]>`
+    const logs = await testDb.db<
+      { action: string; resource: string; metadata: string | Record<string, unknown>; tenant_id: string }[]
+    >`
       SELECT action, resource, metadata, tenant_id FROM audit_logs WHERE action = 'document.bulk_delete'
     `;
     expect(logs).toHaveLength(1);
     expect(logs[0]!.resource).toBe('documents/bulk-delete');
     expect(logs[0]!.tenant_id).toBe(TENANT_A);
-    // `metadata` é jsonb gravado com JSON.stringify (ver auth/audit.ts) — a
-    // leitura devolve a string JSON crua.
-    const metadata = JSON.parse(logs[0]!.metadata) as { count: number; documentIds: string[] };
+    // `metadata` é jsonb gravado com `sql.json()` (ver auth/audit.ts) — o
+    // driver já entrega objeto quando a coluna carrega um jsonb OBJECT. Mantém
+    // o fallback de string por robustez (linhas antigas double-encoded).
+    const rawMetadata = logs[0]!.metadata;
+    const metadata =
+      typeof rawMetadata === 'string'
+        ? (JSON.parse(rawMetadata) as { count: number; documentIds: string[] })
+        : (rawMetadata as unknown as { count: number; documentIds: string[] });
     expect(metadata.count).toBe(deleted);
     expect([...metadata.documentIds].sort()).toEqual([DOC_1, DOC_2, DOC_3].sort());
   });
@@ -417,6 +450,10 @@ describe('POST /documents/bulk-delete — S3 best-effort', () => {
   it('falha ao remover no S3 não derruba a requisição nem desfaz a exclusão', async () => {
     const failingS3 = {
       provider: 's3',
+      // get/put resolvem — a falha simulada é especificamente no passo final
+      // do `moveWithinDriver` (delete da chave original), para exercitar
+      // exatamente o cenário do título do teste.
+      get: vi.fn().mockResolvedValue(Buffer.from('conteudo de teste')),
       put: vi.fn().mockResolvedValue(undefined),
       getDownloadUrl: vi.fn().mockResolvedValue('https://mock-signed-url'),
       delete: vi.fn().mockRejectedValue(new Error('S3 fora do ar')),

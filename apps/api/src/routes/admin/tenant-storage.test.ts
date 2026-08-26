@@ -758,7 +758,9 @@ describe('audit log da troca de destino', () => {
     expect((await putStorage(TENANT_A, s3TenantBody(BUCKET_B))).statusCode).toBe(200);
     const configB = (await storageRows(TENANT_A)).find((r) => r.active)!.id;
 
-    const logs = await testDb.db<Array<{ action: string; metadata: string; user_id: string | null }>>`
+    const logs = await testDb.db<
+      Array<{ action: string; metadata: Record<string, unknown>; user_id: string | null }>
+    >`
       SELECT action, metadata, user_id
       FROM audit_logs
       WHERE tenant_id = ${TENANT_A} AND action = 'tenant.storage.update'
@@ -766,10 +768,9 @@ describe('audit log da troca de destino', () => {
     `;
     expect(logs).toHaveLength(2);
 
-    // `audit_logs.metadata` é gravado com JSON.stringify (defeito conhecido —
-    // T-149) e volta como STRING deste cliente; o parse aqui espelha o que a
-    // rota GET /audit-logs já faz.
-    const segundo = JSON.parse(logs[1]!.metadata) as Record<string, unknown>;
+    // `audit_logs.metadata` é gravado com `sql.json()` (ver auth/audit.ts) — o
+    // postgres.js já devolve o valor como objeto, sem JSON.parse manual.
+    const segundo = logs[1]!.metadata;
     expect(logs[1]!.user_id).toBe(SUPER_ID);
     expect(segundo['retiredStorageConfigId']).toBe(configA);
     expect(segundo['newStorageConfigId']).toBe(configB);
@@ -782,8 +783,10 @@ describe('audit log da troca de destino', () => {
 
     // Nem o segredo em claro nem o texto cifrado entram no audit log — gravar
     // segredo de cliente num registro que gente lê anula a criptografia.
-    expect(logs[1]!.metadata).not.toContain(SECRET_DO_CLIENTE);
-    expect(logs[1]!.metadata).not.toContain('v1:');
+    // `metadata` agora é objeto — serializa para checar substring com segurança.
+    const metadataSerializado = JSON.stringify(logs[1]!.metadata);
+    expect(metadataSerializado).not.toContain(SECRET_DO_CLIENTE);
+    expect(metadataSerializado).not.toContain('v1:');
   });
 
   it('PUT idempotente não registra audit log nem versiona', async () => {

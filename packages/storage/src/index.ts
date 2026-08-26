@@ -43,6 +43,8 @@ export {
 
 export { storageLocationKey } from './location.js';
 
+export { buildDeletedStorageKey, moveWithinDriver, type MinimalLogger } from './move.js';
+
 export {
   StorageCryptoError,
   decryptSecret,

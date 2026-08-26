@@ -564,7 +564,19 @@ describe('PATCH /documents/:id/move — auditoria', () => {
     expect(res.statusCode).toBe(200);
 
     const logs = await testDb.db<
-      Array<{ action: string; resource: string; metadata: string; tenant_id: string; user_id: string }>
+      Array<{
+        action: string;
+        resource: string;
+        metadata: {
+          documentId: string;
+          fromDepartmentId: string;
+          toDepartmentId: string;
+          chunksUpdated: number;
+          status: string;
+        };
+        tenant_id: string;
+        user_id: string;
+      }>
     >`
       SELECT action, resource, metadata, tenant_id, user_id
       FROM audit_logs WHERE action = 'document.move'
@@ -574,15 +586,9 @@ describe('PATCH /documents/:id/move — auditoria', () => {
     expect(logs[0]!.tenant_id).toBe(TENANT_A);
     expect(logs[0]!.user_id).toBe(UPLOADER_AMBOS_ID);
 
-    // `metadata` é jsonb gravado com JSON.stringify (ver auth/audit.ts) — a
-    // leitura devolve a string JSON crua.
-    const metadata = JSON.parse(logs[0]!.metadata) as {
-      documentId: string;
-      fromDepartmentId: string;
-      toDepartmentId: string;
-      chunksUpdated: number;
-      status: string;
-    };
+    // `metadata` é jsonb gravado com `sql.json()` (ver auth/audit.ts) — o
+    // postgres.js já devolve o valor como objeto.
+    const metadata = logs[0]!.metadata;
     expect(metadata.documentId).toBe(DOC_1);
     // O `from` é o estado ANTES do UPDATE — o bug clássico aqui é registrar o
     // departamento novo dos dois lados, relendo a linha depois da transação.

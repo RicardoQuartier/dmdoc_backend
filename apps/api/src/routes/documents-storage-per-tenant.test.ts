@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import FormData from 'form-data';
 import { newId } from '@dmdoc/db-pg';
 import {
+  buildDeletedStorageKey,
   createStorageResolver,
   encryptSecret,
   parseSecretKey,
@@ -62,6 +63,14 @@ function bucketOf(name: string): Map<string, Buffer> {
 
 function keysIn(name: string): string[] {
   return [...(world.get(name)?.keys() ?? [])].sort();
+}
+
+/**
+ * Chave esperada de um documento DEPOIS do soft-delete físico — o arquivo não
+ * some do destino, é renomeado no MESMO destino/prefixo (`moveWithinDriver`).
+ */
+function deletedKeyOf(doc: { id: string; storageKey: string }): string {
+  return buildDeletedStorageKey(doc.storageKey, doc.id);
 }
 
 function fakeDriver(provider: 's3' | 'sharepoint', destination: string): StorageDriver {
@@ -532,7 +541,8 @@ describe('leitura e exclusão — cada arquivo no destino da SUA empresa', () =>
     });
 
     expect(res.statusCode).toBe(204);
-    expect(keysIn(BUCKET_DO_CLIENTE)).toEqual([]);
+    // Soft-delete FÍSICO: o objeto não some do destino, é renomeado nele mesmo.
+    expect(keysIn(BUCKET_DO_CLIENTE)).toEqual([deletedKeyOf(noProprio)]);
     // O arquivo da outra empresa não foi tocado.
     expect(keysIn(PLATFORM_BUCKET)).toEqual([naPlataforma.storageKey]);
   });
@@ -553,7 +563,10 @@ describe('leitura e exclusão — cada arquivo no destino da SUA empresa', () =>
       payload: { documentIds: [proprio1.id, proprio2.id] },
     });
     expect(primeira.statusCode).toBe(200);
-    expect(keysIn(BUCKET_DO_CLIENTE)).toEqual([]);
+    // Soft-delete FÍSICO: os dois objetos continuam no MESMO destino, renomeados.
+    expect(keysIn(BUCKET_DO_CLIENTE)).toEqual(
+      [deletedKeyOf(proprio1), deletedKeyOf(proprio2)].sort()
+    );
     expect(keysIn(PLATFORM_BUCKET)).toEqual(
       [plataforma1.storageKey, plataforma2.storageKey].sort()
     );
@@ -565,7 +578,9 @@ describe('leitura e exclusão — cada arquivo no destino da SUA empresa', () =>
       payload: { documentIds: [plataforma1.id, plataforma2.id] },
     });
     expect(segunda.statusCode).toBe(200);
-    expect(keysIn(PLATFORM_BUCKET)).toEqual([]);
+    expect(keysIn(PLATFORM_BUCKET)).toEqual(
+      [deletedKeyOf(plataforma1), deletedKeyOf(plataforma2)].sort()
+    );
   });
 
   it('seleção cross-tenant continua sendo 422 e não apaga arquivo nenhum', async () => {
@@ -712,7 +727,9 @@ describe('acervo em mais de um destino — a leitura segue o DOCUMENTO', () => {
     });
 
     expect(res.statusCode).toBe(204);
-    expect(keysIn(PLATFORM_BUCKET)).toEqual([]);
+    // Soft-delete FÍSICO: renomeado no destino ANTIGO (a plataforma), não movido
+    // para o destino atual — o documento nunca esteve lá.
+    expect(keysIn(PLATFORM_BUCKET)).toEqual([deletedKeyOf(antigo)]);
     expect(keysIn(BUCKET_DO_CLIENTE)).toEqual([novo.storageKey]);
   });
 
@@ -744,9 +761,15 @@ describe('acervo em mais de um destino — a leitura segue o DOCUMENTO', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.json().deleted).toBe(2);
-    // Sobra exatamente um arquivo em CADA destino: o que não foi selecionado.
-    expect(keysIn(PLATFORM_BUCKET)).toEqual([naPlataforma2.storageKey]);
-    expect(keysIn(BUCKET_DO_CLIENTE)).toEqual([noCliente2.storageKey]);
+    // Cada destino fica com DOIS objetos: o que não foi selecionado (intacto) e
+    // o que foi excluído (soft-delete FÍSICO — renomeado no MESMO destino, não
+    // apagado nem movido para o destino do outro).
+    expect(keysIn(PLATFORM_BUCKET)).toEqual(
+      [naPlataforma2.storageKey, deletedKeyOf(naPlataforma1)].sort()
+    );
+    expect(keysIn(BUCKET_DO_CLIENTE)).toEqual(
+      [noCliente2.storageKey, deletedKeyOf(noCliente1)].sort()
+    );
   });
 });
 

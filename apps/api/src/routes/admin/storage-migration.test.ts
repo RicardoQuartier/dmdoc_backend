@@ -230,12 +230,14 @@ async function migrationRows(): Promise<
 }
 
 async function auditEntries(action: string): Promise<Array<Record<string, unknown>>> {
-  const rows = await testDb.db<Array<{ metadata: string }>>`
+  // `metadata` é jsonb gravado com `sql.json()` (ver auth/audit.ts) — o
+  // postgres.js já devolve o valor como objeto, sem JSON.parse manual.
+  const rows = await testDb.db<Array<{ metadata: Record<string, unknown> }>>`
     SELECT metadata FROM audit_logs
     WHERE tenant_id = ${TENANT} AND action = ${action}
     ORDER BY created_at ASC
   `;
-  return rows.map((row) => JSON.parse(row.metadata) as Record<string, unknown>);
+  return rows.map((row) => row.metadata);
 }
 
 function startMigration(token = tokenSuper) {

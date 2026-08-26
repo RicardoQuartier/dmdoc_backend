@@ -535,7 +535,18 @@ describe('POST /documents/bulk-move — auditoria', () => {
     expect(res.statusCode).toBe(200);
 
     const logs = await testDb.db<
-      Array<{ resource: string; metadata: string; tenant_id: string; user_id: string }>
+      Array<{
+        resource: string;
+        metadata: {
+          documentIds: string[];
+          count: number;
+          toDepartmentId: string;
+          fromDepartmentIds: string[];
+          chunksUpdated: number;
+        };
+        tenant_id: string;
+        user_id: string;
+      }>
     >`
       SELECT resource, metadata, tenant_id, user_id
       FROM audit_logs WHERE action = 'document.bulk_move'
@@ -545,15 +556,9 @@ describe('POST /documents/bulk-move — auditoria', () => {
     expect(logs[0]!.tenant_id).toBe(TENANT_A);
     expect(logs[0]!.user_id).toBe(ADMIN_A_ID);
 
-    // `metadata` é jsonb gravado com JSON.stringify (ver auth/audit.ts) — a
-    // leitura devolve a string JSON crua.
-    const metadata = JSON.parse(logs[0]!.metadata) as {
-      documentIds: string[];
-      count: number;
-      toDepartmentId: string;
-      fromDepartmentIds: string[];
-      chunksUpdated: number;
-    };
+    // `metadata` é jsonb gravado com `sql.json()` (ver auth/audit.ts) — o
+    // postgres.js já devolve o valor como objeto.
+    const metadata = logs[0]!.metadata;
     expect(metadata.count).toBe(3);
     expect([...metadata.documentIds].sort()).toEqual([DOC_1, DOC_2, DOC_OUTRA_ORIGEM].sort());
     expect(metadata.toDepartmentId).toBe(DEPT_DESTINO);

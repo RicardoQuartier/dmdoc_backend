@@ -324,14 +324,14 @@ describe('POST /documents/bulk-reprocess — elegibilidade e não-destrutividade
     const res = await post(tokenAdminA, [FAILED_1, FAILED_2, READY_1]);
     const { batchId } = JSON.parse(res.body);
 
-    const logs = await testDb.db<{ action: string; resource: string; metadata: string }[]>`
+    const logs = await testDb.db<{ action: string; resource: string; metadata: Record<string, unknown> }[]>`
       SELECT action, resource, metadata FROM audit_logs WHERE action = 'document.bulk_reprocess'
     `;
     expect(logs).toHaveLength(1);
     expect(logs[0]!.resource).toBe(`documents/bulk-reprocess/${batchId}`);
-    // `metadata` é jsonb gravado com JSON.stringify (ver auth/audit.ts) — a
-    // leitura devolve a string JSON crua.
-    expect(JSON.parse(logs[0]!.metadata)).toMatchObject({ batchId, requested: 3, total: 2, skipped: 1 });
+    // `metadata` é jsonb gravado com `sql.json()` (ver auth/audit.ts) — o
+    // postgres.js já devolve o valor como objeto.
+    expect(logs[0]!.metadata).toMatchObject({ batchId, requested: 3, total: 2, skipped: 1 });
   });
 });
 

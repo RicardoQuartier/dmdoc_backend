@@ -5,6 +5,7 @@ import { ROLE_LEVEL, type Role } from '@dmdoc/shared-types';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
 import { NotFoundError, ValidationError } from '../errors/index.js';
+import { escapeLikePattern } from './documents.js';
 
 /**
  * Papéis visíveis a um ator segundo a regra "inferior ou igual": todos os
@@ -76,6 +77,42 @@ type MimeTypeRow = { group_key: string | null; files: string; pages: string; siz
 type UserIdRow = { group_key: string | null; files: string; pages: string; size_bytes: string };
 type DocTypeRow = { group_key: string | null; files: string; pages: string; size_bytes: string; document_type_name?: string | null };
 type UploaderRow = { id: string; name: string; email: string };
+
+/**
+ * Query do relatório de exclusões. `search` reaproveita EXATAMENTE o padrão de
+ * `GET /documents` (`escapeLikePattern` + bind seguro via `addParam`, nunca
+ * concatenado cru). Paginação por página/tamanho (offset), igual ao restante
+ * do produto — diferente das demais rotas deste arquivo, que são agregados
+ * sem paginação: este relatório é uma listagem linha a linha.
+ */
+const DeletionsReportQuerySchema = z.object({
+  tenantId: z.string().uuid().optional(),
+  dateFrom: z.coerce.date().optional(),
+  dateTo: z.coerce.date().optional(),
+  userId: z.string().uuid().optional(),
+  search: z.string().optional(),
+  page: z
+    .string()
+    .optional()
+    .transform((v) => (v !== undefined ? parseInt(v, 10) : 1))
+    .pipe(z.number().int().min(1)),
+  pageSize: z
+    .string()
+    .optional()
+    .transform((v) => (v !== undefined ? parseInt(v, 10) : 20))
+    .pipe(z.number().min(1).max(500)),
+});
+
+type DeletionRow = {
+  document_id: string;
+  filename: string | null;
+  action: 'document.delete' | 'document.bulk_delete';
+  user_id: string | null;
+  user_name: string | null;
+  user_email: string | null;
+  deleted_at: Date;
+  restorable: boolean;
+};
 
 export const reportsRoutes: FastifyPluginAsync = async (app) => {
   /**
@@ -540,6 +577,215 @@ export const reportsRoutes: FastifyPluginAsync = async (app) => {
       );
 
       return reply.status(200).send(uploaders);
+    },
+  );
+
+  /**
+   * GET /reports/deletions — auditoria de exclusões (TENANT_ADMIN+).
+   *
+   * Uma linha por ARQUIVO excluído, não por evento de auditoria: uma exclusão
+   * em massa grava UM registro em `audit_logs` (`document.bulk_delete`) para N
+   * documentos (`metadata.documentIds`); esta rota "achata" cada evento em N
+   * linhas, todas com o mesmo usuário/data/hora. `document.delete` individual
+   * já é 1 documento = 1 linha (o id vem de `resource`, formato
+   * `documents/{id}`).
+   *
+   * `metadata` pode estar com o defeito histórico de double-encoding
+   * (`auth/audit.ts`, corrigido para gravações novas com `sql.json()` — ver
+   * changelog do método `record`): registros ANTIGOS de `document.bulk_delete`
+   * têm `jsonb_typeof(metadata) = 'string'` em vez de `'object'`, porque o
+   * valor foi serializado duas vezes na escrita. A CTE abaixo normaliza os
+   * dois formatos (`CASE jsonb_typeof(...) = 'string' THEN unwrap`) para não
+   * perder exclusões em massa antigas do relatório.
+   */
+  app.get(
+    '/reports/deletions',
+    { preHandler: app.authenticate },
+    async (request, reply) => {
+      requireRole(request, 'TENANT_ADMIN', 'MULTI_TENANT_ADMIN');
+
+      const {
+        tenantId: tenantIdParam,
+        dateFrom,
+        dateTo,
+        userId,
+        search,
+        page,
+        pageSize,
+      } = DeletionsReportQuerySchema.parse(request.query);
+
+      if (dateFrom !== undefined && dateTo !== undefined && dateFrom > dateTo) {
+        throw new ValidationError('dateFrom não pode ser posterior a dateTo');
+      }
+
+      const ctx = resolveTenantContext(request, { explicitTenantId: tenantIdParam, write: true });
+
+      if (ctx.mode !== 'single') {
+        throw new NotFoundError('tenantId é obrigatório para esta operação');
+      }
+
+      const tenantId = ctx.tenantId;
+      const sql = app.db;
+      const visibleRoles = rolesVisibleTo(request.user!.role);
+
+      // ------------------------------------------------------------------
+      // Query dinâmica parametrizada — mesmo padrão de `GET /documents`
+      // (documents.ts): `conditions`/`addParam` monta $1, $2... na ordem em
+      // que cada filtro é adicionado, nunca concatenação crua de valor.
+      // ------------------------------------------------------------------
+      const params: unknown[] = [];
+      let paramIdx = 1;
+      const addParam = (val: unknown): string => {
+        params.push(val);
+        return `$${paramIdx++}`;
+      };
+
+      // Filtros que reduzem `audit_logs` ANTES da expansão (uma linha por
+      // evento, não por documento) — tenant/data/usuário são colunas diretas
+      // de `audit_logs`, então entram na CTE para não expandir eventos que já
+      // sairiam filtrados.
+      const cteConditions: string[] = [`a.tenant_id = ${addParam(tenantId)}`];
+      if (dateFrom !== undefined) {
+        cteConditions.push(`a.created_at >= ${addParam(dateFrom)}::timestamptz`);
+      }
+      if (dateTo !== undefined) {
+        cteConditions.push(`a.created_at <= ${addParam(dateTo)}::timestamptz`);
+      }
+      if (userId !== undefined) {
+        cteConditions.push(`a.user_id = ${addParam(userId)}`);
+      }
+      const cteWhere = cteConditions.join(' AND ');
+
+      const baseQuery = `
+        WITH document_deletions AS (
+          -- document.delete: 1 evento = 1 documento, id extraído de "resource"
+          -- (formato "documents/{id}", garantido por quem grava o audit log).
+          SELECT
+            a.id AS audit_log_id,
+            split_part(a.resource, '/', 2) AS document_id,
+            a.action,
+            a.user_id,
+            a.created_at
+          FROM audit_logs a
+          WHERE ${cteWhere} AND a.action = 'document.delete'
+
+          UNION ALL
+
+          -- document.bulk_delete: 1 evento = N documentos, ids expandidos de
+          -- metadata.documentIds. O CASE com jsonb_typeof normaliza o defeito
+          -- de double-encoding histórico (ver comentário da rota acima).
+          SELECT
+            a.id AS audit_log_id,
+            elem.value AS document_id,
+            a.action,
+            a.user_id,
+            a.created_at
+          FROM audit_logs a
+          CROSS JOIN LATERAL jsonb_array_elements_text(
+            CASE
+              WHEN jsonb_typeof(a.metadata) = 'string' THEN (a.metadata #>> '{}')::jsonb -> 'documentIds'
+              ELSE a.metadata -> 'documentIds'
+            END
+          ) AS elem(value)
+          WHERE ${cteWhere} AND a.action = 'document.bulk_delete'
+        )
+      `;
+
+      // Filtro de busca livre — depende do JOIN com `documents`, então roda na
+      // query EXTERNA (fora da CTE), sobre a CTE já expandida (uma linha por
+      // documento). EXATAMENTE o padrão de `GET /documents`: termo sanitizado
+      // por `escapeLikePattern`, nunca concatenado cru.
+      const outerConditions: string[] = [];
+      const trimmedSearch = search?.trim();
+      if (trimmedSearch !== undefined && trimmedSearch.length > 0) {
+        const searchPattern = `%${escapeLikePattern(trimmedSearch)}%`;
+        const searchParam = addParam(searchPattern);
+        outerConditions.push(
+          `(d.original_filename ILIKE ${searchParam} ESCAPE '\\' OR d.title ILIKE ${searchParam} ESCAPE '\\')`
+        );
+      }
+      const outerWhere = outerConditions.length > 0 ? outerConditions.join(' AND ') : 'TRUE';
+
+      // `d.id::text = dd.document_id` (e não o inverso): `document_id` já sai
+      // como TEXT da CTE (split_part/jsonb_array_elements_text) — comparar
+      // como texto evita um `::uuid` explícito sobre uma string extraída de
+      // jsonb, que lançaria erro de sintaxe de tipo se algum dia houvesse um
+      // valor corrompido em metadata.documentIds (defesa em profundidade).
+      //
+      // `countParams` é um SNAPSHOT de `params` NESTE ponto — antes de alocar
+      // `visibleRoles`/limit/offset (só usados no `pageQuery`). Reaproveitar o
+      // array completo aqui criaria um "buraco": o texto do `countQuery` nunca
+      // referencia esses parâmetros extras, e o Postgres rejeita a query com
+      // "could not determine data type of parameter $N" para qualquer
+      // placeholder que exista no array mas não apareça no texto.
+      const countParams = [...params];
+      const countQuery = `
+        ${baseQuery}
+        SELECT COUNT(*) AS count
+        FROM document_deletions dd
+        LEFT JOIN documents d ON d.id::text = dd.document_id
+        WHERE ${outerWhere}
+      `;
+      const countRows = await sql.unsafe<Array<{ count: string }>>(
+        countQuery,
+        countParams as Parameters<typeof sql.unsafe>[1]
+      );
+      const total = parseInt(countRows[0]?.count ?? '0', 10);
+
+      const visibleRolesParam = addParam(visibleRoles);
+      const limitPlaceholder = addParam(pageSize);
+      const offsetPlaceholder = addParam((page - 1) * pageSize);
+
+      const pageQuery = `
+        ${baseQuery}
+        SELECT
+          dd.document_id,
+          COALESCE(d.title, d.original_filename) AS filename,
+          dd.action,
+          dd.user_id,
+          u.name AS user_name,
+          u.email AS user_email,
+          dd.created_at AS deleted_at,
+          (d.id IS NOT NULL AND d.deleted = true) AS restorable
+        FROM document_deletions dd
+        LEFT JOIN documents d ON d.id::text = dd.document_id
+        LEFT JOIN users u ON u.id = dd.user_id AND u.role = ANY(${visibleRolesParam}::text[])
+        WHERE ${outerWhere}
+        ORDER BY dd.created_at DESC, dd.document_id DESC
+        LIMIT ${limitPlaceholder}
+        OFFSET ${offsetPlaceholder}
+      `;
+      const rows = await sql.unsafe<DeletionRow[]>(
+        pageQuery,
+        params as Parameters<typeof sql.unsafe>[1]
+      );
+
+      const items = rows.map((row) => ({
+        documentId: row.document_id,
+        filename: row.filename,
+        action: row.action,
+        userId: row.user_id,
+        userName: row.user_name,
+        userEmail: row.user_email,
+        deletedAt: row.deleted_at,
+        restorable: row.restorable,
+      }));
+
+      const pageCount = Math.ceil(total / pageSize);
+
+      request.log.info(
+        {
+          tenantId,
+          userId: request.user?.sub,
+          total,
+          returned: items.length,
+          page,
+          pageSize,
+        },
+        'relatório de exclusões consultado',
+      );
+
+      return reply.status(200).send({ items, page, pageSize, total, pageCount });
     },
   );
 };
