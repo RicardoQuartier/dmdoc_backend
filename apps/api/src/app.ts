@@ -367,7 +367,7 @@ function registerErrorHandler(app: FastifyInstance): void {
       return reply.status(422).send({
         error: {
           code: 'FILE_TOO_LARGE',
-          message: `Arquivo excede o tamanho máximo permitido`,
+          message: `Arquivo excede o tamanho máximo permitido (${config.MAX_UPLOAD_MB} MB)`,
         },
       });
     }

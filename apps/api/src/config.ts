@@ -81,7 +81,7 @@ const EnvSchema = z.object({
   REDIS_URL: z.string().min(1, 'REDIS_URL é obrigatória'),
 
   // Limites de upload (spec §12).
-  MAX_UPLOAD_MB: z.coerce.number().int().positive().default(50),
+  MAX_UPLOAD_MB: z.coerce.number().int().positive().default(500),
 
   // Extractor Python — conversão de documentos Office→PDF para preview.
   EXTRACTOR_URL: z.string().url().default('http://localhost:5056/extract'),
