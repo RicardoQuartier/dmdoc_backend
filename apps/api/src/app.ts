@@ -151,7 +151,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     done();
   });
 
-  registerErrorHandler(app);
+  registerErrorHandler(app, config);
 
   // Em produção, CORS fica fechado por padrão (`origin: false`) — funciona
   // porque homolog serve front e API na mesma origem via proxy path-based.
@@ -306,7 +306,7 @@ async function resolveDb(
  *  - `ZodError`  → 422 VALIDATION_ERROR (input externo inválido)
  *  - demais      → 500 INTERNAL_ERROR (mensagem ocultada do cliente)
  */
-function registerErrorHandler(app: FastifyInstance): void {
+function registerErrorHandler(app: FastifyInstance, config: Config): void {
   app.setErrorHandler((error: FastifyError, request, reply) => {
     if (error instanceof AppError) {
       request.log.info({ err: error, code: error.code }, 'erro de domínio tratado');
