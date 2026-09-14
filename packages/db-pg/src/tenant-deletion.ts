@@ -165,6 +165,32 @@ export async function purgeTenantData(
              END
        WHERE tenant_id = ${tenantId}
     `;
+    // evaluated_document_entries (E-13) é histórico de COBRANÇA, como
+    // document_events: a linha fica (inclusive as soft-deletadas) e só as
+    // referências a usuários DO tenant — que serão removidos no passo 3 — são
+    // anuladas. Atores globais (SUPER_ADMIN/MTA) que lançaram, editaram ou
+    // excluíram são preservados. Precisa rodar ANTES do DELETE de `users`: as
+    // quatro colunas são FK para `users` e o delete seria recusado.
+    //
+    // `user_id` é anulado SEM filtrar o tenant do lançamento: a FK é simples
+    // (ver migration 0019), então nada no banco impede um lançamento de OUTRA
+    // empresa apontar para um usuário desta — e esse lançamento bloquearia o
+    // DELETE de `users`. O escopo continua sendo desta empresa: só são tocadas
+    // linhas cujo `user_id` é um usuário DELA, que deixa de existir. Sem índice
+    // com `user_id` na frente: varredura aceitável num job raro, em background.
+    await tx`
+      UPDATE evaluated_document_entries
+         SET user_id = NULL
+       WHERE user_id IN (SELECT id FROM users WHERE tenant_id = ${tenantId})
+    `;
+    await tx`
+      WITH tenant_users AS (SELECT id FROM users WHERE tenant_id = ${tenantId})
+      UPDATE evaluated_document_entries
+         SET created_by_id = CASE WHEN created_by_id IN (SELECT id FROM tenant_users) THEN NULL ELSE created_by_id END,
+             updated_by_id = CASE WHEN updated_by_id IN (SELECT id FROM tenant_users) THEN NULL ELSE updated_by_id END,
+             deleted_by_id = CASE WHEN deleted_by_id IN (SELECT id FROM tenant_users) THEN NULL ELSE deleted_by_id END
+       WHERE tenant_id = ${tenantId}
+    `;
     // audit_logs mantém tenant_id (rastreabilidade) e só anula o user_id de
     // usuários DO tenant. O ator da própria exclusão (SUPER_ADMIN, usuário global
     // que não é removido) é preservado — invariante "audit guarda quem fez".

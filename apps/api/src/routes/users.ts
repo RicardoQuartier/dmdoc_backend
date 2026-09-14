@@ -3,13 +3,14 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { TenantRepository, assertUserScopeInvariant, validateUserDocument } from '@dmdoc/db-pg';
 import type { User, Role } from '@dmdoc/shared-types';
-import { ADMIN_ROLES, ROLE_LEVEL, isGlobalRole } from '@dmdoc/shared-types';
+import { ADMIN_ROLES, isGlobalRole } from '@dmdoc/shared-types';
 import type { TenantDocument } from '@dmdoc/db-pg';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../errors/index.js';
 import { requireRole, requireCanManageRole } from '../auth/role-guard.js';
 import { hashPassword } from '../auth/password.js';
 import { resolveTenantContext, resolveTenantId } from '../auth/resolve-tenant.js';
 import { AuditLogger } from '../auth/audit.js';
+import { rolesVisibleTo } from '../auth/role-visibility.js';
 
 interface UserDoc extends TenantDocument {
   email: string;
@@ -683,17 +684,6 @@ async function findUserInScope(
   }
 
   return rows.length > 0 ? rowToUserDoc(rows[0]!) : null;
-}
-
-/**
- * Papéis visíveis para um ator segundo a regra "inferior ou igual": todos os
- * papéis cujo nível (`ROLE_LEVEL`) seja MENOR OU IGUAL ao do ator. SUPER_ADMIN
- * (100) devolve os 5 papéis; TENANT_ADMIN (60) exclui MULTI_TENANT_ADMIN (80) e
- * SUPER_ADMIN (100).
- */
-function rolesVisibleTo(actorRole: Role): Role[] {
-  const actorLevel = ROLE_LEVEL[actorRole];
-  return (Object.keys(ROLE_LEVEL) as Role[]).filter((r) => ROLE_LEVEL[r] <= actorLevel);
 }
 
 function safeUser(user: UserDoc): Omit<UserDoc, 'passwordHash'> {

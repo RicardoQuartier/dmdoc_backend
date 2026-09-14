@@ -23,6 +23,7 @@ import { searchRoutes, type SearchRoutesOptions } from './routes/search.js';
 import { auditLogsRoutes } from './routes/audit-logs.js';
 import { usageRoutes } from './routes/usage.js';
 import { reportsRoutes } from './routes/reports.js';
+import { reportsEvaluatedDocumentsRoutes } from './routes/reports-evaluated-documents.js';
 import { createStorageResolver, parseSecretKey, type StorageResolver } from '@dmdoc/storage';
 import { buildPlatformS3Config, type StorageDriverFactory } from './lib/storage-admin.js';
 import type { LLMProvider } from '@dmdoc/llm-provider';
@@ -242,6 +243,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(auditLogsRoutes);
   await app.register(usageRoutes);
   await app.register(reportsRoutes);
+  await app.register(reportsEvaluatedDocumentsRoutes);
 
   // Fecha a fila BullMQ no shutdown (deve ser antes de ready())
   if (options.queue) {

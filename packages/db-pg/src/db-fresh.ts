@@ -53,6 +53,7 @@ export async function dbFresh(sql: postgres.Sql): Promise<void> {
       chunks,
       document_content,
       document_events,
+      evaluated_document_entries,
       documents,
       department_permissions,
       departments,

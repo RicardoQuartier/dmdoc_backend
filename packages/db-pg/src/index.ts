@@ -4,6 +4,7 @@ export * from './tenant-context.js';
 export * from './helpers.js';
 export * from './tenant-repository.js';
 export * from './document-events-repository.js';
+export * from './evaluated-document-entries-repository.js';
 export * from './search.js';
 export * from './user-write-validation.js';
 export * from './tenant-deletion.js';

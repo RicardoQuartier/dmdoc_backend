@@ -1,5 +1,16 @@
-import type { JSONValue, Sql } from '@dmdoc/db-pg';
+import type { EvaluatedDocumentEntriesSql, JSONValue } from '@dmdoc/db-pg';
 import { newId } from '@dmdoc/db-pg';
+
+/**
+ * Conexão aceita pelo audit: o pool (`Sql`) OU o `tx` de um `sql.begin`
+ * (`TransactionSql`). Com `tx`, o INSERT do audit entra na MESMA transação da
+ * operação auditada — se o audit falhar, a operação é desfeita junto.
+ *
+ * O `@dmdoc/db-pg` não reexporta `TransactionSql` do postgres.js (e a api não
+ * depende de `postgres` diretamente); `EvaluatedDocumentEntriesSql` é
+ * exatamente `Sql | TransactionSql` e é reaproveitado aqui só como alias.
+ */
+export type AuditSql = EvaluatedDocumentEntriesSql;
 
 /**
  * Documento de auditoria como armazenado na tabela `audit_logs` (spec §5.3).
@@ -22,16 +33,18 @@ export const AUDIT_LOGS_COLLECTION = 'audit_logs';
  * login, upload, delete, mudança de permissão e reprocessamento.
  */
 export class AuditLogger {
-  private readonly sql: Sql;
+  private readonly sql: AuditSql;
 
-  constructor(sql: Sql) {
+  constructor(sql: AuditSql) {
     this.sql = sql;
   }
 
   /**
-   * Insere um registro de auditoria. Não lança em caso de falha de escrita do
-   * log — auditoria nunca deve derrubar a operação principal. A falha é apenas
-   * logada pelo chamador.
+   * Insere um registro de auditoria. Lança se a escrita falhar: cabe ao
+   * chamador decidir. Rotas cujo audit é "melhor esforço" capturam e só
+   * logam; rotas em que o audit é parte da operação (ex.: a justificativa de
+   * uma correção só existe aqui) chamam dentro de `sql.begin` com o `tx`, e a
+   * falha desfaz a operação inteira.
    */
   async record(entry: Omit<AuditLogDocument, 'createdAt'>): Promise<void> {
     const id = newId();

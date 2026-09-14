@@ -1,40 +1,18 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { DocumentEventsRepository } from '@dmdoc/db-pg';
-import { ROLE_LEVEL, type Role } from '@dmdoc/shared-types';
 import { requireRole } from '../auth/role-guard.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
+import { rolesVisibleTo } from '../auth/role-visibility.js';
 import { NotFoundError, ValidationError } from '../errors/index.js';
+import { csvUuids } from '../lib/query-schemas.js';
 import { escapeLikePattern } from './documents.js';
-
-/**
- * Papéis visíveis a um ator segundo a regra "inferior ou igual": todos os
- * papéis cujo nível (`ROLE_LEVEL`) seja MENOR OU IGUAL ao do ator. Usado para
- * não expor, em relatórios, nome/e-mail de usuários de nível ACIMA do
- * solicitante (ex.: TENANT_ADMIN não deve ver um MULTI_TENANT_ADMIN que fez
- * upload no tenant). Ver wiki "Hierarquia de papéis e gestão de usuários".
- */
-function rolesVisibleTo(actorRole: Role): Role[] {
-  const actorLevel = ROLE_LEVEL[actorRole];
-  return (Object.keys(ROLE_LEVEL) as Role[]).filter((r) => ROLE_LEVEL[r] <= actorLevel);
-}
 
 const TenantIdQuerySchema = z.object({
   tenantId: z.string().uuid().optional(),
   dateFrom: z.coerce.date().optional(),
   dateTo: z.coerce.date().optional(),
 });
-
-const csvUuids = z
-  .string()
-  .optional()
-  .transform((raw) =>
-    (raw ?? '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0),
-  )
-  .pipe(z.array(z.string().uuid('cada id deve ser um UUID válido')));
 
 const csvStrings = z
   .string()
