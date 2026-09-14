@@ -1,11 +1,11 @@
 /**
  * Schema Drizzle para o DMDoc — PostgreSQL + pgvector.
  *
- * Tabelas (18 no total):
+ * Tabelas (19 no total):
  *   tenants, platform_settings, users, departments, department_permissions,
  *   document_types, document_type_index_fields,
  *   global_type_tenant_depts, documents, document_content,
- *   chunks, document_events, department_templates,
+ *   chunks, document_events, evaluated_document_entries, department_templates,
  *   ai_reprocess_batch, document_reprocess_batch,
  *   tenant_storage_configs, storage_migrations, audit_logs
  *
@@ -29,6 +29,7 @@ import {
   integer,
   bigint,
   timestamp,
+  date,
   jsonb,
   unique,
   uniqueIndex,
@@ -557,6 +558,59 @@ export const documentEvents = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// evaluated_document_entries
+// ---------------------------------------------------------------------------
+
+/**
+ * Lançamento MANUAL de páginas avaliadas (épico E-13, migration 0019) — fonte
+ * da seção "Documentos avaliados" do relatório de Uso e Cobrança.
+ *
+ * Ao contrário de `document_events`, é corrigível: tem soft delete
+ * (`deleted`/`deletedAt`/`deletedById`) e edição (`updatedById`/`updatedAt`).
+ * A justificativa das correções vive no audit log, não aqui.
+ *
+ * - `evaluatedOn` é `date` em modo string (`YYYY-MM-DD`): o dia da avaliação,
+ *   sem hora nem fuso.
+ * - `userId` e os `*ById` são nullable: a purga de empresa remove os usuários
+ *   e o histórico de cobrança sobrevive com a referência anulada.
+ * - `userId` é FK SIMPLES em `users.id`: FK composta com o tenant quebraria a
+ *   promoção de usuário local a papel global (`users.tenant_id` vira NULL).
+ *   "Usuário da mesma empresa" é regra da API na escrita.
+ */
+export const evaluatedDocumentEntries = pgTable(
+  'evaluated_document_entries',
+  {
+    id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    userId: uuid('user_id').references(() => users.id),
+    evaluatedOn: date('evaluated_on', { mode: 'string' }).notNull(),
+    pageCount: integer('page_count').notNull(),
+    createdById: uuid('created_by_id').references(() => users.id),
+    updatedById: uuid('updated_by_id').references(() => users.id),
+    deletedById: uuid('deleted_by_id').references(() => users.id),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .default(sql`now()`),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .default(sql`now()`),
+    deleted: boolean('deleted').notNull().default(false),
+    deletedAt: timestamp('deleted_at', { withTimezone: true, mode: 'date' }),
+  },
+  (t) => [
+    check('evaluated_doc_entries_page_count_positive', sql`${t.pageCount} > 0`),
+    // Parcial: summary/listPaged sempre filtram `deleted = false`.
+    index('evaluated_doc_entries_by_tenant_date')
+      .on(t.tenantId, t.evaluatedOn)
+      .where(sql`deleted = false`),
+    // Completo: filtro por usuário e varredura da purga (sem filtro de deleted).
+    index('evaluated_doc_entries_by_tenant_user_date').on(t.tenantId, t.userId, t.evaluatedOn),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // department_templates
 // ---------------------------------------------------------------------------
 
@@ -854,6 +908,9 @@ export type NewChunk = typeof chunks.$inferInsert;
 
 export type DocumentEvent = typeof documentEvents.$inferSelect;
 export type NewDocumentEvent = typeof documentEvents.$inferInsert;
+
+export type EvaluatedDocumentEntry = typeof evaluatedDocumentEntries.$inferSelect;
+export type NewEvaluatedDocumentEntry = typeof evaluatedDocumentEntries.$inferInsert;
 
 export type DepartmentTemplate = typeof departmentTemplates.$inferSelect;
 export type NewDepartmentTemplate = typeof departmentTemplates.$inferInsert;

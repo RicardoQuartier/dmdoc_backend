@@ -23,6 +23,7 @@ import { searchRoutes, type SearchRoutesOptions } from './routes/search.js';
 import { auditLogsRoutes } from './routes/audit-logs.js';
 import { usageRoutes } from './routes/usage.js';
 import { reportsRoutes } from './routes/reports.js';
+import { reportsEvaluatedDocumentsRoutes } from './routes/reports-evaluated-documents.js';
 import { createStorageResolver, parseSecretKey, type StorageResolver } from '@dmdoc/storage';
 import { buildPlatformS3Config, type StorageDriverFactory } from './lib/storage-admin.js';
 import type { LLMProvider } from '@dmdoc/llm-provider';
@@ -151,7 +152,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     done();
   });
 
-  registerErrorHandler(app);
+  registerErrorHandler(app, config);
 
   // Em produção, CORS fica fechado por padrão (`origin: false`) — funciona
   // porque homolog serve front e API na mesma origem via proxy path-based.
@@ -242,6 +243,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   await app.register(auditLogsRoutes);
   await app.register(usageRoutes);
   await app.register(reportsRoutes);
+  await app.register(reportsEvaluatedDocumentsRoutes);
 
   // Fecha a fila BullMQ no shutdown (deve ser antes de ready())
   if (options.queue) {
@@ -306,7 +308,7 @@ async function resolveDb(
  *  - `ZodError`  → 422 VALIDATION_ERROR (input externo inválido)
  *  - demais      → 500 INTERNAL_ERROR (mensagem ocultada do cliente)
  */
-function registerErrorHandler(app: FastifyInstance): void {
+function registerErrorHandler(app: FastifyInstance, config: Config): void {
   app.setErrorHandler((error: FastifyError, request, reply) => {
     if (error instanceof AppError) {
       request.log.info({ err: error, code: error.code }, 'erro de domínio tratado');

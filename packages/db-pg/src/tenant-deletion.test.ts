@@ -307,8 +307,25 @@ const GLOBAL_ACTOR_ID = '88888888-8888-8888-8888-888888888888';
 /** Destinos de armazenamento do tenant alvo, resemeados a cada teste. */
 let storageA: StorageIds;
 
+/**
+ * Semeia dois lançamentos de páginas avaliadas (E-13) no tenant, cobrindo as
+ * quatro colunas de usuário: um ativo (atribuído e lançado por usuário DO
+ * tenant, editado pelo ator GLOBAL) e um soft-deletado (lançado pelo ator
+ * global, excluído por usuário do tenant). `page_count` 7/9 identifica cada um.
+ */
+async function seedEvaluatedEntries(tenantId: string, userId: string): Promise<void> {
+  await sql`INSERT INTO evaluated_document_entries
+      (tenant_id, user_id, evaluated_on, page_count, created_by_id, updated_by_id)
+    VALUES (${tenantId}, ${userId}, '2026-03-10', 7, ${userId}, ${GLOBAL_ACTOR_ID})`;
+  await sql`INSERT INTO evaluated_document_entries
+      (tenant_id, user_id, evaluated_on, page_count, created_by_id, deleted_by_id, deleted, deleted_at)
+    VALUES (${tenantId}, ${userId}, '2026-03-11', 9, ${GLOBAL_ACTOR_ID}, ${userId}, true, now())`;
+}
+
 beforeEach(async () => {
   // Limpeza total (ordem filhos → pais) antes de cada teste.
+  // Primeiro: referencia `users` (inclusive o ator global) e `tenants`.
+  await sql`DELETE FROM evaluated_document_entries`;
   await sql`DELETE FROM chunks`;
   await sql`DELETE FROM document_content`;
   await sql`DELETE FROM document_events`;
@@ -345,9 +362,17 @@ beforeEach(async () => {
   await sql`INSERT INTO audit_logs (id, tenant_id, user_id, action, resource)
     VALUES ('a0000000-0000-0000-0000-0000000000ac', ${TENANT_A}, ${GLOBAL_ACTOR_ID},
             'tenant.delete.requested', ${'tenants/' + TENANT_A})`;
+
+  // Lançamentos de páginas avaliadas nos dois tenants (depois do ator global,
+  // que aparece como editor/autor).
+  await seedEvaluatedEntries(TENANT_A, idsA.userId);
+  await seedEvaluatedEntries(TENANT_B, idsB.userId);
 });
 
 afterAll(async () => {
+  // Referencia `users`: sem isto, o `DELETE FROM users` do próximo arquivo
+  // (mesmo banco, execução serializada) esbarraria na FK.
+  await sql`DELETE FROM evaluated_document_entries`;
   // ⚠️ Limpar os DESTINOS antes de sair. `tenant_storage_configs` tem invariante
   // GLOBAL (`uniq_tenant_storage_active`) e `tenant-storage-schema.test.ts` conta
   // `WHERE active` sem filtro de tenant — deixar as configurações do tenant de
@@ -410,6 +435,59 @@ describe('purgeTenantData', () => {
     `;
     expect(seededAudit).toHaveLength(1);
     expect(seededAudit[0]?.['user_id']).toBeNull();
+  });
+
+  it('preserva lançamentos de páginas avaliadas com usuários do tenant anulados (sem violar FK)', async () => {
+    const { deps } = makeDeps();
+    await purgeTenantData(sql, TENANT_A, deps);
+
+    const rows = await sql<
+      Array<{
+        page_count: number;
+        user_id: string | null;
+        created_by_id: string | null;
+        updated_by_id: string | null;
+        deleted_by_id: string | null;
+        deleted: boolean;
+      }>
+    >`
+      SELECT page_count, user_id, created_by_id, updated_by_id, deleted_by_id, deleted
+        FROM evaluated_document_entries
+       WHERE tenant_id = ${TENANT_A}
+       ORDER BY page_count
+    `;
+    // As duas linhas sobrevivem (inclusive a soft-deletada) — histórico de cobrança.
+    expect(rows).toHaveLength(2);
+    expect(rows).toEqual([
+      // Ativo: atribuído/lançado por usuário do tenant → anulado; editor global preservado.
+      { page_count: 7, user_id: null, created_by_id: null, updated_by_id: GLOBAL_ACTOR_ID, deleted_by_id: null, deleted: false },
+      // Excluído: autor global preservado; excluído por usuário do tenant → anulado.
+      { page_count: 9, user_id: null, created_by_id: GLOBAL_ACTOR_ID, updated_by_id: null, deleted_by_id: null, deleted: true },
+    ]);
+  });
+
+  it('anula user_id de lançamento de OUTRA empresa que aponta para usuário purgado (sem violar FK)', async () => {
+    // A FK de user_id é simples: nada no banco impede o lançamento da B apontar
+    // para um usuário da A. Sem a anulação cross-tenant, o DELETE de users da
+    // purga de A estouraria 23503.
+    const userA = 'aaaa0000-0000-0000-0000-00000000000a';
+    const userB = 'aaaa0000-0000-0000-0000-00000000000b';
+    await sql`INSERT INTO evaluated_document_entries
+        (tenant_id, user_id, evaluated_on, page_count, created_by_id)
+      VALUES (${TENANT_B}, ${userA}, '2026-03-12', 13, ${userB})`;
+
+    const { deps } = makeDeps();
+    await expect(purgeTenantData(sql, TENANT_A, deps)).resolves.toBeUndefined();
+
+    const cross = await sql<Array<{ user_id: string | null; created_by_id: string | null }>>`
+      SELECT user_id, created_by_id FROM evaluated_document_entries
+       WHERE tenant_id = ${TENANT_B} AND page_count = 13
+    `;
+    // Linha preservada; só a referência ao usuário purgado caiu. O autor (da B)
+    // não é tocado — a purga de A não mexe em nada que não seja dela.
+    expect(cross).toEqual([{ user_id: null, created_by_id: userB }]);
+    const usersA = await sql`SELECT id FROM users WHERE id = ${userA}`;
+    expect(usersA).toHaveLength(0);
   });
 
   it('preserva o ator global (SUPER_ADMIN) que executou a exclusão no audit', async () => {
@@ -489,6 +567,14 @@ describe('purgeTenantData', () => {
     expect(await countRows('departments', TENANT_B)).toBe(1);
     expect(await countRows('users', TENANT_B)).toBe(1);
     expect(await countRows('document_events', TENANT_B)).toBe(1);
+    expect(await countRows('evaluated_document_entries', TENANT_B)).toBe(2);
+
+    // Lançamentos de B mantêm o usuário atribuído (não foram anulados).
+    const entriesB = await sql<Array<{ c: number }>>`
+      SELECT COUNT(*)::int AS c FROM evaluated_document_entries
+       WHERE tenant_id = ${TENANT_B} AND user_id IS NOT NULL
+    `;
+    expect(entriesB[0]?.c).toBe(2);
 
     // FKs do evento de B continuam preenchidas (não foram tocadas).
     const eventsB = await sql`
