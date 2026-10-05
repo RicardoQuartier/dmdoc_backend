@@ -19,6 +19,10 @@ import { departmentsRoutes } from './routes/departments.js';
 import { documentTypesRoutes } from './routes/document-types.js';
 import { permissionsRoutes } from './routes/permissions.js';
 import { documentsRoutes, type DocumentsRoutesOptions } from './routes/documents.js';
+import {
+  documentUploadsRoutes,
+  type DocumentUploadsRoutesOptions,
+} from './routes/document-uploads.js';
 import { searchRoutes, type SearchRoutesOptions } from './routes/search.js';
 import { auditLogsRoutes } from './routes/audit-logs.js';
 import { usageRoutes } from './routes/usage.js';
@@ -127,6 +131,12 @@ export interface BuildAppOptions {
    * Em produção, cada rota cria o seu a partir da config.
    */
   llmProvider?: LLMProvider;
+  /**
+   * Intervalo (ms) da limpeza periódica de sessões de upload em partes
+   * (ADR 0004). `0` desliga o timer — os testes chamam `cleanupUploadSessions`
+   * diretamente. Ausente: 15 min.
+   */
+  uploadCleanupIntervalMs?: number;
 }
 
 /**
@@ -239,6 +249,12 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     config,
     ...(options.llmProvider ? { llmProvider: options.llmProvider } : {}),
   } satisfies DocumentsRoutesOptions);
+  await app.register(documentUploadsRoutes, {
+    config,
+    ...(options.uploadCleanupIntervalMs !== undefined
+      ? { cleanupIntervalMs: options.uploadCleanupIntervalMs }
+      : {}),
+  } satisfies DocumentUploadsRoutesOptions);
   await app.register(searchRoutes, { config } satisfies SearchRoutesOptions);
   await app.register(auditLogsRoutes);
   await app.register(usageRoutes);
