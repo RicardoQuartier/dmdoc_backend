@@ -1,4 +1,6 @@
 import type { Sql } from '@dmdoc/db-pg';
+import { ROLE_LEVEL, RoleSchema } from '@dmdoc/shared-types';
+import { NotFoundError } from '../errors/index.js';
 
 /**
  * Resolução de acesso a departamentos (ACL por raiz com herança dinâmica).
@@ -9,7 +11,7 @@ import type { Sql } from '@dmdoc/db-pg';
  *     de escrita é adicionalmente limitada pelo PAPEL do usuário: USER é
  *     somente leitura (nunca escreve, mesmo com raiz concedida), enquanto a
  *     escrita exige nível >= UPLOADER. Esse gate por papel vive em
- *     `assertCanWriteDepartment` (routes/documents.ts) — este resolvedor apenas
+ *     `assertCanWriteDepartment` (abaixo) — este resolvedor apenas
  *     computa o conjunto acessível para LEITURA, reaproveitado pela checagem de
  *     escrita de UPLOADER+ para restringir o departamento à subárvore concedida.
  *   - A herança é DINÂMICA: os filhos NÃO são materializados em
@@ -112,4 +114,54 @@ export async function resolveAccessibleDepartmentIds(
   }
 
   return [...accessible];
+}
+
+/**
+ * Valida se o usuário pode ESCREVER em um departamento específico.
+ *
+ * Duas camadas de controle, nesta ordem:
+ *   1. GATE POR PAPEL — a CAPACIDADE de escrita exige nível >= UPLOADER (40).
+ *      USER (20) é somente leitura por definição (wiki "Papéis de acesso
+ *      (roles)"): mesmo com uma raiz concedida ativa (que lhe dá leitura da
+ *      subárvore), NUNCA pode escrever. Papel desconhecido/inválido cai como
+ *      SEM escrita (fail-closed). Cobre uniformemente PATCH/DELETE/reprocess/
+ *      suggest-indexes — todos passam por este choke point.
+ *   2. ACL POR DEPARTAMENTO — para papéis com capacidade de escrita, o
+ *      departamento precisa estar no conjunto acessível (subárvore concedida)
+ *      ou o papel ser admin (sem restrição de ACL).
+ *
+ * Lança `NotFoundError` (nunca 403 — spec §10, invariante 4) se sem permissão,
+ * com a mesma mensagem em ambas as camadas para não vazar a existência do
+ * recurso a quem não pode escrever nele.
+ */
+export async function assertCanWriteDepartment(
+  sql: Sql,
+  userId: string,
+  tenantId: string,
+  departmentId: string,
+  role: string
+): Promise<void> {
+  // Camada 1: gate por nível de papel (fail-closed).
+  // O role vem do JWT já validado, mas mantemos a checagem type-safe: um papel
+  // não reconhecido resolve para nível 0 e é negado, nunca liberado.
+  const parsedRole = RoleSchema.safeParse(role);
+  const roleLevel = parsedRole.success ? ROLE_LEVEL[parsedRole.data] : 0;
+  if (roleLevel < ROLE_LEVEL.UPLOADER) {
+    throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
+  }
+
+  const accessible = await resolveAccessibleDepartmentIds(sql, userId, tenantId, role);
+  if (accessible === null) {
+    // Admin sem restrição de ACL: verifica apenas que o dept pertence ao tenant.
+    const rows = await sql<Array<{ id: string }>>`
+      SELECT id FROM departments WHERE id = ${departmentId} AND tenant_id = ${tenantId} LIMIT 1
+    `;
+    if (rows.length === 0) {
+      throw new NotFoundError('Departamento não encontrado');
+    }
+    return;
+  }
+  if (!accessible.includes(departmentId)) {
+    throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
+  }
 }
