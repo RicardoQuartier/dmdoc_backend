@@ -578,6 +578,8 @@ describe('upload em partes — limpeza de sessões', () => {
     expect((done.body['error'] as Record<string, unknown>)['code']).toBe('COMPLETION_INTERRUPTED');
     expect(existsSync(sessionDir(TENANT_A, uploadId))).toBe(false);
     expect(existsSync(orphan)).toBe(false);
+    // Diretórios de empresa vazios também saem.
+    expect(existsSync(path.join(UPLOAD_TMP_DIR, TENANT_B))).toBe(false);
   });
 
   it('sessão aberta dentro do prazo não é tocada', async () => {

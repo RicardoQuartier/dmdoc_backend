@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
+import { mkdir, readdir, rename, rm, rmdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { Transform, type Readable, type TransformCallback } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -208,6 +208,10 @@ interface AssembledFile {
  * Concatena as partes 1..totalParts num único arquivo, por stream, calculando
  * o SHA-256 e o tamanho real no caminho. Memória constante (buffers do stream),
  * qualquer que seja o tamanho do arquivo.
+ *
+ * Cada parte é apagada logo depois de anexada: o pico de disco da sessão fica
+ * em ~1× o arquivo (+ uma parte), não 2×. A sessão já está em COMPLETING e não
+ * volta a OPEN, então as partes não seriam reaproveitadas de qualquer jeito.
  */
 async function assembleParts(dir: string, totalParts: number): Promise<AssembledFile> {
   const target = path.join(dir, ASSEMBLED_FILENAME);
@@ -225,6 +229,7 @@ async function assembleParts(dir: string, totalParts: number): Promise<Assembled
           await new Promise<void>((resolve) => out.once('drain', resolve));
         }
       }
+      await rm(partPath(dir, n), { force: true });
     }
   } finally {
     await new Promise<void>((resolve, reject) => {
@@ -316,6 +321,11 @@ export async function cleanupUploadSessions(deps: CleanupUploadSessionsDeps): Pr
       await removeDir(path.join(uploadTmpDir, tenantId, uploadId), log, { tenantId, uploadId });
       orphanDirs += 1;
     }
+  }
+  // Diretórios de empresa que ficaram vazios. `rmdir` falha (e é ignorado) se
+  // um PUT acabou de criar uma sessão nova ali — nunca apaga conteúdo.
+  for (const tenantId of tenantDirs) {
+    await rmdir(path.join(uploadTmpDir, tenantId)).catch(() => undefined);
   }
 
   if (expired.length > 0 || stuck.length > 0 || orphanDirs > 0) {
