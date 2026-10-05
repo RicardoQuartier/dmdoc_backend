@@ -128,7 +128,6 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
           WHERE tenant_id = ${tenantIdParam}
             AND deleted = false
           ORDER BY level ASC, name ASC
-          LIMIT 1000
         `;
       } else {
         rows = await sql<DeptRow[]>`
@@ -136,7 +135,6 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
           FROM departments
           WHERE deleted = false
           ORDER BY level ASC, name ASC
-          LIMIT 1000
         `;
       }
     } else if (role === 'MULTI_TENANT_ADMIN') {
@@ -149,7 +147,6 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
           WHERE tenant_id = ${context.tenantId}
             AND deleted = false
           ORDER BY level ASC, name ASC
-          LIMIT 1000
         `;
       } else {
         const allowedTenantIds = request.user?.allowedTenantIds ?? [];
@@ -159,7 +156,6 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
           WHERE tenant_id = ANY(${allowedTenantIds}::uuid[])
             AND deleted = false
           ORDER BY level ASC, name ASC
-          LIMIT 1000
         `;
       }
     } else {
@@ -173,7 +169,6 @@ export const departmentsRoutes: FastifyPluginAsync = async (app) => {
         WHERE tenant_id = ${tenantId}
           AND deleted = false
         ORDER BY level ASC, name ASC
-        LIMIT 1000
       `;
     }
 
