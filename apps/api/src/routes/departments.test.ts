@@ -206,6 +206,52 @@ describe('GET /departments — documentCount', () => {
   });
 });
 
+describe('GET /departments — árvore completa, sem corte por quantidade', () => {
+  it('devolve todos os departamentos de um tenant com mais de 1000, inclusive sub-departamentos profundos', async () => {
+    const raizId = newId();
+    const nivel1Id = newId();
+    const nivel2Id = newId();
+    const [subA, subB, subC] = [newId(), newId(), newId()];
+    const subIds = [subA, subB, subC];
+
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      VALUES
+        (${raizId}, ${TENANT_A}, NULL, 'Raiz', 0, '{}'::text[], false, NOW()),
+        (${nivel1Id}, ${TENANT_A}, ${raizId}, 'Nivel 1', 1, '{}'::text[], false, NOW()),
+        (${nivel2Id}, ${TENANT_A}, ${nivel1Id}, 'Nivel 2', 2, '{}'::text[], false, NOW()),
+        (${subA}, ${TENANT_A}, ${nivel2Id}, 'Diversos-01', 3, '{}'::text[], false, NOW()),
+        (${subB}, ${TENANT_A}, ${nivel2Id}, 'Doctos Suporte DIPJ-01', 3, '{}'::text[], false, NOW()),
+        (${subC}, ${TENANT_A}, ${nivel2Id}, 'Traffic IRPJ-CSLL - 2001', 3, '{}'::text[], false, NOW())
+    `;
+
+    // Enche os níveis rasos até passar de 1000 linhas: com o corte antigo
+    // (ORDER BY level, name LIMIT 1000) os nós de nível 3 eram os primeiros a sumir.
+    await testDb.db`
+      INSERT INTO departments (id, tenant_id, parent_id, name, level, tags, deleted, created_at)
+      SELECT gen_random_uuid(), ${TENANT_A}, ${raizId}, 'Filial ' || lpad(n::text, 5, '0'), 1, '{}'::text[], false, NOW()
+      FROM generate_series(1, 1100) AS n
+    `;
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/departments',
+      headers: { authorization: `Bearer ${tokenA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const items = res.json() as Array<{ id: string; name: string; level: number }>;
+
+    expect(items).toHaveLength(6 + 1100);
+    expect(items.map((d) => d.id)).toEqual(expect.arrayContaining(subIds));
+    expect(items.filter((d) => d.level === 3).map((d) => d.name).sort()).toEqual([
+      'Diversos-01',
+      'Doctos Suporte DIPJ-01',
+      'Traffic IRPJ-CSLL - 2001',
+    ]);
+  });
+});
+
 describe('GET /departments?writable=true — filtro de escrita (seletor de upload)', () => {
   /**
    * Regra de negócio (wiki "Permissões por departamento (ACL)" → seção
