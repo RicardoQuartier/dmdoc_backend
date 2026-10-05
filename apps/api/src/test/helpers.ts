@@ -104,6 +104,7 @@ export async function resetDomainTables(db: Sql): Promise<void> {
       storage_migrations,
       tenant_storage_configs,
       tenants,
+      upload_sessions,
       users
     RESTART IDENTITY CASCADE
   `);

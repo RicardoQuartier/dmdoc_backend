@@ -1,13 +1,13 @@
 /**
  * Schema Drizzle para o DMDoc — PostgreSQL + pgvector.
  *
- * Tabelas (19 no total):
+ * Tabelas (20 no total):
  *   tenants, platform_settings, users, departments, department_permissions,
  *   document_types, document_type_index_fields,
  *   global_type_tenant_depts, documents, document_content,
  *   chunks, document_events, evaluated_document_entries, department_templates,
  *   ai_reprocess_batch, document_reprocess_batch,
- *   tenant_storage_configs, storage_migrations, audit_logs
+ *   tenant_storage_configs, storage_migrations, upload_sessions, audit_logs
  *
  * Regras gerais de mapeamento MongoDB → PostgreSQL:
  *   - string (UUID)          → uuid  (default pgCrypto.gen_random_uuid())
@@ -846,6 +846,99 @@ export const storageMigrations = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// upload_sessions
+// ---------------------------------------------------------------------------
+
+/**
+ * Estados de uma sessão de upload em partes (ADR 0004).
+ *
+ * `OPEN` → (`complete`) → `COMPLETING` → `COMPLETED` | `FAILED`.
+ * De `OPEN` também `ABORTED` (cancelado pelo usuário) e `EXPIRED` (TTL).
+ */
+export const UPLOAD_SESSION_STATUSES = [
+  'OPEN',
+  'COMPLETING',
+  'COMPLETED',
+  'FAILED',
+  'ABORTED',
+  'EXPIRED',
+] as const;
+export type UploadSessionStatus = (typeof UPLOAD_SESSION_STATUSES)[number];
+
+/**
+ * Sessão de upload em partes (épico E-16 / ADR 0004).
+ *
+ * Dado OPERACIONAL e efêmero: sem soft delete. As partes ficam em disco local
+ * da API (`${UPLOAD_TMP_DIR}/<tenantId>/<id>/<n>.part`), caminho montado a
+ * partir destes ids — nunca de texto do cliente. A linha sobrevive ao desfecho
+ * como histórico (resultado em `document_id`/`deduplicated`/`error_*`).
+ *
+ * Isolamento: toda leitura filtra `tenant_id` E `user_id` — sessão de outra
+ * empresa ou de outro usuário responde 404.
+ *
+ * `index_values` é jsonb: grave com `sql.json(...)`, nunca `JSON.stringify`
+ * (double-encoding no postgres.js).
+ *
+ * `received_parts` guarda os números (1..total_parts) já recebidos; o PUT de
+ * parte faz a união numa única instrução UPDATE, que serializa partes
+ * concorrentes pelo lock da linha.
+ */
+export const uploadSessions = pgTable(
+  'upload_sessions',
+  {
+    id: uuid('id').primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id),
+    departmentId: uuid('department_id')
+      .notNull()
+      .references(() => departments.id),
+    documentTypeId: uuid('document_type_id').references(() => documentTypes.id),
+    indexValues: jsonb('index_values').notNull().default(sql`'{}'::jsonb`),
+    originalPath: text('original_path'),
+    // Nome original declarado pelo cliente — só vira chave de storage depois de
+    // sanitizado, igual ao upload simples. Nunca entra no caminho em disco.
+    filename: text('filename').notNull(),
+    mimeType: text('mime_type').notNull(),
+    declaredSizeBytes: bigint('declared_size_bytes', { mode: 'bigint' }).notNull(),
+    chunkSizeBytes: integer('chunk_size_bytes').notNull(),
+    totalParts: integer('total_parts').notNull(),
+    receivedParts: integer('received_parts').array().notNull().default(sql`'{}'::integer[]`),
+    status: text('status').notNull().default('OPEN'),
+    // Resultado da conclusão (preenchido em COMPLETED/FAILED).
+    documentId: uuid('document_id').references(() => documents.id),
+    deduplicated: boolean('deduplicated'),
+    errorCode: text('error_code'),
+    errorMessage: text('error_message'),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'date' }).notNull(),
+    // Quando a sessão entrou em COMPLETING — base para encerrar como FAILED a
+    // conclusão presa (API reiniciada no meio) depois do TTL.
+    completingStartedAt: timestamp('completing_started_at', { withTimezone: true, mode: 'date' }),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .default(sql`now()`),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .default(sql`now()`),
+  },
+  (t) => [
+    check(
+      'upload_sessions_status_valid',
+      sql`${t.status} IN ('OPEN', 'COMPLETING', 'COMPLETED', 'FAILED', 'ABORTED', 'EXPIRED')`,
+    ),
+    // Consultas da sessão pelo dono (toda rota filtra tenant + usuário).
+    index('upload_sessions_by_tenant_user_status').on(t.tenantId, t.userId, t.status),
+    // Varredura da limpeza periódica: só sessões abertas ocupam o índice.
+    index('upload_sessions_open_expires_at')
+      .on(t.expiresAt)
+      .where(sql`status = 'OPEN'`),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // audit_logs
 // ---------------------------------------------------------------------------
 
@@ -926,3 +1019,6 @@ export type NewTenantStorageConfig = typeof tenantStorageConfigs.$inferInsert;
 
 export type StorageMigration = typeof storageMigrations.$inferSelect;
 export type NewStorageMigration = typeof storageMigrations.$inferInsert;
+
+export type UploadSession = typeof uploadSessions.$inferSelect;
+export type NewUploadSession = typeof uploadSessions.$inferInsert;

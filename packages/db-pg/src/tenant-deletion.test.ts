@@ -137,6 +137,16 @@ async function seedTenant(tenantId: string, suffix: string, globalTypeId: string
   await sql`INSERT INTO audit_logs (id, tenant_id, user_id, action, resource)
     VALUES (${ids.auditId}, ${tenantId}, ${ids.userId}, 'document.upload', ${`documents/${ids.docId}`})`;
 
+  // Sessão de upload em partes (E-16) já concluída, apontando para usuário,
+  // departamento, tipo e documento do tenant — todos apagados pela purga.
+  await sql`INSERT INTO upload_sessions (
+      tenant_id, user_id, department_id, document_type_id, filename, mime_type,
+      declared_size_bytes, chunk_size_bytes, total_parts, status, document_id, expires_at
+    ) VALUES (
+      ${tenantId}, ${ids.userId}, ${ids.deptId}, ${ids.docTypeId}, 'f.pdf', 'application/pdf',
+      ${1234}, ${10485760}, 1, 'COMPLETED', ${ids.docId}, now() + interval '1 day'
+    )`;
+
   return ids;
 }
 
@@ -325,6 +335,7 @@ async function seedEvaluatedEntries(tenantId: string, userId: string): Promise<v
 beforeEach(async () => {
   // Limpeza total (ordem filhos → pais) antes de cada teste.
   // Primeiro: referencia `users` (inclusive o ator global) e `tenants`.
+  await sql`DELETE FROM upload_sessions`;
   await sql`DELETE FROM evaluated_document_entries`;
   await sql`DELETE FROM chunks`;
   await sql`DELETE FROM document_content`;
@@ -373,6 +384,7 @@ afterAll(async () => {
   // Referencia `users`: sem isto, o `DELETE FROM users` do próximo arquivo
   // (mesmo banco, execução serializada) esbarraria na FK.
   await sql`DELETE FROM evaluated_document_entries`;
+  await sql`DELETE FROM upload_sessions`;
   // ⚠️ Limpar os DESTINOS antes de sair. `tenant_storage_configs` tem invariante
   // GLOBAL (`uniq_tenant_storage_active`) e `tenant-storage-schema.test.ts` conta
   // `WHERE active` sem filtro de tenant — deixar as configurações do tenant de
@@ -508,6 +520,14 @@ describe('purgeTenantData', () => {
     expect(actor).toHaveLength(1);
   });
 
+  it('remove as sessões de upload em partes do tenant e preserva as do tenant de controle', async () => {
+    const { deps } = makeDeps();
+    await purgeTenantData(sql, TENANT_A, deps);
+
+    expect(await countRows('upload_sessions', TENANT_A)).toBe(0);
+    expect(await countRows('upload_sessions', TENANT_B)).toBe(1);
+  });
+
   it('marca o tenant como deletado, inativo e renomeado', async () => {
     const { deps } = makeDeps();
     await purgeTenantData(sql, TENANT_A, deps);
@@ -537,6 +557,7 @@ describe('purgeTenantData', () => {
     expect(metadata.counts?.['users']).toBe(1);
     expect(metadata.counts?.['tenantStorageConfigs']).toBe(3);
     expect(metadata.counts?.['storageMigrations']).toBe(1);
+    expect(metadata.counts?.['uploadSessions']).toBe(1);
   });
 
   it('chama deleteStoragePrefix uma vez com o tenant e o prefixo', async () => {
