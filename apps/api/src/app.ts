@@ -179,6 +179,13 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         : true,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    // Headers de resposta que o FRONT lê e que não são "safelisted": sem esta
+    // lista o navegador os esconde do JS em requisição cross-origin (front e
+    // API em origens diferentes em dev e produção).
+    //  - X-Deduplicated: upload simples de conteúdo que já existia;
+    //  - Content-Disposition: nome do arquivo em download/preview;
+    //  - Retry-After: espera pedida pelo rate limit (429).
+    exposedHeaders: ['X-Deduplicated', 'Content-Disposition', 'Retry-After'],
   });
 
   const db = await resolveDb(app, options, config);

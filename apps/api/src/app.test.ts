@@ -198,4 +198,30 @@ describe('CORS — comportamento por ambiente (épico E-12, T-152)', () => {
       await app.close();
     }
   });
+
+  it('expõe X-Deduplicated e Content-Disposition ao navegador em resposta cross-origin', async () => {
+    // Sem Access-Control-Expose-Headers o navegador esconde do JS os headers
+    // fora da lista "safelisted" — o front não enxergava `X-Deduplicated` e
+    // mostrava duplicado como "enviado" (bug B-1 do QA do E-16).
+    const app = await buildApp({
+      config: testConfig({ NODE_ENV: 'production', CORS_ORIGIN: 'https://boavi.app.br' }),
+      db: testDb.db,
+    });
+
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/healthz',
+        headers: { origin: 'https://boavi.app.br' },
+      });
+
+      const exposed = String(res.headers['access-control-expose-headers'] ?? '')
+        .split(',')
+        .map((h) => h.trim().toLowerCase());
+      expect(exposed).toContain('x-deduplicated');
+      expect(exposed).toContain('content-disposition');
+    } finally {
+      await app.close();
+    }
+  });
 });
