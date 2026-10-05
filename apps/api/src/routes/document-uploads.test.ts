@@ -1,5 +1,7 @@
 import crypto from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -618,5 +620,119 @@ describe('upload em partes — convivência com POST /documents', () => {
     const done = await waitFinished(tokenAdminA, uploadId);
     expect(done['deduplicated']).toBe(true);
     expect((done['document'] as Record<string, unknown>)['id']).toBe((simple.json() as Record<string, unknown>)['id']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rede real: cancelamento e corrida PUT × DELETE (bugs B-2 e B-3 do QA)
+// ---------------------------------------------------------------------------
+
+describe('upload em partes — conexão real (cancelamento e corrida com DELETE)', () => {
+  let netApp: FastifyInstance;
+  let baseUrl: string;
+  const logLines: string[] = [];
+
+  beforeAll(async () => {
+    netApp = await buildApp({
+      config: testConfig({ UPLOAD_TMP_DIR, LOG_LEVEL: 'info' }),
+      db: testDb.db,
+      queue: null,
+      storage: staticStorage(storage),
+      uploadCleanupIntervalMs: 0,
+      logStream: { write: (line: string) => void logLines.push(line) },
+    });
+    await netApp.listen({ host: '127.0.0.1', port: 0 });
+    baseUrl = `http://127.0.0.1:${(netApp.server.address() as AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    await netApp.close();
+  });
+
+  beforeEach(() => {
+    logLines.length = 0;
+  });
+
+  function errorLogs(): string[] {
+    return logLines.filter((l) => /"level":"(error|fatal)"/.test(l));
+  }
+
+  /** Abre um PUT de parte e envia só o começo do corpo. */
+  function startPartialPut(token: string, uploadId: string, n: number, total: number, firstBytes: Buffer) {
+    const url = new URL(`/documents/uploads/${uploadId}/parts/${n}`, baseUrl);
+    const req = http.request(url, {
+      method: 'PUT',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/octet-stream',
+        'content-length': String(total),
+      },
+    });
+    const response = new Promise<number>((resolve, reject) => {
+      req.on('response', (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode ?? 0));
+      });
+      req.on('error', reject);
+    });
+    req.write(firstBytes);
+    return { req, response };
+  }
+
+  async function waitFor(cond: () => boolean, label: string): Promise<void> {
+    for (let i = 0; i < 200; i += 1) {
+      if (cond()) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`timeout esperando: ${label}`);
+  }
+
+  function tmpFiles(uploadId: string): string[] {
+    const dir = sessionDir(TENANT_A, uploadId);
+    return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.tmp')) : [];
+  }
+
+  it('B-2: DELETE enquanto a parte chega → DELETE 204 e o PUT responde 409, sem log de erro', async () => {
+    const content = randomContent();
+    const init = await initUpload(tokenAdminA);
+    const uploadId = init.body['uploadId'] as string;
+    const part = partOf(content, 1);
+
+    const put = startPartialPut(tokenAdminA, uploadId, 1, part.length, part.subarray(0, 1024 * 1024));
+    await waitFor(() => tmpFiles(uploadId).length > 0, 'arquivo temporário da parte');
+
+    expect(await abort(tokenAdminA, uploadId)).toBe(204);
+    put.req.end(part.subarray(1024 * 1024));
+
+    expect(await put.response).toBe(409);
+    expect(errorLogs()).toEqual([]);
+    expect(existsSync(sessionDir(TENANT_A, uploadId))).toBe(false);
+    expect((await getUpload(tokenAdminA, uploadId)).body['status']).toBe('ABORTED');
+  });
+
+  it('B-3: cliente aborta o PUT no meio → parcial apagado, log info, nenhum log de erro', async () => {
+    const content = randomContent();
+    const init = await initUpload(tokenAdminA);
+    const uploadId = init.body['uploadId'] as string;
+    const part = partOf(content, 1);
+
+    const put = startPartialPut(tokenAdminA, uploadId, 1, part.length, part.subarray(0, 1024 * 1024));
+    put.response.catch(() => undefined); // o socket é destruído de propósito
+    await waitFor(() => tmpFiles(uploadId).length > 0, 'arquivo temporário da parte');
+
+    put.req.destroy();
+    await waitFor(
+      () => logLines.some((l) => l.includes('envio de parte interrompido pelo cliente')),
+      'log de cancelamento'
+    );
+    await waitFor(() => tmpFiles(uploadId).length === 0, 'parcial apagado');
+
+    const cancelLog = logLines.find((l) => l.includes('envio de parte interrompido pelo cliente'))!;
+    expect(cancelLog).toContain('"level":"info"');
+    expect(errorLogs()).toEqual([]);
+    const status = await getUpload(tokenAdminA, uploadId);
+    expect(status.body['status']).toBe('OPEN');
+    expect(status.body['receivedParts']).toEqual([]);
+    expect(existsSync(path.join(sessionDir(TENANT_A, uploadId), '1.part'))).toBe(false);
   });
 });

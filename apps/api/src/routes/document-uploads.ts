@@ -13,6 +13,7 @@ import type { Role } from '@dmdoc/shared-types';
 import {
   AppError,
   BadRequestError,
+  ClientClosedRequestError,
   ConflictError,
   ForbiddenError,
   NotFoundError,
@@ -184,6 +185,19 @@ class ByteCounter extends Transform {
     }
     callback(null, chunk);
   }
+}
+
+/** Códigos de erro de socket/stream quando o cliente some no meio do corpo. */
+const CLIENT_ABORT_CODES = new Set(['ECONNRESET', 'ECONNABORTED', 'EPIPE', 'ERR_STREAM_PREMATURE_CLOSE']);
+
+/**
+ * O corpo da requisição foi interrompido pelo cliente? Só vale enquanto o
+ * corpo não chegou inteiro — depois disso qualquer erro é do servidor.
+ */
+function isClientAbort(request: FastifyRequest, err: unknown): boolean {
+  if (request.raw.complete) return false;
+  const code = (err as { code?: string } | null)?.code;
+  return request.raw.destroyed || (code !== undefined && CLIENT_ABORT_CODES.has(code));
 }
 
 async function removeDir(dir: string, log: FastifyBaseLogger, context: Record<string, unknown>): Promise<void> {
@@ -403,6 +417,18 @@ export const documentUploadsRoutes: FastifyPluginAsync<DocumentUploadsRoutesOpti
     return session.status === 'OPEN' && session.expires_at.getTime() > Date.now();
   }
 
+  /** Relê o status da sessão (ela pode ter sido encerrada durante o PUT). */
+  async function isStillOpen(session: UploadSessionRow): Promise<boolean> {
+    const rows = await sql<Array<{ id: string }>>`
+      SELECT id FROM upload_sessions
+       WHERE id = ${session.id}
+         AND tenant_id = ${session.tenant_id}
+         AND status = 'OPEN'
+         AND expires_at > now()
+    `;
+    return rows.length > 0;
+  }
+
   // -------------------------------------------------------------------------
   // Conclusão em segundo plano
   // -------------------------------------------------------------------------
@@ -610,22 +636,36 @@ export const documentUploadsRoutes: FastifyPluginAsync<DocumentUploadsRoutesOpti
       }
 
       const dir = sessionDir(uploadTmpDir, session.tenant_id, session.id);
-      await mkdir(dir, { recursive: true });
+      const logContext = { tenantId: session.tenant_id, userId: session.user_id, uploadId: session.id, part: n };
       // Grava num temporário e renomeia: reenviar a mesma parte sobrescreve de
       // forma atômica, e uma parte interrompida nunca fica com o nome final.
       const tmp = path.join(dir, `${n}.part.${crypto.randomUUID()}.tmp`);
       const counter = new ByteCounter(expected);
       try {
+        await mkdir(dir, { recursive: true });
         await pipeline(body, counter, createWriteStream(tmp));
         if (counter.bytes !== expected) {
           throw new PartSizeMismatchError('parte menor que o esperado');
         }
+        await rename(tmp, partPath(dir, n));
       } catch (err) {
         await rm(tmp, { force: true });
         if (err instanceof PartSizeMismatchError) throw sizeError();
+        // Cancelamento pelo cliente (aborto da UI, queda de rede): evento
+        // normal, não erro do servidor. O parcial já foi apagado acima.
+        if (isClientAbort(request, err)) {
+          request.log.info(logContext, 'envio de parte interrompido pelo cliente');
+          throw new ClientClosedRequestError();
+        }
+        // A sessão foi encerrada enquanto a parte chegava (DELETE ou limpeza
+        // apagaram o diretório): o `rename`/escrita falha com ENOENT. Para o
+        // cliente é "sessão fora de OPEN", não falha interna.
+        if (!(await isStillOpen(session))) {
+          await removeDir(dir, request.log, logContext);
+          throw new ConflictError('Upload não está mais aberto');
+        }
         throw err;
       }
-      await rename(tmp, partPath(dir, n));
 
       const updated = await sql`
         UPDATE upload_sessions
@@ -639,6 +679,8 @@ export const documentUploadsRoutes: FastifyPluginAsync<DocumentUploadsRoutesOpti
         RETURNING id
       `;
       if (updated.length === 0) {
+        // Encerrada entre a escrita e o registro: a parte não serve mais.
+        await removeDir(dir, request.log, logContext);
         throw new ConflictError('Upload não está mais aberto');
       }
       return reply.status(204).send();

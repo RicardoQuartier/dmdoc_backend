@@ -137,6 +137,11 @@ export interface BuildAppOptions {
    * diretamente. Ausente: 15 min.
    */
   uploadCleanupIntervalMs?: number;
+  /**
+   * Destino das linhas de log (JSON, uma por linha). Só para testes que
+   * precisam afirmar o NÍVEL de um log; ausente, o Pino escreve no stdout.
+   */
+  logStream?: { write(line: string): void };
 }
 
 /**
@@ -152,7 +157,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   const config = options.config ?? getConfig();
 
   const app = Fastify({
-    logger: baseLoggerOptions({ service: 'api', level: config.LOG_LEVEL }),
+    logger: {
+      ...baseLoggerOptions({ service: 'api', level: config.LOG_LEVEL }),
+      ...(options.logStream ? { stream: options.logStream } : {}),
+    },
   });
 
   // Anexa o `traceId` (id da request) ao logger desde o primeiro hook, para que
