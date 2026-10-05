@@ -7,14 +7,18 @@ import {
   DeleteObjectsCommand,
   type ObjectIdentifier,
 } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { createReadStream } from 'node:fs';
 
 import type {
   DownloadUrlOptions,
+  PutFileParams,
   PutParams,
   StorageDriver,
   StorageProvider,
 } from './driver.js';
+import { assertLocalFileSize } from './file-source.js';
 
 /**
  * Configuração necessária para construir o cliente S3.
@@ -46,6 +50,19 @@ export interface S3Config {
  * A listagem é paginada e cada página é apagada em lotes de até este tamanho.
  */
 const S3_DELETE_BATCH_LIMIT = 1000;
+
+/**
+ * Tamanho de cada parte do multipart upload do `putFile`. 10 MiB fica acima do
+ * mínimo de 5 MiB do S3 e, com o teto de 10.000 partes, cobre objetos de até
+ * ~100 GB — muito além de `MAX_UPLOAD_MB`.
+ */
+const PUT_FILE_PART_SIZE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Partes enviadas em paralelo pelo `putFile`. A memória do envio fica limitada
+ * a ~`queueSize × partSize` (20 MiB), qualquer que seja o tamanho do arquivo.
+ */
+const PUT_FILE_QUEUE_SIZE = 2;
 
 /**
  * Driver de armazenamento sobre o protocolo S3 — atende AWS S3, Cloudflare R2 e
@@ -105,6 +122,33 @@ export class S3Driver implements StorageDriver {
         ContentType: params.mimeType,
       })
     );
+  }
+
+  /**
+   * Envio por stream a partir do disco. Arquivo menor que uma parte vira um
+   * `PutObject` simples (o `Upload` decide sozinho); maior vira multipart
+   * upload, abortado pelo próprio `Upload` se uma parte falhar — não sobra
+   * upload incompleto cobrando armazenamento no bucket.
+   *
+   * Usa o cliente interno, nunca o `presignClient` (que aponta para o
+   * endpoint público, inalcançável de dentro da rede Docker em dev).
+   */
+  async putFile(params: PutFileParams): Promise<void> {
+    await assertLocalFileSize(params.path, params.sizeBytes, this.provider);
+
+    const upload = new Upload({
+      client: this.client,
+      params: {
+        Bucket: this.bucket,
+        Key: params.key,
+        Body: createReadStream(params.path),
+        ContentType: params.mimeType,
+      },
+      partSize: PUT_FILE_PART_SIZE_BYTES,
+      queueSize: PUT_FILE_QUEUE_SIZE,
+      leavePartsOnError: false,
+    });
+    await upload.done();
   }
 
   async get(key: string): Promise<Buffer> {

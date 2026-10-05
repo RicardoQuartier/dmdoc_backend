@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import crypto from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
@@ -57,6 +58,10 @@ function bucketOf(name: string): Map<string, Buffer> {
 function fakeDriver(provider: 's3' | 'sharepoint', destination: string): StorageDriver {
   return {
     provider,
+    // Upload em partes (ADR 0004): grava o conteúdo do arquivo como o `put`.
+    putFile: async ({ key, path }) => {
+      bucketOf(destination).set(key, await readFile(path));
+    },
     put: async ({ key, buffer }) => {
       bucketOf(destination).set(key, buffer);
     },
@@ -123,6 +128,8 @@ function connectionTestDriver(target: ResolvedStorageTarget): StorageDriver {
 
   return {
     provider,
+    // O "Testar conexão" só exercita `put`/`get`/`delete`.
+    putFile: () => Promise.reject(new Error('putFile não é usado no teste de conexão')),
     put: async ({ key, buffer }) => {
       switch (testDriverBehavior) {
         case 'credencial-sharepoint':
