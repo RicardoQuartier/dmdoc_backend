@@ -1,3 +1,5 @@
+import os from 'node:os';
+import path from 'node:path';
 import { createPgClient, type Sql } from '@dmdoc/db-pg';
 import type { StorageDriver, StorageResolver } from '@dmdoc/storage';
 import { loadConfig, type Config } from '../config.js';
@@ -65,6 +67,9 @@ export function testConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): Config {
     // memória, janela de 60s), o que estouraria o default de 200/min e tornaria
     // os testes dependentes de tempo/ordem. Nenhum teste exercita o rate limit.
     RATE_LIMIT_MAX: '100000000',
+    // Partes do upload em partes: diretório temporário do SO, nunca o volume
+    // `/upload-tmp` do ambiente (que a API de dev usa de verdade).
+    UPLOAD_TMP_DIR: path.join(os.tmpdir(), 'dmdoc-upload-tmp-test'),
     ...overrides,
   });
 }
@@ -104,6 +109,7 @@ export async function resetDomainTables(db: Sql): Promise<void> {
       storage_migrations,
       tenant_storage_configs,
       tenants,
+      upload_sessions,
       users
     RESTART IDENTITY CASCADE
   `);

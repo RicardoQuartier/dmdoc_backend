@@ -31,6 +31,24 @@ export interface PutParams {
   mimeType: string;
 }
 
+/**
+ * Envio de um arquivo que já está em disco, lido por stream (upload em partes,
+ * ADR 0004). Nunca carrega o arquivo inteiro em memória: o S3 usa multipart
+ * upload e o SharePoint usa upload session, os dois lendo fatias do arquivo.
+ */
+export interface PutFileParams {
+  /** Chave do objeto — mesmo formato de `PutParams.key`. */
+  key: string;
+  /** Caminho absoluto do arquivo local a enviar. */
+  path: string;
+  /**
+   * Tamanho esperado do arquivo em bytes. O driver confere contra o tamanho
+   * real em disco antes de enviar — divergência é erro, nunca envio truncado.
+   */
+  sizeBytes: number;
+  mimeType: string;
+}
+
 export interface DownloadUrlOptions {
   expiresInSeconds: number;
   /**
@@ -52,6 +70,13 @@ export interface StorageDriver {
   readonly provider: StorageProvider;
 
   put(params: PutParams): Promise<void>;
+
+  /**
+   * Grava o objeto a partir de um arquivo em disco, por stream (memória
+   * limitada, independente do tamanho do arquivo). Mesmo resultado de `put`
+   * para a mesma chave e o mesmo conteúdo.
+   */
+  putFile(params: PutFileParams): Promise<void>;
 
   /** Baixa o objeto inteiro em memória. Usado na conversão de preview e na migração de acervo. */
   get(key: string): Promise<Buffer>;

@@ -19,6 +19,10 @@ import { departmentsRoutes } from './routes/departments.js';
 import { documentTypesRoutes } from './routes/document-types.js';
 import { permissionsRoutes } from './routes/permissions.js';
 import { documentsRoutes, type DocumentsRoutesOptions } from './routes/documents.js';
+import {
+  documentUploadsRoutes,
+  type DocumentUploadsRoutesOptions,
+} from './routes/document-uploads.js';
 import { searchRoutes, type SearchRoutesOptions } from './routes/search.js';
 import { auditLogsRoutes } from './routes/audit-logs.js';
 import { usageRoutes } from './routes/usage.js';
@@ -127,6 +131,17 @@ export interface BuildAppOptions {
    * Em produção, cada rota cria o seu a partir da config.
    */
   llmProvider?: LLMProvider;
+  /**
+   * Intervalo (ms) da limpeza periódica de sessões de upload em partes
+   * (ADR 0004). `0` desliga o timer — os testes chamam `cleanupUploadSessions`
+   * diretamente. Ausente: 15 min.
+   */
+  uploadCleanupIntervalMs?: number;
+  /**
+   * Destino das linhas de log (JSON, uma por linha). Só para testes que
+   * precisam afirmar o NÍVEL de um log; ausente, o Pino escreve no stdout.
+   */
+  logStream?: { write(line: string): void };
 }
 
 /**
@@ -142,7 +157,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   const config = options.config ?? getConfig();
 
   const app = Fastify({
-    logger: baseLoggerOptions({ service: 'api', level: config.LOG_LEVEL }),
+    logger: {
+      ...baseLoggerOptions({ service: 'api', level: config.LOG_LEVEL }),
+      ...(options.logStream ? { stream: options.logStream } : {}),
+    },
   });
 
   // Anexa o `traceId` (id da request) ao logger desde o primeiro hook, para que
@@ -169,6 +187,13 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         : true,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    // Headers de resposta que o FRONT lê e que não são "safelisted": sem esta
+    // lista o navegador os esconde do JS em requisição cross-origin (front e
+    // API em origens diferentes em dev e produção).
+    //  - X-Deduplicated: upload simples de conteúdo que já existia;
+    //  - Content-Disposition: nome do arquivo em download/preview;
+    //  - Retry-After: espera pedida pelo rate limit (429).
+    exposedHeaders: ['X-Deduplicated', 'Content-Disposition', 'Retry-After'],
   });
 
   const db = await resolveDb(app, options, config);
@@ -239,6 +264,12 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     config,
     ...(options.llmProvider ? { llmProvider: options.llmProvider } : {}),
   } satisfies DocumentsRoutesOptions);
+  await app.register(documentUploadsRoutes, {
+    config,
+    ...(options.uploadCleanupIntervalMs !== undefined
+      ? { cleanupIntervalMs: options.uploadCleanupIntervalMs }
+      : {}),
+  } satisfies DocumentUploadsRoutesOptions);
   await app.register(searchRoutes, { config } satisfies SearchRoutesOptions);
   await app.register(auditLogsRoutes);
   await app.register(usageRoutes);

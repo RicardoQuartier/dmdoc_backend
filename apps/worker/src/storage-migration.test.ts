@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import crypto from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import pino from 'pino';
@@ -55,8 +56,10 @@ function bucketOf(name: string): Map<string, Buffer> {
 }
 
 function fakeDriver(destination: string, provider: 's3' | 'sharepoint' = 's3'): StorageDriver {
-  return {
+  const driver: StorageDriver = {
     provider,
+    // Upload em partes (ADR 0004): lê o arquivo do disco e grava como o `put`.
+    putFile: async ({ key, path, mimeType }) => driver.put({ key, buffer: await readFile(path), mimeType }),
     put: async ({ key, buffer }) => {
       if (failOnPut.has(key)) throw new Error(`put recusado em ${destination}: ${key}`);
       putCalls.push(`${destination}:${key}`);
@@ -81,6 +84,7 @@ function fakeDriver(destination: string, provider: 's3' | 'sharepoint' = 's3'): 
       }
     },
   };
+  return driver;
 }
 
 /**

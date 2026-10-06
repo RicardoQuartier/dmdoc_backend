@@ -1,5 +1,6 @@
 export type {
   DownloadUrlOptions,
+  PutFileParams,
   PutParams,
   StorageDriver,
   StorageProvider,

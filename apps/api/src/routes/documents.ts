@@ -1,11 +1,10 @@
 import crypto from 'node:crypto';
-import type { FastifyPluginAsync, FastifyBaseLogger } from 'fastify';
+import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import type { MultipartFile } from '@fastify/multipart';
 import {
   TenantRepository,
   DocumentEventsRepository,
-  newId,
   resolveAiFeatureFlags,
   createAiReprocessBatch,
   getAiReprocessBatch,
@@ -20,7 +19,6 @@ import {
   type AiReprocessBatchStep,
   type DocumentReprocessBatchRecord,
 } from '@dmdoc/db-pg';
-import type { TenantDocument } from '@dmdoc/db-pg';
 import type { Sql, JSONValue } from '@dmdoc/db-pg';
 import type {
   DocumentProcessingJobData,
@@ -38,8 +36,6 @@ import {
   MAX_TAG_LENGTH,
   mergeConfirmedTags,
   ADMIN_ROLES,
-  ROLE_LEVEL,
-  RoleSchema,
   AiReprocessJobDataSchema,
   AI_REPROCESS_STEPS,
   AiReprocessStepSchema,
@@ -47,7 +43,6 @@ import {
   BulkMoveDocumentsBodySchema,
   type AiReprocessStep,
 } from '@dmdoc/shared-types';
-import type { CreateDocumentEventPgInput } from '@dmdoc/db-pg';
 import { buildDeletedStorageKey, moveWithinDriver, type StorageDriver } from '@dmdoc/storage';
 import {
   createLLMProvider,
@@ -57,63 +52,26 @@ import {
   type LLMProvider,
   type IndexFieldRow,
 } from '@dmdoc/llm-provider';
-import { NotFoundError, QuotaExceededError, ValidationError, ForbiddenError, UpstreamServiceError, ConflictError } from '../errors/index.js';
+import { NotFoundError, ValidationError, ForbiddenError, UpstreamServiceError, ConflictError } from '../errors/index.js';
 import { requireRole } from '../auth/role-guard.js';
 import { AuditLogger } from '../auth/audit.js';
 import { resolveTenantContext } from '../auth/resolve-tenant.js';
-import { resolveAccessibleDepartmentIds } from '../auth/department-access.js';
+import { resolveAccessibleDepartmentIds, assertCanWriteDepartment } from '../auth/department-access.js';
 import { getConfig, type Config } from '../config.js';
 import { suggestDocumentIndexes } from '../services/index-suggestion.js';
 import { classifyDocument } from '../services/classify-document.js';
 import { generateDocumentTags } from '../services/tag-generation.js';
 import { moveDocumentsToDepartment } from '../services/move-documents.js';
+import { type DocumentRow, rowToDocument } from '../services/document-row.js';
+import {
+  assertCanUploadToDepartment,
+  ingestDocument,
+  resolveDocumentTypeName,
+} from '../services/ingest-document.js';
 
 // ---------------------------------------------------------------------------
 // Tipos locais que mapeiam as tabelas do PostgreSQL (spec §5.3)
 // ---------------------------------------------------------------------------
-
-interface TenantRow {
-  id: string;
-  name: string;
-  disk_quota_bytes: bigint;
-  user_quota: number;
-  active: boolean;
-  created_at: Date;
-}
-
-interface DocumentRow extends TenantDocument {
-  tenant_id: string; // postgres.js entrega snake_case; TenantDocument.tenantId é undefined em runtime
-  department_id: string;
-  document_type_id: string | null;
-  filename: string;
-  original_filename: string;
-  original_path: string | null;
-  title: string | null;
-  suggested_title: string | null;
-  content_hash: string;
-  size_bytes: bigint;
-  mime_type: string;
-  storage_key: string;
-  /**
-   * Rótulo do destino onde o arquivo DESTA linha está: `s3` | `sharepoint`
-   * (migration 0017). DENORMALIZAÇÃO — nunca é o critério de "de onde ler":
-   * dois destinos diferentes do mesmo provider têm o mesmo valor aqui.
-   */
-  storage_provider: string;
-  /**
-   * A configuração de armazenamento de que ESTE arquivo depende para ser lido
-   * (E-11 / ADR-1). É a AUTORIDADE do destino. `null` = S3 da plataforma.
-   */
-  storage_config_id: string | null;
-  status: 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED';
-  failure_reason: string | null;
-  tags: string[];
-  index_values: Record<string, string | number | null>;
-  uploaded_by_id: string;
-  uploaded_at: Date;
-  processed_at: Date | null;
-  cost_usd_cents: number;
-}
 
 /**
  * Linha crua de `document_content` como armazenada no PostgreSQL — usada
@@ -419,14 +377,6 @@ function sha256hex(buf: Buffer): string {
 }
 
 /**
- * Sanitiza o nome original do arquivo para uso seguro como chave de armazenamento.
- * Remove caracteres especiais e preserva a extensão.
- */
-function sanitizeFilename(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 200);
-}
-
-/**
  * Busca um documento pelo seu id sem filtrar por tenantId.
  *
  * Usado exclusivamente para SUPER_ADMIN, que não tem um tenantId no JWT e
@@ -509,108 +459,6 @@ async function assertCanReadDepartment(
 }
 
 /**
- * Valida se o usuário pode ESCREVER em um departamento específico.
- *
- * Duas camadas de controle, nesta ordem:
- *   1. GATE POR PAPEL — a CAPACIDADE de escrita exige nível >= UPLOADER (40).
- *      USER (20) é somente leitura por definição (wiki "Papéis de acesso
- *      (roles)"): mesmo com uma raiz concedida ativa (que lhe dá leitura da
- *      subárvore), NUNCA pode escrever. Papel desconhecido/inválido cai como
- *      SEM escrita (fail-closed). Cobre uniformemente PATCH/DELETE/reprocess/
- *      suggest-indexes — todos passam por este choke point.
- *   2. ACL POR DEPARTAMENTO — para papéis com capacidade de escrita, o
- *      departamento precisa estar no conjunto acessível (subárvore concedida)
- *      ou o papel ser admin (sem restrição de ACL).
- *
- * Lança `NotFoundError` (nunca 403 — spec §10, invariante 4) se sem permissão,
- * com a mesma mensagem em ambas as camadas para não vazar a existência do
- * recurso a quem não pode escrever nele.
- */
-async function assertCanWriteDepartment(
-  sql: Sql,
-  userId: string,
-  tenantId: string,
-  departmentId: string,
-  role: string
-): Promise<void> {
-  // Camada 1: gate por nível de papel (fail-closed).
-  // O role vem do JWT já validado, mas mantemos a checagem type-safe: um papel
-  // não reconhecido resolve para nível 0 e é negado, nunca liberado.
-  const parsedRole = RoleSchema.safeParse(role);
-  const roleLevel = parsedRole.success ? ROLE_LEVEL[parsedRole.data] : 0;
-  if (roleLevel < ROLE_LEVEL.UPLOADER) {
-    throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
-  }
-
-  const accessible = await resolveAccessibleDepartmentIds(sql, userId, tenantId, role);
-  if (accessible === null) {
-    // Admin sem restrição de ACL: verifica apenas que o dept pertence ao tenant.
-    const rows = await sql<Array<{ id: string }>>`
-      SELECT id FROM departments WHERE id = ${departmentId} AND tenant_id = ${tenantId} LIMIT 1
-    `;
-    if (rows.length === 0) {
-      throw new NotFoundError('Departamento não encontrado');
-    }
-    return;
-  }
-  if (!accessible.includes(departmentId)) {
-    throw new NotFoundError('Departamento não encontrado ou sem permissão de escrita');
-  }
-}
-
-/**
- * Resolve o `name` de um tipo de documento (tenant OU global) para denormalizar
- * no evento de upload.
- */
-async function resolveDocumentTypeName(
-  sql: Sql,
-  tenantId: string,
-  documentTypeId: string | null
-): Promise<string | null> {
-  if (documentTypeId === null) {
-    return null;
-  }
-  const rows = await sql<Array<{ name: string }>>`
-    SELECT name
-    FROM document_types
-    WHERE id = ${documentTypeId}
-      AND (tenant_id = ${tenantId} OR is_global = true)
-    LIMIT 1
-  `;
-  return rows[0]?.name ?? null;
-}
-
-/**
- * Mapeia uma linha snake_case do PostgreSQL para o formato camelCase da resposta.
- */
-function rowToDocument(r: DocumentRow): Record<string, unknown> {
-  return {
-    id: r.id,
-    tenantId: r.tenant_id,
-    departmentId: r.department_id,
-    documentTypeId: r.document_type_id,
-    filename: r.filename,
-    originalFilename: r.original_filename,
-    originalPath: r.original_path,
-    title: r.title,
-    suggestedTitle: r.suggested_title,
-    contentHash: r.content_hash,
-    sizeBytes: Number(r.size_bytes),
-    mimeType: r.mime_type,
-    storageKey: r.storage_key,
-    status: r.status,
-    failureReason: r.failure_reason,
-    tags: r.tags,
-    indexValues: r.index_values,
-    uploadedById: r.uploaded_by_id,
-    uploadedAt: r.uploaded_at,
-    processedAt: r.processed_at,
-    costUsdCents: r.cost_usd_cents,
-    deleted: r.deleted,
-  };
-}
-
-/**
  * Linha de `documents` enriquecida com os LEFT JOINs exclusivos do
  * `GET /documents` (spec da tela de listagem — departamento/enviado
  * por/tipo/empresa). `document_type_name` é nullable porque
@@ -640,48 +488,6 @@ function rowToDocumentListItem(r: DocumentListRow): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 // GET /documents — paginação por número de página (OFFSET)
 // ---------------------------------------------------------------------------
-
-/** Número total de tentativas de `emitUploadEvent` (1 original + 1 retry). */
-const EMIT_UPLOAD_EVENT_MAX_ATTEMPTS = 2;
-
-/**
- * Emite um evento de upload na tabela append-only `document_events`.
- *
- * Tenta até `EMIT_UPLOAD_EVENT_MAX_ATTEMPTS` vezes (1 tentativa original + 1
- * retry síncrono, sem backoff) antes de desistir — absorve falhas transitórias
- * de pool/conexão sem adicionar complexidade de fila/backoff assíncrono.
- *
- * Falha de emissão (mesmo após o retry) NUNCA derruba a operação de upload.
- */
-async function emitUploadEvent(
-  sql: Sql,
-  log: FastifyBaseLogger,
-  tenantId: string,
-  input: CreateDocumentEventPgInput
-): Promise<void> {
-  const eventsRepo = new DocumentEventsRepository(sql, { tenantId });
-  let lastError: unknown;
-
-  for (let attempt = 1; attempt <= EMIT_UPLOAD_EVENT_MAX_ATTEMPTS; attempt++) {
-    try {
-      await eventsRepo.insertOne(input);
-      return;
-    } catch (eventError) {
-      lastError = eventError;
-    }
-  }
-
-  log.error(
-    {
-      err: lastError,
-      tenantId,
-      documentId: input.documentId,
-      userId: input.uploadedById,
-      deduplicated: input.deduplicated,
-    },
-    'falha ao emitir evento de upload (document_events)'
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Plugin de rotas
@@ -804,313 +610,45 @@ export const documentsRoutes: FastifyPluginAsync<DocumentsRoutesOptions> = async
     const { departmentId, documentTypeId, indexValues } = fields_;
 
     // ------------------------------------------------------------------
-    // 2. Verificar permissão de escrita no departamento
+    // 2. Verificar permissão de escrita no departamento (ativo)
     // ------------------------------------------------------------------
     const userRole = request.user!.role;
-    await assertCanWriteDepartment(sql, userId, tenantId, departmentId, userRole);
-
-    const activeDeptRows = await sql<Array<{ id: string }>>`
-      SELECT id FROM departments
-      WHERE id = ${departmentId}
-        AND tenant_id = ${tenantId}
-        AND deleted = false
-      LIMIT 1
-    `;
-    if (activeDeptRows.length === 0) {
-      throw new NotFoundError('Departamento não encontrado');
-    }
+    await assertCanUploadToDepartment(sql, userId, tenantId, departmentId, userRole);
 
     // ------------------------------------------------------------------
     // 3. Calcular SHA-256
     // ------------------------------------------------------------------
     const fileSize = fileBuffer.byteLength;
     const contentHash = sha256hex(fileBuffer);
-    const originalFilename = data.filename;
-    const mimeType = data.mimetype;
-    const filename = sanitizeFilename(originalFilename);
 
     // ------------------------------------------------------------------
-    // 4. Verificar cota de disco do tenant
+    // 4. Cota, deduplicação, storage, persistência, fila, audit e evento
+    //    (serviço compartilhado com o upload em partes — ADR 0004)
     // ------------------------------------------------------------------
-    const tenantRows = await sql<TenantRow[]>`
-      SELECT id, disk_quota_bytes FROM tenants WHERE id = ${tenantId} LIMIT 1
-    `;
-    const tenant = tenantRows[0];
-    if (!tenant) {
-      throw new NotFoundError('Tenant não encontrado');
-    }
+    const { document, deduplicated } = await ingestDocument({
+      sql,
+      storage: app.storage,
+      queue: app.queue,
+      log: request.log,
+      tenantId,
+      userId,
+      departmentId,
+      documentTypeId,
+      indexValues: indexValues as Record<string, string | number | null>,
+      originalPath: fields_.originalPath ?? null,
+      originalFilename: data.filename,
+      mimeType: data.mimetype,
+      contentHash,
+      sizeBytes: fileSize,
+      content: { kind: 'buffer', buffer: fileBuffer },
+    });
 
-    const usageRows = await sql<Array<{ total: string }>>`
-      SELECT COALESCE(SUM(size_bytes), 0)::text AS total
-      FROM documents
-      WHERE tenant_id = ${tenantId}
-        AND deleted = false
-    `;
-    const currentUsageBytes = BigInt(usageRows[0]?.total ?? '0');
-
-    if (currentUsageBytes + BigInt(fileSize) > tenant.disk_quota_bytes) {
-      throw new QuotaExceededError(
-        `Cota de disco esgotada: uso atual ${currentUsageBytes} bytes, ` +
-          `arquivo ${fileSize} bytes, limite ${tenant.disk_quota_bytes} bytes`
-      );
-    }
-
-    // ------------------------------------------------------------------
-    // 5. Deduplicação
-    // ------------------------------------------------------------------
-    const existingRows = await sql<DocumentRow[]>`
-      SELECT *
-      FROM documents
-      WHERE tenant_id = ${tenantId}
-        AND content_hash = ${contentHash}
-        AND deleted = false
-      LIMIT 1
-    `;
-    const existingDoc = existingRows[0] ?? null;
-
-    if (existingDoc !== null && existingDoc.status !== 'FAILED') {
-      const existingTypeName = await resolveDocumentTypeName(
-        sql,
-        tenantId,
-        existingDoc.document_type_id
-      );
-      await emitUploadEvent(sql, request.log, tenantId, {
-        documentId: existingDoc.id,
-        uploadedById: userId,
-        eventType: 'upload',
-        mimeType,
-        documentTypeId: existingDoc.document_type_id,
-        documentTypeName: existingTypeName,
-        sizeBytes: BigInt(fileSize),
-        pageCount: null,
-        deduplicated: true,
-      });
-
-      request.log.info(
-        { tenantId, userId, documentId: existingDoc.id, contentHash },
-        'documento deduplicado — retornando existente'
-      );
+    if (deduplicated) {
       return reply
         .status(200)
         .header('X-Deduplicated', 'true')
-        .send(rowToDocument(existingDoc));
+        .send(rowToDocument(document));
     }
-
-    // ------------------------------------------------------------------
-    // 6. Validar documentTypeId (se informado)
-    // ------------------------------------------------------------------
-    if (documentTypeId !== undefined) {
-      const tenantDocTypeRows = await sql<Array<{ id: string }>>`
-        SELECT id FROM document_types
-        WHERE id = ${documentTypeId}
-          AND tenant_id = ${tenantId}
-          AND deleted = false
-        LIMIT 1
-      `;
-      if (tenantDocTypeRows.length === 0) {
-        const globalDocTypeRows = await sql<Array<{ id: string }>>`
-          SELECT id FROM document_types
-          WHERE id = ${documentTypeId}
-            AND is_global = true
-            AND deleted = false
-          LIMIT 1
-        `;
-        if (globalDocTypeRows.length === 0) {
-          throw new NotFoundError('Tipo de documento não encontrado');
-        }
-      }
-    }
-
-    // ------------------------------------------------------------------
-    // 7. Upload para o armazenamento
-    // ------------------------------------------------------------------
-    const storageKey = `tenants/${tenantId}/documents/${contentHash}/${filename}`;
-    // Destino ATIVO da EMPRESA (bucket da plataforma, bucket próprio ou
-    // SharePoint). É o único ponto do arquivo em que resolver pela empresa está
-    // certo: arquivo NOVO vai para onde a empresa grava HOJE. Toda leitura
-    // posterior usa o `storage_config_id` gravado logo abaixo.
-    const { driver: storageDriver, storageConfigId } =
-      await app.storage.activeDestination(tenantId);
-    await storageDriver.put({ key: storageKey, buffer: fileBuffer, mimeType });
-
-    // ------------------------------------------------------------------
-    // 8. Persistir documento no PostgreSQL com status PENDING
-    // ------------------------------------------------------------------
-    const documentId = newId();
-    const repo = new TenantRepository<DocumentRow>(sql, 'documents', { tenantId });
-
-    // Exceção FAILED da deduplicação (regra "Deduplicação de documentos por
-    // conteúdo"): se já existe um documento com o mesmo `contentHash` neste
-    // tenant mas em status FAILED, a dedup NÃO se aplica — criamos um NOVO
-    // documento e reenfileiramos. O índice único parcial
-    // `uniq_doc_tenant_content_hash (tenant_id, content_hash) WHERE deleted = false`
-    // impede duas linhas não-deletadas com o mesmo hash; por isso, ao reenviar
-    // um conteúdo FAILED, soft-deletamos o registro FAILED (liberando o índice)
-    // e inserimos o novo NA MESMA TRANSAÇÃO — antes disso o insert colidia
-    // (23505) e vazava como 500 (bug UPLOAD-14).
-    const reuploadOfFailed = existingDoc !== null && existingDoc.status === 'FAILED';
-
-    const insertPayload = {
-      id: documentId,
-      department_id: departmentId,
-      document_type_id: documentTypeId ?? null,
-      filename,
-      original_filename: originalFilename,
-      // Nunca inventado: só vem preenchido quando o front captura
-      // `webkitRelativePath` de upload de pasta; ausência vira `null`.
-      original_path: fields_.originalPath ?? null,
-      title: null,
-      suggested_title: null,
-      content_hash: contentHash,
-      size_bytes: BigInt(fileSize),
-      mime_type: mimeType,
-      storage_key: storageKey,
-      // ONDE o arquivo ficou, por documento. Durante (e depois de) uma migração
-      // de acervo a empresa tem arquivos em destinos diferentes ao mesmo tempo,
-      // então quem lê precisa saber o destino DESTE arquivo — não o destino
-      // corrente da empresa (ver migration 0017).
-      //
-      // As duas colunas juntas, sempre: `storage_config_id` é a AUTORIDADE (a
-      // configuração cujas credenciais abrem este arquivo, `null` = plataforma)
-      // e `storage_provider` é o rótulo denormalizado dela. Gravar só o provider
-      // deixaria um documento em bucket próprio registrado como plataforma — o
-      // ponteiro errado que a ADR-1 corrigiu.
-      storage_provider: storageDriver.provider,
-      storage_config_id: storageConfigId,
-      status: 'PENDING',
-      failure_reason: null,
-      tags: [],
-      index_values: indexValues as Record<string, string | number | null>,
-      uploaded_by_id: userId,
-      uploaded_at: new Date(),
-      processed_at: null,
-      cost_usd_cents: 0,
-    } as Omit<DocumentRow, 'id' | 'tenantId' | 'tenant_id' | 'deleted'>;
-
-    let document: DocumentRow;
-    try {
-      if (reuploadOfFailed) {
-        document = await sql.begin(async (tx) => {
-          await tx`
-            UPDATE documents
-            SET deleted = true
-            WHERE tenant_id = ${tenantId}
-              AND content_hash = ${contentHash}
-              AND status = 'FAILED'
-              AND deleted = false
-          `;
-          const txRepo = new TenantRepository<DocumentRow>(tx as unknown as typeof sql, 'documents', { tenantId });
-          return txRepo.insertOne(insertPayload);
-        });
-      } else {
-        document = await repo.insertOne(insertPayload);
-      }
-    } catch (insertError) {
-      // Corrida de deduplicação (UPLOAD-16): dois uploads do MESMO conteúdo novo
-      // passam pela checagem de dedup antes de qualquer um persistir; o índice
-      // único parcial `uniq_doc_tenant_content_hash (tenant_id, content_hash)
-      // WHERE deleted = false` garante que só um vença — o perdedor recebe 23505.
-      // Regra "Deduplicação de documentos por conteúdo" (caso de borda "upload
-      // concorrente do mesmo arquivo"): o perdedor é tratado como 409 Conflict
-      // (nunca 500). A integridade é preservada — apenas um documento persiste.
-      if ((insertError as { code?: string }).code === '23505') {
-        // NÃO remover o objeto do armazenamento aqui: a chave é derivada de
-        // (contentHash, filename) e, quando o vencedor subiu o mesmo arquivo
-        // com o mesmo nome, é a MESMA chave — apagá-la corromperia o documento
-        // vencedor. O conteúdo já está armazenado (upload idempotente). Um eventual
-        // objeto órfão (nomes de arquivo diferentes) é custo aceitável nesta
-        // corrida rara, preferível a arriscar apagar o arquivo do vencedor.
-        request.log.info(
-          { tenantId, userId, contentHash },
-          'colisão de deduplicação por corrida — perdedor tratado como 409'
-        );
-        throw new ConflictError('Conteúdo já existe nesta empresa (conflito de deduplicação por corrida)');
-      }
-
-      // Rollback: remove arquivo do armazenamento (erro de insert não relacionado à corrida).
-      try {
-        await storageDriver.delete(storageKey);
-      } catch (deleteError) {
-        request.log.error(
-          { err: deleteError, storageKey, tenantId, userId },
-          'falha ao remover arquivo do armazenamento no rollback'
-        );
-      }
-      throw insertError;
-    }
-
-    // ------------------------------------------------------------------
-    // 9. Enfileirar job BullMQ
-    // ------------------------------------------------------------------
-    const jobData: DocumentProcessingJobData = DocumentProcessingJobDataSchema.parse({
-      tenantId,
-      documentId: document.id,
-      storageKey,
-      mimeType,
-    });
-
-    if (app.queue !== null) {
-      await app.queue.add('process-document', jobData, {
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 2000 },
-      });
-    } else {
-      request.log.warn(
-        { tenantId, documentId: document.id },
-        'queue não configurada — job de processamento não enfileirado'
-      );
-    }
-
-    // ------------------------------------------------------------------
-    // 10. AuditLog
-    // ------------------------------------------------------------------
-    const auditLogger = new AuditLogger(sql);
-    try {
-      await auditLogger.record({
-        tenantId,
-        userId,
-        action: 'document.upload',
-        resource: `documents/${document.id}`,
-        metadata: {
-          filename: originalFilename,
-          sizeBytes: fileSize,
-          contentHash,
-          departmentId,
-          documentTypeId: documentTypeId ?? null,
-        },
-      });
-    } catch (auditError) {
-      request.log.error(
-        { err: auditError, tenantId, userId, documentId: document.id },
-        'falha ao registrar audit log de upload'
-      );
-    }
-
-    // ------------------------------------------------------------------
-    // 11. Evento de upload
-    // ------------------------------------------------------------------
-    const documentTypeName = await resolveDocumentTypeName(
-      sql,
-      tenantId,
-      documentTypeId ?? null
-    );
-    await emitUploadEvent(sql, request.log, tenantId, {
-      documentId: document.id,
-      uploadedById: userId,
-      eventType: 'upload',
-      mimeType,
-      documentTypeId: documentTypeId ?? null,
-      documentTypeName,
-      sizeBytes: BigInt(fileSize),
-      pageCount: null,
-      deduplicated: false,
-    });
-
-    request.log.info(
-      { tenantId, userId, documentId: document.id, sizeBytes: fileSize, contentHash },
-      'documento enviado com sucesso'
-    );
-
     return reply.status(201).send(rowToDocument(document));
   });
 

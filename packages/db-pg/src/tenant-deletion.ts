@@ -64,7 +64,8 @@ type PurgeCounts = Record<
   | 'departments'
   | 'users'
   | 'tenantStorageConfigs'
-  | 'storageMigrations',
+  | 'storageMigrations'
+  | 'uploadSessions',
   number
 >;
 
@@ -202,6 +203,13 @@ export async function purgeTenantData(
     `;
 
     // --- Passo 3: hard-delete em cascata (filhos → pais) ---------------------
+    // Sessões de upload em partes (E-16): dado operacional, sem valor de
+    // auditoria. Saem PRIMEIRO porque têm FK para `documents`, `departments`,
+    // `document_types` e `users`, todos apagados a seguir. As partes em disco
+    // da API viram órfãs e são removidas pela limpeza periódica de lá.
+    const uploadSessions = (
+      await tx`DELETE FROM upload_sessions WHERE tenant_id = ${tenantId}`
+    ).count;
     const chunks = (await tx`DELETE FROM chunks WHERE tenant_id = ${tenantId}`).count;
     const documentContent = (
       await tx`DELETE FROM document_content WHERE tenant_id = ${tenantId}`
@@ -273,6 +281,7 @@ export async function purgeTenantData(
       users,
       tenantStorageConfigs,
       storageMigrations,
+      uploadSessions,
     };
   });
 

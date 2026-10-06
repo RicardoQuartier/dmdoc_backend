@@ -83,6 +83,17 @@ const EnvSchema = z.object({
   // Limites de upload (spec §12).
   MAX_UPLOAD_MB: z.coerce.number().int().positive().default(500),
 
+  // Upload em partes (ADR 0004): diretório onde a API guarda as partes até a
+  // conclusão, em `<dir>/<tenantId>/<uploadId>/<n>.part`. Nos composes é o
+  // volume nomeado `upload-tmp`, montado só na api — por isso a api roda com
+  // uma única réplica. Caminho absoluto: um relativo dependeria do cwd do
+  // processo e mudaria de lugar entre `pnpm dev` e a imagem buildada.
+  UPLOAD_TMP_DIR: z
+    .string()
+    .min(1)
+    .refine((v) => v.startsWith('/'), 'UPLOAD_TMP_DIR deve ser um caminho absoluto')
+    .default('/upload-tmp'),
+
   // Extractor Python — conversão de documentos Office→PDF para preview.
   EXTRACTOR_URL: z.string().url().default('http://localhost:5056/extract'),
 

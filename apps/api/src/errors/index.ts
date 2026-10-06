@@ -7,3 +7,6 @@ export { QuotaExceededError } from './QuotaExceededError.js';
 export { RateLimitError } from './RateLimitError.js';
 export { ValidationError } from './ValidationError.js';
 export { UpstreamServiceError } from './UpstreamServiceError.js';
+export { BadRequestError } from './BadRequestError.js';
+export { PayloadTooLargeError } from './PayloadTooLargeError.js';
+export { ClientClosedRequestError } from './ClientClosedRequestError.js';

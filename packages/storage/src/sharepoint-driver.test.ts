@@ -1,4 +1,7 @@
 import { randomBytes } from 'node:crypto';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
@@ -697,5 +700,117 @@ describe('SharePointDriver — configuração', () => {
   it('expõe o provider correto', () => {
     const h = createHarness();
     expect(h.driver.provider).toBe('sharepoint');
+  });
+});
+
+// ── putFile (arquivo em disco, upload em partes — ADR 0004) ────────────────
+
+describe('SharePointDriver.putFile — fatias lidas do disco', () => {
+  async function writeTempFile(content: Buffer): Promise<{ path: string; cleanup: () => Promise<void> }> {
+    const dir = await mkdtemp(join(tmpdir(), 'sp-putfile-'));
+    const path = join(dir, 'arquivo.bin');
+    await writeFile(path, content);
+    return { path, cleanup: () => rm(dir, { recursive: true, force: true }) };
+  }
+
+  it('envia o arquivo em fatias de 320 KiB × n com Content-Range corretos e remonta o original', async () => {
+    const chunkBytes = 3 * CHUNK_UNIT;
+    const h = createHarness({ uploadChunkBytes: chunkBytes });
+    // Tamanho que não é múltiplo da fatia: o último chunk fica menor.
+    const total = 5 * 1024 * 1024 + 12_345;
+    const content = randomBytes(total);
+    const file = await writeTempFile(content);
+
+    const chunkCount = Math.ceil(total / chunkBytes);
+    h.enqueue(
+      tokenResponse(),
+      jsonResponse({ uploadUrl: 'https://upload.sharepoint.com/sess?guid=f1' })
+    );
+    for (let i = 0; i < chunkCount - 1; i += 1) {
+      h.enqueue(jsonResponse({ nextExpectedRanges: ['x'] }, { status: 202 }));
+    }
+    h.enqueue(jsonResponse({ id: 'item-f1' }, { status: 201 }));
+
+    try {
+      await h.driver.putFile({ key: KEY, path: file.path, sizeBytes: total, mimeType: 'video/mp4' });
+    } finally {
+      await file.cleanup();
+    }
+
+    expect(h.calls[1]?.url).toBe(`${ENCODED_ITEM_URL}:/createUploadSession`);
+    const chunks = h.calls.slice(2);
+    expect(chunks).toHaveLength(chunkCount);
+
+    const enviado: Buffer[] = [];
+    chunks.forEach((call, index) => {
+      const body = call.body as Buffer;
+      const start = index * chunkBytes;
+      const end = Math.min(start + chunkBytes, total);
+      expect(call.method).toBe('PUT');
+      expect(call.headers['authorization']).toBeUndefined();
+      expect(call.headers['content-range']).toBe(`bytes ${start}-${end - 1}/${total}`);
+      expect(body.byteLength).toBe(end - start);
+      if (index < chunkCount - 1) expect(body.byteLength % CHUNK_UNIT).toBe(0);
+      enviado.push(body);
+    });
+    expect(Buffer.compare(Buffer.concat(enviado), content)).toBe(0);
+  });
+
+  it('arquivo de até 4 MB vai pelo PUT simples com o conteúdo do disco', async () => {
+    const h = createHarness();
+    const content = randomBytes(1024);
+    const file = await writeTempFile(content);
+    h.enqueue(tokenResponse(), jsonResponse({ id: 'item-f2' }, { status: 201 }));
+
+    try {
+      await h.driver.putFile({ key: KEY, path: file.path, sizeBytes: content.byteLength, mimeType: 'application/pdf' });
+    } finally {
+      await file.cleanup();
+    }
+
+    expect(h.calls).toHaveLength(2);
+    expect(h.calls[1]?.method).toBe('PUT');
+    expect(h.calls[1]?.url).toContain(':/content');
+    expect(Buffer.compare(h.calls[1]?.body as Buffer, content)).toBe(0);
+  });
+
+  it('recusa arquivo com tamanho diferente do declarado, sem abrir sessão', async () => {
+    const h = createHarness();
+    const file = await writeTempFile(randomBytes(100));
+
+    try {
+      const erro = await h.driver
+        .putFile({ key: KEY, path: file.path, sizeBytes: 101, mimeType: 'application/pdf' })
+        .catch((e: unknown) => e);
+      expect(erro).toBeInstanceOf(StorageError);
+    } finally {
+      await file.cleanup();
+    }
+    expect(h.calls).toHaveLength(0);
+  });
+
+  it('cancela a sessão quando um chunk falha', async () => {
+    const chunkBytes = 8 * CHUNK_UNIT;
+    const h = createHarness({ uploadChunkBytes: chunkBytes });
+    const total = 4 * 1024 * 1024 + 1;
+    const file = await writeTempFile(Buffer.alloc(total));
+
+    h.enqueue(
+      tokenResponse(),
+      jsonResponse({ uploadUrl: 'https://upload.sharepoint.com/sess?guid=f3' }),
+      jsonResponse({ error: { code: 'invalidRange', message: 'Bad range' } }, { status: 416 }),
+      new Response(null, { status: 204 })
+    );
+
+    try {
+      const erro = (await h.driver
+        .putFile({ key: KEY, path: file.path, sizeBytes: total, mimeType: 'application/pdf' })
+        .catch((e: unknown) => e)) as StorageError;
+      expect(erro).toBeInstanceOf(StorageError);
+      expect(erro.status).toBe(416);
+    } finally {
+      await file.cleanup();
+    }
+    expect(h.calls[3]?.method).toBe('DELETE');
   });
 });

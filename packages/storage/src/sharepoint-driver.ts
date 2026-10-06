@@ -1,5 +1,8 @@
+import { open, readFile } from 'node:fs/promises';
+
 import type {
   DownloadUrlOptions,
+  PutFileParams,
   PutParams,
   StorageDriver,
   StorageProvider,
@@ -12,6 +15,7 @@ import {
   StorageNotFoundError,
   StorageRateLimitError,
 } from './errors.js';
+import { assertLocalFileSize } from './file-source.js';
 
 /**
  * Driver de armazenamento sobre uma biblioteca de documentos do SharePoint
@@ -245,7 +249,50 @@ export class SharePointDriver implements StorageDriver {
       await this.putSimple(path, params);
       return;
     }
-    await this.putWithSession(path, params);
+    const { buffer } = params;
+    await this.putWithSession(path, buffer.byteLength, (start, end) =>
+      Promise.resolve(Buffer.from(buffer.subarray(start, end)))
+    );
+  }
+
+  /**
+   * Envio a partir de um arquivo em disco. Até 4 MB o arquivo é lido inteiro e
+   * vai pelo PUT simples (é pequeno por definição); acima disso, upload session
+   * com fatias lidas do arquivo uma a uma — a memória fica em uma fatia
+   * (`uploadChunkBytes`, 10 MiB por padrão), qualquer que seja o tamanho.
+   */
+  async putFile(params: PutFileParams): Promise<void> {
+    const path = this.itemPath(params.key, 'put');
+    await assertLocalFileSize(params.path, params.sizeBytes, this.provider);
+
+    if (params.sizeBytes <= SIMPLE_UPLOAD_MAX_BYTES) {
+      const buffer = await readFile(params.path);
+      await this.putSimple(path, { key: params.key, buffer, mimeType: params.mimeType });
+      return;
+    }
+
+    const file = await open(params.path, 'r');
+    try {
+      await this.putWithSession(path, params.sizeBytes, async (start, end) => {
+        const length = end - start;
+        const chunk = Buffer.allocUnsafe(length);
+        let filled = 0;
+        // `read` pode devolver menos bytes que o pedido; repete até completar.
+        while (filled < length) {
+          const { bytesRead } = await file.read(chunk, filled, length - filled, start + filled);
+          if (bytesRead === 0) {
+            throw new StorageError(
+              `arquivo local terminou antes do esperado (bytes ${start}-${end - 1}/${params.sizeBytes})`,
+              { provider: 'sharepoint', operation: 'put' }
+            );
+          }
+          filled += bytesRead;
+        }
+        return chunk;
+      });
+    } finally {
+      await file.close();
+    }
   }
 
   async get(key: string): Promise<Buffer> {
@@ -392,7 +439,16 @@ export class SharePointDriver implements StorageDriver {
     await discardBody(response);
   }
 
-  private async putWithSession(path: string, params: PutParams): Promise<void> {
+  /**
+   * Upload session do Graph. `readChunk(start, end)` devolve os bytes
+   * `[start, end)` do conteúdo — vindos de um buffer em memória (`put`) ou
+   * lidos do disco sob demanda (`putFile`).
+   */
+  private async putWithSession(
+    path: string,
+    totalBytes: number,
+    readChunk: (start: number, end: number) => Promise<Buffer>
+  ): Promise<void> {
     const sessionResponse = await this.send({
       operation: 'put',
       method: 'POST',
@@ -418,7 +474,7 @@ export class SharePointDriver implements StorageDriver {
     }
 
     try {
-      await this.uploadChunks(uploadUrl, params.buffer);
+      await this.uploadChunks(uploadUrl, totalBytes, readChunk);
     } catch (error) {
       // Sessão abandonada segura o arquivo pela metade na biblioteca e bloqueia
       // a próxima tentativa até expirar. Cancelar é best-effort: se o cancel
@@ -428,14 +484,17 @@ export class SharePointDriver implements StorageDriver {
     }
   }
 
-  private async uploadChunks(uploadUrl: string, buffer: Buffer): Promise<void> {
-    const total = buffer.byteLength;
+  private async uploadChunks(
+    uploadUrl: string,
+    total: number,
+    readChunk: (start: number, end: number) => Promise<Buffer>
+  ): Promise<void> {
     const chunkSize = this.config.uploadChunkBytes;
 
     for (let start = 0; start < total; start += chunkSize) {
       const end = Math.min(start + chunkSize, total);
       const isLast = end === total;
-      const chunk = buffer.subarray(start, end);
+      const chunk = await readChunk(start, end);
 
       const response = await this.send({
         operation: 'put',
@@ -445,7 +504,7 @@ export class SharePointDriver implements StorageDriver {
           // `end - 1` porque Content-Range é inclusivo nas duas pontas.
           'content-range': `bytes ${start}-${end - 1}/${total}`,
         },
-        body: Buffer.from(chunk),
+        body: chunk,
         // A uploadUrl já vem assinada; mandar Authorization nela é motivo
         // documentado de 401 no Graph.
         authenticated: false,
